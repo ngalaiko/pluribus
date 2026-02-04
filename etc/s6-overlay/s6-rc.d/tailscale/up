@@ -1,0 +1,1 @@
+/command/with-contenv /bin/sh -c "tailscale up --auth-key $TS_AUTHKEY --ssh"

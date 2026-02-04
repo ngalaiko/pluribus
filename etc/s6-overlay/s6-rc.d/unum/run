@@ -1,0 +1,5 @@
+#!/command/with-contenv sh
+export HOME=/home/unum
+export XDG_DATA_HOME=/data
+chown -R unum:pluribus /data
+exec s6-setuidgid unum /usr/local/bin/unum

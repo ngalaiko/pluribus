@@ -1,0 +1,28 @@
+[package]
+name = "pluribus-frequency"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+rmp-serde = { workspace = true }
+exn = { workspace = true }
+futures-lite = { workspace = true }
+loro = { workspace = true }
+async-broadcast = { workspace = true }
+async-tungstenite = { workspace = true }
+async-channel = { workspace = true }
+serde_bytes = { workspace = true }
+futures-sink = { workspace = true }
+tracing = { workspace = true }
+async-executor = { workspace = true }
+async-io = { workspace = true }
+async-net = { workspace = true }
+async-process = { workspace = true }

@@ -1,0 +1,6 @@
+- [ ] thinking mode
+- [ ] multimodal
+- [ ] sync dynamic tool updates to other nodes
+- [ ] inline ratatui for console chat
+- [ ] track paid apis usage
+- [ ] more async inputs to enable assistant initiating more conversations

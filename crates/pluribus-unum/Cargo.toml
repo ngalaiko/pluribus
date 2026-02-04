@@ -1,0 +1,35 @@
+[package]
+name = "pluribus-unum"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "unum"
+path = "src/main.rs"
+
+[dependencies]
+pluribus-frequency = { workspace = true}
+pluribus-llm = { workspace = true}
+dirs = { workspace = true }
+futures-lite = { workspace = true }
+serde_json = { workspace = true }
+async-executor = { workspace = true }
+smol-macros = { workspace = true }
+macro_rules_attribute = { workspace = true }
+is-terminal = { workspace = true }
+exn = { workspace = true }
+blocking = { workspace = true }
+isahc = { workspace = true }
+dom_smoothie = { workspace = true }
+serde = { workspace = true }
+async-io = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+schemars = { workspace = true }
+chrono = { workspace = true }
+croner = { workspace = true }
+pulldown-cmark = { workspace = true }

@@ -1,0 +1,2 @@
+#!/command/with-contenv sh
+exec /usr/local/bin/tailscaled --state=mem: --tun=userspace-networking
