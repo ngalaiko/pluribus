@@ -156,6 +156,13 @@ fn is_lowest_node(my_id: &NodeId, net: &Handle) -> bool {
     net.others().iter().all(|m| *my_id < m.id)
 }
 
+fn is_lowest_for_tool(my_id: &NodeId, tool_name: &ToolName, net: &Handle) -> bool {
+    net.others()
+        .iter()
+        .filter(|m| m.tools.iter().any(|t| t.name() == tool_name))
+        .all(|m| *my_id < m.id)
+}
+
 /// Collect all tool definitions (local + others).
 fn all_tool_defs(local_defs: &[ToolDef], net: &Handle) -> Vec<ToolDef> {
     let mut defs = local_defs.to_vec();
@@ -421,7 +428,7 @@ async fn run<P: Provider, C: chat::Chat>(
                     }
 
                     // Only execute if we're the lowest-ID node.
-                    if !is_lowest_node(&node_id, net) {
+                    if !is_lowest_for_tool(&node_id, &tool_name, net) {
                         continue;
                     }
 
