@@ -427,8 +427,6 @@ impl Stream for Listener {
                 // New entries available — read from cursor.
                 let new_entries = this.read_from(this.cursor);
                 if new_entries.is_empty() {
-                    // Spurious wake; re-register.
-                    cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
                 this.cursor += new_entries.len();
