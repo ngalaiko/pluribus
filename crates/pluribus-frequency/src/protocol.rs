@@ -391,11 +391,7 @@ impl fmt::Display for Message {
                 } else {
                     let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
                     if text.is_empty() {
-                        write!(
-                            f,
-                            "[assistant] {thinking}tools=[{}]",
-                            names.join(", ")
-                        )
+                        write!(f, "[assistant] {thinking}tools=[{}]", names.join(", "))
                     } else {
                         write!(
                             f,

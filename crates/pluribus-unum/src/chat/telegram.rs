@@ -208,10 +208,7 @@ impl crate::chat::Chat for Chat {
                     // Display text (with reasoning) — edit streaming message or send new.
                     if !text.is_empty() {
                         let html_text = crate::telegram::markdown::to_telegram_html(&text);
-                        let reasoning = entry
-                            .message
-                            .reasoning_content()
-                            .unwrap_or_default();
+                        let reasoning = entry.message.reasoning_content().unwrap_or_default();
                         let html = combine_reasoning_html(reasoning, &html_text);
                         let plain = format_plain_fallback(reasoning, &text);
 
@@ -231,12 +228,7 @@ impl crate::chat::Chat for Chat {
                                 );
                                 let _ = self
                                     .api
-                                    .edit_message_text(
-                                        self.chat_id,
-                                        state.message_id,
-                                        &plain,
-                                        None,
-                                    )
+                                    .edit_message_text(self.chat_id, state.message_id, &plain, None)
                                     .await;
                             }
                         } else if let Err(e) = self
@@ -244,11 +236,8 @@ impl crate::chat::Chat for Chat {
                             .send_message(self.chat_id, &html, Some("HTML"))
                             .await
                         {
-                            tracing::warn!(
-                                "Telegram sendMessage HTML error, retrying plain: {e}"
-                            );
-                            let _ =
-                                self.api.send_message(self.chat_id, &plain, None).await;
+                            tracing::warn!("Telegram sendMessage HTML error, retrying plain: {e}");
+                            let _ = self.api.send_message(self.chat_id, &plain, None).await;
                         }
                     }
 
@@ -280,8 +269,7 @@ impl crate::chat::Chat for Chat {
                             tracing::warn!(
                                 "Telegram tool call sendMessage HTML error, retrying plain: {e}"
                             );
-                            let _ =
-                                self.api.send_message(self.chat_id, &tool_plain, None).await;
+                            let _ = self.api.send_message(self.chat_id, &tool_plain, None).await;
                         }
                     }
                 }
@@ -345,12 +333,7 @@ impl crate::chat::Chat for Chat {
                     };
 
                     if let Some(new_id) = self
-                        .send_or_edit_snapshot(
-                            &action,
-                            &reasoning_snap,
-                            &text_snap,
-                            msg_id,
-                        )
+                        .send_or_edit_snapshot(&action, &reasoning_snap, &text_snap, msg_id)
                         .await
                     {
                         let mut guard = acc.lock().expect("poisoned");
@@ -358,9 +341,7 @@ impl crate::chat::Chat for Chat {
                         guard.last_edit = Instant::now();
                         drop(guard);
                         let mut s = self.streaming.lock().expect("poisoned");
-                        *s = Some(StreamingState {
-                            message_id: new_id,
-                        });
+                        *s = Some(StreamingState { message_id: new_id });
                     } else if matches!(action, Action::Edit) {
                         let mut guard = acc.lock().expect("poisoned");
                         guard.last_edit = Instant::now();
