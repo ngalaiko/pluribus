@@ -18,11 +18,13 @@ use pluribus_frequency::network;
 use pluribus_frequency::protocol::{Message, NodeId, ToolDef, ToolName};
 use pluribus_frequency::state::{Entry, State};
 
-/// Maximum number of user messages to keep in the context window.
-const CONTEXT_USER_MESSAGES: usize = 5;
 use pluribus_frequency::Handle;
 use pluribus_llm::{collect_response, GenOptions, Provider};
 
+/// Maximum number of user messages to keep in the context window.
+const CONTEXT_USER_MESSAGES: usize = 5;
+/// Maximum number of iterations to allow in a single LLM turn before giving up
+const MAX_ITERATIONS: usize = 20;
 /// Port nodes listen on for communication.
 const PORT: u16 = 8613;
 
@@ -387,6 +389,14 @@ async fn run_scheduler(state: &State, net: &Handle) {
     }
 }
 
+fn messages_since_user(entries: &'a [Entry]) -> usize {
+    entries
+        .iter()
+        .rev()
+        .take_while(|e| !matches!(e.message, Message::User { .. }))
+        .count()
+}
+
 /// Run the agent as an event-driven loop over a [`State`].
 ///
 /// Reacts to entries in the conversation log:
@@ -417,6 +427,11 @@ async fn run<P: Provider, C: chat::Chat>(
 
             // Assistant requested tool calls → execute ones we own and are routed to
             Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                if messages_since_user(state.history().messages()) >= MAX_ITERATIONS {
+                    tracing::warn!("too many iterations without a new user message, skipping tool calls to avoid loops");
+                    continue;
+                }
+
                 let tools = tools::resolve(state);
 
                 for call in tool_calls {
