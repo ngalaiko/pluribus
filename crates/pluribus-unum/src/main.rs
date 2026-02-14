@@ -389,7 +389,7 @@ async fn run_scheduler(state: &State, net: &Handle) {
     }
 }
 
-fn messages_since_user(entries: &'a [Entry]) -> usize {
+fn messages_since_user(entries: &[Entry]) -> usize {
     entries
         .iter()
         .rev()
@@ -427,7 +427,7 @@ async fn run<P: Provider, C: chat::Chat>(
 
             // Assistant requested tool calls → execute ones we own and are routed to
             Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
-                if messages_since_user(state.history().messages()) >= MAX_ITERATIONS {
+                if messages_since_user(&state.history().messages()) >= MAX_ITERATIONS {
                     tracing::warn!("too many iterations without a new user message, skipping tool calls to avoid loops");
                     continue;
                 }
