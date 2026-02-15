@@ -91,7 +91,11 @@ async fn run_interactive<P: Provider, C: chat::Chat>(
         run(&llm, &state, frequency, options, chat),
         futures_lite::future::zip(
             async {
-                let mut stream = state.history().listen_live();
+                let mut stream = if chat.show_full_history() {
+                    state.history().listen().boxed_local()
+                } else {
+                    state.history().listen_live().boxed_local()
+                };
                 while let Some(entry) = stream.next().await {
                     chat.display(&node_id, &entry).await;
                 }

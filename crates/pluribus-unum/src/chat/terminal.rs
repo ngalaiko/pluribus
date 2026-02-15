@@ -54,6 +54,10 @@ impl crate::chat::Chat for Chat {
         }))
     }
 
+    fn show_full_history(&self) -> bool {
+        true
+    }
+
     fn context_hint(&self) -> &'static str {
         "You are chatting via a terminal. Use plain text."
     }

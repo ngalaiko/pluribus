@@ -33,6 +33,14 @@ pub trait Chat: Send + Sync {
     /// the returned stream to `collect_response` for message collection.
     fn display_stream<'a>(&'a self, stream: LlmEventStream<'a>) -> LlmEventStream<'a>;
 
+    /// Whether to call `display` for every log entry in the history when a user connects, or
+    /// only for new entries after they connect.
+    ///
+    /// Defaults to `false` (only new entries).
+    fn show_full_history(&self) -> bool {
+        false
+    }
+
     /// Whether this chat source requires the node to be the leader (lowest
     /// `NodeId`) before accepting messages.
     ///
