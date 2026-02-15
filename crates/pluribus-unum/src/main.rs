@@ -9,13 +9,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_lite::StreamExt;
+use futures_lite::{Stream, StreamExt};
 use is_terminal::IsTerminal;
 use macro_rules_attribute::apply;
+use serde_json::Map;
 use smol_macros::main;
 
 use pluribus_frequency::network;
-use pluribus_frequency::protocol::{Message, NodeId, ToolDef, ToolName};
+use pluribus_frequency::protocol::{Message, NodeId, ToolCall, ToolDef, ToolName};
 use pluribus_frequency::state::{Entry, State};
 
 use pluribus_frequency::Handle;
@@ -24,21 +25,12 @@ use pluribus_llm::{collect_response, GenOptions, Provider};
 /// Maximum number of user messages to keep in the context window.
 const CONTEXT_USER_MESSAGES: usize = 5;
 /// Maximum number of iterations to allow in a single LLM turn before giving up
-const MAX_ITERATIONS: usize = 20;
+const MAX_ITERATIONS: usize = 50;
 /// Port nodes listen on for communication.
 const PORT: u16 = 8613;
 
 #[apply(main!)]
 async fn main(executor: Arc<async_executor::Executor<'static>>) {
-    tracing_subscriber::fmt()
-        .compact()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,loro_internal=warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let network = network::tailscale(PORT).await.expect("tailscale identity");
     let data_dir = dirs::data_dir()
         .expect("could not determine data directory")
@@ -64,21 +56,22 @@ async fn main(executor: Arc<async_executor::Executor<'static>>) {
 
     if std::io::stdout().is_terminal() {
         let chat = chat::terminal();
-        run_interactive(llm, state, &frequency, &options, &chat).await;
+        run_interactive(&executor, llm, state, &frequency, &options, &chat).await;
     } else if let (Some(token), Some(chat_id)) = (
         tools::telegram::bot_token(&config),
         tools::telegram::chat_id(&config),
     ) {
         tracing::info!(chat_id, "using Telegram chat");
         let chat = chat::telegram(&token, chat_id);
-        run_interactive(llm, state, &frequency, &options, &chat).await;
+        run_interactive(&executor, llm, state, &frequency, &options, &chat).await;
     } else {
         let chat = chat::noop();
-        run_interactive(llm, state, &frequency, &options, &chat).await;
+        run_interactive(&executor, llm, state, &frequency, &options, &chat).await;
     }
 }
 
 async fn run_interactive<P: Provider, C: chat::Chat>(
+    executor: &Arc<async_executor::Executor<'static>>,
     llm: P,
     state: State,
     frequency: &Handle,
@@ -88,13 +81,13 @@ async fn run_interactive<P: Provider, C: chat::Chat>(
     let node_id = frequency.self_manifest().id.clone();
 
     futures_lite::future::zip(
-        run(&llm, &state, frequency, options, chat),
+        run(executor, &llm, &state, frequency, options, chat),
         futures_lite::future::zip(
             async {
                 let mut stream = if chat.show_full_history() {
-                    state.history().listen().boxed_local()
+                    state.history().listen().boxed()
                 } else {
-                    state.history().listen_live().boxed_local()
+                    state.history().listen_live().boxed()
                 };
                 while let Some(entry) = stream.next().await {
                     chat.display(&node_id, &entry).await;
@@ -120,39 +113,6 @@ async fn run_interactive<P: Provider, C: chat::Chat>(
         ),
     )
     .await;
-}
-
-/// Find the `Assistant` entry that contains a tool call with the given
-/// `call_id`. Returns the entry's `origin` and tool call IDs if found.
-fn find_assistant_for_call<'a>(
-    entries: &'a [Entry],
-    call_id: &str,
-) -> Option<(&'a NodeId, Vec<&'a str>)> {
-    entries.iter().rev().find_map(|e| {
-        if let Message::Assistant { tool_calls, .. } = &e.message {
-            if tool_calls.iter().any(|c| c.id == call_id) {
-                let ids = tool_calls.iter().map(|c| c.id.as_str()).collect();
-                return Some((&e.origin, ids));
-            }
-        }
-        None
-    })
-}
-
-/// Check if all tool results are in for a set of call IDs.
-fn all_results_in(entries: &[Entry], needed: &[&str]) -> bool {
-    let needed: HashSet<&str> = needed.iter().copied().collect();
-    let found: HashSet<&str> = entries
-        .iter()
-        .filter_map(|e| {
-            if let Message::Tool { tool_call_id, .. } = &e.message {
-                Some(tool_call_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-    needed.iter().all(|id| found.contains(id))
 }
 
 /// Check if this node has the lowest `NodeId` among all connected peers.
@@ -303,42 +263,6 @@ Use getCurrentTime before computing schedule times.{chat_hint_section}"
     ))
 }
 
-/// Run one LLM turn: build tools, call LLM, post the resulting Assistant message.
-async fn run_llm_turn<P: Provider, C: chat::Chat>(
-    llm: &P,
-    node_id: &NodeId,
-    state: &State,
-    net: &Handle,
-    options: &GenOptions,
-    chat: &C,
-) {
-    let local_defs = tools::resolve(state).defs();
-    let entries = state.history().messages();
-    let tool_defs = all_tool_defs(&local_defs, net);
-    tracing::debug!(entries = entries.len(), tools = tool_defs.len(), "llm turn");
-    let mut messages = build_context(&entries);
-    messages.insert(0, build_system_message(net, state, chat));
-    let response = {
-        let stream = llm.complete_stream(&messages, &tool_defs, options);
-        let stream = chat.display_stream(stream);
-        match collect_response(stream).await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!(%e, "llm error");
-                let entry = Entry::new(
-                    Message::assistant(format!("LLM error: {e}")),
-                    node_id.clone(),
-                );
-                let _ = state.history().push(&entry);
-                return;
-            }
-        }
-    };
-
-    let entry = Entry::new(response, node_id.clone());
-    let _ = state.history().push(&entry);
-}
-
 /// Background scheduler: wakes every 30 seconds and fires due schedules.
 ///
 /// Only the leader (lowest `NodeId`) fires schedules to avoid duplicates
@@ -393,14 +317,6 @@ async fn run_scheduler(state: &State, net: &Handle) {
     }
 }
 
-fn messages_since_user(entries: &[Entry]) -> usize {
-    entries
-        .iter()
-        .rev()
-        .take_while(|e| !matches!(e.message, Message::User { .. }))
-        .count()
-}
-
 /// Run the agent as an event-driven loop over a [`State`].
 ///
 /// Reacts to entries in the conversation log:
@@ -413,6 +329,7 @@ fn messages_since_user(entries: &[Entry]) -> usize {
 ///
 /// Returns when the log stream ends (i.e. [`State::leave`] is called).
 async fn run<P: Provider, C: chat::Chat>(
+    executor: &Arc<async_executor::Executor<'static>>,
     llm: &P,
     state: &State,
     net: &Handle,
@@ -424,72 +341,197 @@ async fn run<P: Provider, C: chat::Chat>(
 
     while let Some(entry) = stream.next().await {
         match &entry.message {
-            // A user message we originated → run LLM
+            // User message we originated → run tool loop
             Message::User { .. } if entry.origin == node_id => {
-                run_llm_turn(llm, &node_id, state, net, options, chat).await;
+                tool_loop(llm, &node_id, state, net, options, chat, executor).await;
             }
 
-            // Assistant requested tool calls → execute ones we own and are routed to
+            // Remote tool call we can handle
             Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
-                if messages_since_user(&state.history().messages()) >= MAX_ITERATIONS {
-                    tracing::warn!("too many iterations without a new user message, skipping tool calls to avoid loops");
-                    continue;
+                if entry.origin == node_id {
+                    continue; // We're the LLM node, tool_loop handles this
                 }
-
-                let tools = tools::resolve(state);
-
-                for call in tool_calls {
-                    let tool_name = ToolName::new(&call.name);
-
-                    // Only execute tools we own.
-                    if !tools.defs().iter().any(|d| d.name() == &tool_name) {
-                        continue;
-                    }
-
-                    // Only execute if we're the lowest-ID node.
-                    if !is_lowest_for_tool(&node_id, &tool_name, net) {
-                        continue;
-                    }
-
-                    tracing::info!(tool = %call, "tool call");
-
-                    let input: serde_json::Value = serde_json::from_str(&call.arguments)
-                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-
-                    let result = tools.execute(&tool_name, input).await;
-                    let (result_content, is_error) = match &result {
-                        Ok(v) => {
-                            tracing::debug!(tool = %call.name, "tool ok");
-                            (serde_json::to_string(&v).unwrap_or_default(), false)
-                        }
-                        Err(e) => {
-                            tracing::debug!(tool = %call.name, error = %e, "tool error");
-                            (e.clone(), true)
-                        }
-                    };
-
-                    let result_entry = Entry::new(
-                        Message::tool_result(call.id.clone(), result_content, is_error),
-                        node_id.clone(),
-                    );
-                    if state.history().push(&result_entry).is_err() {
-                        return;
-                    }
-                }
-            }
-
-            // Tool result arrived → find its parent assistant, check if it's ours,
-            // and if all sibling results are in, continue with the next LLM turn.
-            Message::Tool { tool_call_id, .. } => {
-                let entries = state.history().messages();
-                if let Some((origin, call_ids)) = find_assistant_for_call(&entries, tool_call_id) {
-                    if *origin == node_id && all_results_in(&entries, &call_ids) {
-                        run_llm_turn(llm, &node_id, state, net, options, chat).await;
-                    }
-                }
+                execute_remote_calls(tool_calls, &node_id, state, net).await;
             }
 
             _ => {}
         }
     }
+}
+
+/// Non-LLM nodes: execute tool calls they own.
+async fn execute_remote_calls(
+    tool_calls: &[ToolCall],
+    node_id: &NodeId,
+    state: &State,
+    net: &Handle,
+) {
+    let tools = tools::resolve(state);
+    let local_defs = tools.defs();
+
+    for call in tool_calls {
+        let name = ToolName::new(&call.name);
+        if !local_defs.iter().any(|d| d.name() == &name) {
+            continue;
+        }
+        if !is_lowest_for_tool(node_id, &name, net) {
+            continue;
+        }
+
+        let input: serde_json::Value = serde_json::from_str(&call.arguments)
+            .unwrap_or_else(|_| serde_json::Value::Object(Map::default()));
+
+        let result = tools.execute(&name, input).await;
+        let (content, is_error) = match &result {
+            Ok(v) => (serde_json::to_string(v).unwrap_or_default(), false),
+            Err(e) => (e.clone(), true),
+        };
+
+        let entry = Entry::new(
+            Message::tool_result(&call.id, content, is_error),
+            node_id.clone(),
+        );
+        let _ = state.history().push(&entry);
+    }
+}
+
+/// Run the tool loop for a single user message until the LLM is done.
+async fn tool_loop<P: Provider, C: chat::Chat>(
+    llm: &P,
+    node_id: &NodeId,
+    state: &State,
+    net: &Handle,
+    options: &GenOptions,
+    chat: &C,
+    executor: &Arc<async_executor::Executor<'static>>,
+) {
+    for _ in 0..MAX_ITERATIONS {
+        let local_tools = Arc::new(tools::resolve(state));
+        let all_defs = all_tool_defs(&local_tools.defs(), net);
+        let entries = state.history().messages();
+        let cursor = entries.len();
+        let mut messages = build_context(&entries);
+        messages.insert(0, build_system_message(net, state, chat));
+
+        let response = {
+            let stream = llm.complete_stream(&messages, &all_defs, options);
+            let stream = chat.display_stream(stream);
+            match collect_response(stream).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::warn!(%e, "llm error");
+                    let entry = Entry::new(
+                        Message::assistant(format!("LLM error: {e}")),
+                        node_id.clone(),
+                    );
+                    let _ = state.history().push(&entry);
+                    return;
+                }
+            }
+        };
+
+        let tool_calls = response.tool_calls().to_vec();
+        let entry = Entry::new(response, node_id.clone());
+        let _ = state.history().push(&entry);
+
+        // No tool calls — LLM is done.
+        if tool_calls.is_empty() {
+            return;
+        }
+
+        // Partition: local vs remote
+        let local_defs = local_tools.defs();
+        let mut local = Vec::new();
+        let mut remote = Vec::new();
+
+        for call in &tool_calls {
+            let name = ToolName::new(&call.name);
+            if local_defs.iter().any(|d| d.name() == &name) {
+                local.push(call);
+            } else {
+                remote.push(call);
+            }
+        }
+
+        // Execute local tools in parallel
+        let local_tasks: Vec<_> = local
+            .into_iter()
+            .map(|call| {
+                let tools = Arc::clone(&local_tools);
+                let name = ToolName::new(&call.name);
+                let input: serde_json::Value = serde_json::from_str(&call.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::Object(Map::default()));
+                let call_id = call.id.clone();
+                executor.spawn(async move {
+                    let result = tools.execute(&name, input).await;
+                    let (content, is_error) = match &result {
+                        Ok(v) => (serde_json::to_string(v).unwrap_or_default(), false),
+                        Err(e) => (e.clone(), true),
+                    };
+                    (call_id, content, is_error)
+                })
+            })
+            .collect();
+
+        // Dispatch remote tools — push to history and wait for results
+        let mut pending_remote: HashSet<String> = HashSet::new();
+        for call in &remote {
+            pending_remote.insert(call.id.clone());
+            // The tool call is already in the history (in the Assistant message).
+            // Remote nodes see it and execute it.
+        }
+
+        // Collect local results
+        for task in local_tasks {
+            let (call_id, content, is_error) = task.await;
+            pending_remote.remove(&call_id); // shouldn't be there, but safe
+            let entry = Entry::new(
+                Message::tool_result(&call_id, content, is_error),
+                node_id.clone(),
+            );
+            let _ = state.history().push(&entry);
+        }
+
+        // Wait for remote results
+        if !pending_remote.is_empty() {
+            let stream = state.history().listen_since(cursor);
+            wait_for_results(stream, &pending_remote, Duration::from_secs(120)).await;
+        }
+
+        // All results in — loop back to LLM
+    }
+
+    // Hit max iterations
+    let entry = Entry::new(
+        Message::assistant("Stopped: too many tool iterations."),
+        node_id.clone(),
+    );
+    let _ = state.history().push(&entry);
+}
+
+async fn wait_for_results(
+    stream: impl Stream<Item = Entry> + Unpin,
+    pending: &HashSet<String>,
+    timeout: Duration,
+) -> bool {
+    let mut remaining: HashSet<&str> = pending.iter().map(String::as_str).collect();
+    futures_lite::pin!(stream);
+
+    let done = async {
+        while let Some(entry) = stream.next().await {
+            if let Message::Tool { tool_call_id, .. } = &entry.message {
+                remaining.remove(tool_call_id.as_str());
+                if remaining.is_empty() {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    futures_lite::future::or(done, async {
+        async_io::Timer::after(timeout).await;
+        false
+    })
+    .await
 }

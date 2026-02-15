@@ -331,10 +331,19 @@ impl History {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn listen(&self) -> impl Stream<Item = Entry> {
+    pub fn listen(&self) -> impl Stream<Item = Entry> + Send {
+        self.listen_since(0)
+    }
+
+    /// Stream entries from `start` onward, then live as they arrive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn listen_since(&self, start: usize) -> impl Stream<Item = Entry> + Send {
         let inner = self.inner.lock().expect("poisoned");
 
-        let existing = read_from_inner(&inner, 0);
+        let existing = read_from_inner(&inner, start);
         let cursor = inner.history.len();
         let receiver = inner.sender.new_receiver();
 
@@ -357,7 +366,7 @@ impl History {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn listen_live(&self) -> impl Stream<Item = Entry> {
+    pub fn listen_live(&self) -> impl Stream<Item = Entry> + Send {
         let inner = self.inner.lock().expect("poisoned");
         let cursor = inner.history.len();
         let receiver = inner.sender.new_receiver();
