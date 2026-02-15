@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use isahc::config::RedirectPolicy;
@@ -16,7 +15,6 @@ pub const fn new() -> Tool {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct Input {
     pub url: String,
-    pub headers: HashMap<String, String>,
 }
 
 impl crate::tools::Tool for Tool {
@@ -76,15 +74,11 @@ const fn floor_char_boundary(s: &str, index: usize) -> usize {
 }
 
 async fn fetch_url(input: Input) -> Result<String, String> {
-    let mut builder = Request::get(&input.url)
+    let builder = Request::get(&input.url)
         .timeout(Duration::from_secs(15))
         .redirect_policy(RedirectPolicy::Limit(5))
         .header("User-Agent", "Pluribus/1.0")
         .header("Accept", "text/markdown, text/plain;q=0.9, text/html;q=0.8");
-
-    for (key, value) in &input.headers {
-        builder = builder.header(key.as_str(), value.as_str());
-    }
 
     let request = builder.body(()).map_err(|e| e.to_string())?;
 
