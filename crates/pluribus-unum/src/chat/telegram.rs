@@ -190,10 +190,14 @@ impl crate::chat::Chat for Chat {
 
     fn display<'a>(
         &'a self,
-        _self_id: &'a NodeId,
+        self_id: &'a NodeId,
         entry: &'a Entry,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
+            if !entry.origin.eq(self_id) {
+                // Only display entries originating from this chat.
+                return;
+            }
             match &entry.message {
                 Message::User { .. } | Message::System { .. } | Message::Tool { .. } => {}
 
