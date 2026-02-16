@@ -6,9 +6,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use futures_lite::Stream;
+
 use pluribus_frequency::protocol::{ContentPart, NodeId};
 use pluribus_frequency::state::Entry;
-use pluribus_llm::LlmEventStream;
+
+use crate::llm::LlmEventStream;
 
 /// A chat interface for human interaction.
 ///

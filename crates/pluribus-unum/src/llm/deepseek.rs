@@ -5,8 +5,7 @@ use isahc::{HttpClient, Request};
 use pluribus_frequency::protocol::{Message, ToolDef};
 use pluribus_frequency::state::Configuration;
 
-use crate::openai_compat;
-use crate::{GenOptions, LlmEventStream, Provider};
+use crate::llm::{openai_compat, GenOptions, LlmEventStream, Provider};
 
 const BASE_URL: &str = "https://api.deepseek.com";
 const KEY_API_KEY: &str = "deepseek.api_key";
@@ -14,6 +13,7 @@ const KEY_API_KEY: &str = "deepseek.api_key";
 #[derive(Clone, Copy)]
 pub enum DeepSeekModel {
     Chat,
+    #[allow(dead_code)]
     Reasoner,
 }
 
@@ -93,15 +93,6 @@ enum State {
 }
 
 impl Provider for DeepSeek {
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn name(&self) -> &str {
-        "deepseek"
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model
-    }
-
     fn complete_stream<'a>(
         &'a self,
         messages: &'a [Message],

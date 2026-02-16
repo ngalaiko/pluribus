@@ -18,9 +18,9 @@ use smol_macros::main;
 use pluribus_frequency::network;
 use pluribus_frequency::protocol::{Message, NodeId, ToolCall, ToolDef, ToolName};
 use pluribus_frequency::state::{Entry, State};
-
 use pluribus_frequency::Handle;
-use pluribus_llm::{collect_response, GenOptions, Provider};
+
+use crate::llm::{collect_response, GenOptions, Provider};
 
 /// Maximum number of user messages to keep in the context window.
 const CONTEXT_USER_MESSAGES: usize = 5;

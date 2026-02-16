@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_lite::Stream;
+
 use pluribus_frequency::protocol::{ContentPart, Message, NodeId};
 use pluribus_frequency::state::Entry;
-use pluribus_llm::{LlmEvent, LlmEventStream};
 
+use crate::llm::{LlmEvent, LlmEventStream};
 use crate::telegram::{ApiClient, ERROR_BACKOFF, POLL_TIMEOUT};
 
 // ---------------------------------------------------------------------------
@@ -303,15 +304,15 @@ impl crate::chat::Chat for Chat {
             async move {
                 let is_content_delta = matches!(
                     event,
-                    Ok(LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_))
+                    Ok(LlmEvent::Text(_) | LlmEvent::Reasoning(_))
                 );
 
                 if is_content_delta {
                     let (action, reasoning_snap, text_snap, msg_id) = {
                         let mut guard = acc.lock().expect("poisoned");
                         match &event {
-                            Ok(LlmEvent::TextDelta(delta)) => guard.text.push_str(delta),
-                            Ok(LlmEvent::ReasoningDelta(delta)) => {
+                            Ok(LlmEvent::Text(delta)) => guard.text.push_str(delta),
+                            Ok(LlmEvent::Reasoning(delta)) => {
                                 guard.reasoning.push_str(delta);
                             }
                             _ => {}

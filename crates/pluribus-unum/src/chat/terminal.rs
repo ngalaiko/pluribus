@@ -3,9 +3,11 @@ use std::io::Write;
 use std::pin::Pin;
 
 use futures_lite::Stream;
+
 use pluribus_frequency::protocol::{ContentPart, Message, NodeId};
 use pluribus_frequency::state::Entry;
-use pluribus_llm::{LlmEvent, LlmEventStream};
+
+use crate::llm::{LlmEvent, LlmEventStream};
 
 /// Console-based chat interface using stdin/stdout.
 pub struct Chat;
@@ -41,11 +43,11 @@ impl crate::chat::Chat for Chat {
         use futures_lite::StreamExt;
 
         Box::pin(stream.inspect(|event| match event {
-            Ok(LlmEvent::TextDelta(text)) => {
+            Ok(LlmEvent::Text(text)) => {
                 print!("{text}");
                 let _ = std::io::stdout().flush();
             }
-            Ok(LlmEvent::ReasoningDelta(text)) => {
+            Ok(LlmEvent::Reasoning(text)) => {
                 // Dim ANSI styling for reasoning/thinking output.
                 print!("\x1b[2m{text}\x1b[0m");
                 let _ = std::io::stdout().flush();

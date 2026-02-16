@@ -2,14 +2,12 @@
 resolver = "2"
 members = [
   "crates/pluribus-frequency",
-  "crates/pluribus-llm",
   "crates/pluribus-unum",
 ]
 
 [workspace.dependencies]
 pluribus-chat = { path = "./crates/pluribus-chat" }
 pluribus-frequency = { path = "./crates/pluribus-frequency" }
-pluribus-llm = { path = "./crates/pluribus-llm" }
 
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

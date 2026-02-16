@@ -4,7 +4,7 @@ use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use pluribus_frequency::protocol::{Message, ToolDef};
 use serde::{Deserialize, Serialize};
 
-use crate::{GenOptions, LlmError, LlmEvent};
+use crate::llm::{GenOptions, LlmError, LlmEvent};
 
 // -- Frequency → OpenAI wire conversion -------------------------------------
 
@@ -146,13 +146,13 @@ pub async fn read_next_sse_event(
 
         if let Some(reasoning) = choice.delta.reasoning_content {
             if !reasoning.is_empty() {
-                return Ok(Some(LlmEvent::ReasoningDelta(reasoning)));
+                return Ok(Some(LlmEvent::Reasoning(reasoning)));
             }
         }
 
         if let Some(content) = choice.delta.content {
             if !content.is_empty() {
-                return Ok(Some(LlmEvent::TextDelta(content)));
+                return Ok(Some(LlmEvent::Text(content)));
             }
         }
 
@@ -164,7 +164,7 @@ pub async fn read_next_sse_event(
                     .as_ref()
                     .and_then(|f| f.arguments.clone())
                     .unwrap_or_default();
-                return Ok(Some(LlmEvent::ToolCallDelta {
+                return Ok(Some(LlmEvent::ToolCall {
                     index: tc.index,
                     id: tc.id,
                     function_name: func_name,

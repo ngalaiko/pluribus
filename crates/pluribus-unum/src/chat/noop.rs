@@ -2,9 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use futures_lite::Stream;
+
 use pluribus_frequency::protocol::{ContentPart, NodeId};
 use pluribus_frequency::state::Entry;
-use pluribus_llm::LlmEventStream;
+
+use crate::llm::LlmEventStream;
 
 /// No-op chat interface. Produces no input and discards all output.
 pub struct Chat;

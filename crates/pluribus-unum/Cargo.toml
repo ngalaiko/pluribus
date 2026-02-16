@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 pluribus-frequency = { workspace = true}
-pluribus-llm = { workspace = true}
 dirs = { workspace = true }
 futures-lite = { workspace = true }
 serde_json = { workspace = true }
