@@ -1,6 +1,9 @@
-- [ ] thinking mode
-- [ ] multimodal
-- [ ] sync dynamic tool updates to other nodes
+- [ ] image input
+- [ ] headless chrome
+- [ ] give it shell access. restrict ro unum user, and /home/unum dir, explain how to serve stuff inside tailscale
+- [ ] support skills, add tool to discover new skills via https://skills.sh/
+- [ ] mac os deployment with antoniorodr/memo, steipete/tap/remindctl, ical-buddy
+- [ ] thinking mode only when needed
 - [ ] inline ratatui for console chat
 - [ ] track paid apis usage
 - [ ] more async inputs to enable assistant initiating more conversations
