@@ -31,16 +31,42 @@ impl std::error::Error for Error {}
 ///
 /// Dropping the handle cancels all networking tasks.
 pub struct Handle {
-    manifest: Manifest,
+    manifest: Arc<Mutex<Manifest>>,
+    manifest_tx: async_broadcast::Sender<Manifest>,
+    /// Keep-alive so the broadcast channel stays open even when no receivers exist yet.
+    _manifest_rx: async_broadcast::InactiveReceiver<Manifest>,
     _shutdown_tx: async_channel::Sender<()>,
     peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
 }
 
 impl Handle {
-    /// This node's manifest.
+    /// This node's manifest (owned clone).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
-    pub const fn self_manifest(&self) -> &Manifest {
-        &self.manifest
+    pub fn self_manifest(&self) -> Manifest {
+        self.manifest.lock().expect("poisoned").clone()
+    }
+
+    /// Update the local tool list and broadcast the change to all peers.
+    ///
+    /// No-op if the tools haven't changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn update_tools(&self, tools: &[ToolDef]) {
+        let mut inner = self.manifest.lock().expect("poisoned");
+        if inner.tools == tools {
+            return;
+        }
+        inner.tools = tools.to_vec();
+        let manifest = inner.clone();
+        drop(inner);
+        tracing::debug!(tools = manifest.tools.len(), "broadcasting manifest update");
+        let _ = self.manifest_tx.try_broadcast(manifest);
     }
 
     /// Snapshot of currently connected peers.
@@ -81,6 +107,11 @@ pub async fn join<N: Network>(
     let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
     let peers: Arc<Mutex<HashMap<NodeId, Manifest>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    let (mut manifest_tx, manifest_rx) = async_broadcast::broadcast::<Manifest>(16);
+    manifest_tx.set_overflow(true);
+    let manifest_keep_alive = manifest_rx.deactivate();
+    let manifest = Arc::new(Mutex::new(manifest));
+
     // TCP listener.
     let listener = async_net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
@@ -91,12 +122,13 @@ pub async fn join<N: Network>(
     {
         let ex = Arc::clone(&executor);
         let log = log.clone();
-        let manifest = manifest.clone();
+        let manifest = Arc::clone(&manifest);
         let shutdown_rx = shutdown_rx.clone();
         let peers = Arc::clone(&peers);
+        let manifest_tx = manifest_tx.clone();
         executor
             .spawn(async move {
-                accept_loop(ex, listener, log, manifest, peers, shutdown_rx).await;
+                accept_loop(ex, listener, log, manifest, peers, shutdown_rx, manifest_tx).await;
             })
             .detach();
     }
@@ -105,18 +137,22 @@ pub async fn join<N: Network>(
     {
         let ex = Arc::clone(&executor);
         let log = log.clone();
-        let manifest = manifest.clone();
+        let manifest = Arc::clone(&manifest);
         let shutdown_rx = shutdown_rx.clone();
         let peers = Arc::clone(&peers);
+        let manifest_tx = manifest_tx.clone();
         executor
             .spawn(async move {
-                network_event_loop(ex, network, log, manifest, peers, shutdown_rx).await;
+                network_event_loop(ex, network, log, manifest, peers, shutdown_rx, manifest_tx)
+                    .await;
             })
             .detach();
     }
 
     Ok(Handle {
         manifest,
+        manifest_tx,
+        _manifest_rx: manifest_keep_alive,
         _shutdown_tx: shutdown_tx,
         peers,
     })
@@ -126,9 +162,10 @@ async fn accept_loop(
     executor: Arc<async_executor::Executor<'static>>,
     listener: async_net::TcpListener,
     log: State,
-    manifest: Manifest,
+    manifest: Arc<Mutex<Manifest>>,
     peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
     shutdown_rx: async_channel::Receiver<()>,
+    manifest_tx: async_broadcast::Sender<Manifest>,
 ) {
     loop {
         let accepted = futures_lite::future::or(async { listener.accept().await.ok() }, async {
@@ -144,12 +181,13 @@ async fn accept_loop(
 
         let ex = Arc::clone(&executor);
         let log = log.clone();
-        let manifest = manifest.clone();
+        let manifest = Arc::clone(&manifest);
         let peers = Arc::clone(&peers);
         let shutdown_rx = shutdown_rx.clone();
+        let manifest_tx = manifest_tx.clone();
         executor
             .spawn(async move {
-                handle_inbound(ex, stream, &log, &manifest, peers, shutdown_rx).await;
+                handle_inbound(ex, stream, &log, &manifest, peers, shutdown_rx, manifest_tx).await;
             })
             .detach();
     }
@@ -159,11 +197,23 @@ async fn handle_inbound(
     executor: Arc<async_executor::Executor<'static>>,
     stream: async_net::TcpStream,
     log: &State,
-    manifest: &Manifest,
+    manifest: &Arc<Mutex<Manifest>>,
     peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
     shutdown_rx: async_channel::Receiver<()>,
+    manifest_tx: async_broadcast::Sender<Manifest>,
 ) {
-    let (remote, handle) = match sync::accept(executor, log, manifest, stream).await {
+    let manifest_snapshot = manifest.lock().expect("poisoned").clone();
+    let manifest_rx = manifest_tx.new_receiver();
+    let (remote, handle) = match sync::accept(
+        executor,
+        log,
+        &manifest_snapshot,
+        stream,
+        manifest_rx,
+        Arc::clone(&peers),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(?e, "handshake/sync error");
@@ -202,11 +252,13 @@ async fn network_event_loop<N: Network>(
     executor: Arc<async_executor::Executor<'static>>,
     network: N,
     log: State,
-    manifest: Manifest,
+    manifest: Arc<Mutex<Manifest>>,
     peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
     shutdown_rx: async_channel::Receiver<()>,
+    manifest_tx: async_broadcast::Sender<Manifest>,
 ) {
     let mut events = network.events();
+    let self_id = manifest.lock().expect("poisoned").id.clone();
 
     loop {
         let event = futures_lite::future::or(async { events.next().await }, async {
@@ -221,7 +273,7 @@ async fn network_event_loop<N: Network>(
 
         match event {
             Event::Online { id, name, addr } => {
-                if id == manifest.id {
+                if id == self_id {
                     continue;
                 }
 
@@ -236,18 +288,29 @@ async fn network_event_loop<N: Network>(
                 }
 
                 // Tie-break: only the node with the smaller ID dials out.
-                if manifest.id > id {
+                if self_id > id {
                     continue;
                 }
 
                 let ex = Arc::clone(&executor);
                 let log = log.clone();
-                let manifest = manifest.clone();
+                let manifest = Arc::clone(&manifest);
                 let peers = Arc::clone(&peers);
+                let manifest_tx = manifest_tx.clone();
                 executor
                     .spawn(async move {
                         tracing::info!(%name, %addr, "connecting to peer");
-                        connect_to_peer(ex, &log, &manifest, &peers, &id, &name, addr).await;
+                        connect_to_peer(
+                            ex,
+                            &log,
+                            &manifest,
+                            &peers,
+                            &id,
+                            &name,
+                            addr,
+                            manifest_tx,
+                        )
+                        .await;
                     })
                     .detach();
             }
@@ -263,16 +326,29 @@ async fn network_event_loop<N: Network>(
 // connect_to_peer
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_peer(
     executor: Arc<async_executor::Executor<'static>>,
     log: &State,
-    manifest: &Manifest,
+    manifest: &Arc<Mutex<Manifest>>,
     peers: &Arc<Mutex<HashMap<NodeId, Manifest>>>,
     peer_id: &NodeId,
     peer_name: &str,
     addr: SocketAddr,
+    manifest_tx: async_broadcast::Sender<Manifest>,
 ) {
-    let (remote, handle) = match sync::dial(executor, log, manifest, addr).await {
+    let manifest_snapshot = manifest.lock().expect("poisoned").clone();
+    let manifest_rx = manifest_tx.new_receiver();
+    let (remote, handle) = match sync::dial(
+        executor,
+        log,
+        &manifest_snapshot,
+        addr,
+        manifest_rx,
+        Arc::clone(peers),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(%peer_name, ?e, "connection failed");

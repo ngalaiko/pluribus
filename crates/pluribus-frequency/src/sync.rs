@@ -1,4 +1,9 @@
-use std::{fmt, pin::Pin};
+use std::{
+    collections::HashMap,
+    fmt,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 use exn::ResultExt;
 use futures_lite::io::{AsyncRead, AsyncWrite};
@@ -6,9 +11,7 @@ use futures_lite::StreamExt;
 use futures_sink::Sink;
 use serde::{Deserialize, Serialize};
 
-use std::sync::Arc;
-
-use crate::protocol::Manifest;
+use crate::protocol::{Manifest, NodeId};
 use crate::state::State;
 
 /// Errors returned by sync operations.
@@ -31,6 +34,7 @@ enum WireMessage {
     },
     Sync(#[serde(with = "serde_bytes")] Vec<u8>),
     Update(#[serde(with = "serde_bytes")] Vec<u8>),
+    ManifestUpdate(Manifest),
 }
 
 impl fmt::Debug for WireMessage {
@@ -39,6 +43,7 @@ impl fmt::Debug for WireMessage {
             Self::Hello { manifest, .. } => write!(f, "Hello({manifest})"),
             Self::Sync(data) => write!(f, "Sync({}B)", data.len()),
             Self::Update(data) => write!(f, "Update({}B)", data.len()),
+            Self::ManifestUpdate(manifest) => write!(f, "ManifestUpdate({manifest})"),
         }
     }
 }
@@ -161,6 +166,9 @@ async fn sync_after_hello<S>(
     log: &State,
     mut ws: async_tungstenite::WebSocketStream<S>,
     remote_vv: &loro::VersionVector,
+    manifest_rx: async_broadcast::Receiver<Manifest>,
+    peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
+    remote_id: NodeId,
 ) -> exn::Result<SyncHandle, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -193,7 +201,7 @@ where
     let log = log.clone();
     let peer_vv = log.oplog_vv();
     let ex = Arc::clone(&executor);
-    let task = executor.spawn(sync_loop(ex, log, ws, peer_vv));
+    let task = executor.spawn(sync_loop(ex, log, ws, peer_vv, manifest_rx, peers, remote_id));
 
     Ok(SyncHandle { task })
 }
@@ -206,12 +214,16 @@ async fn join_websocket<S>(
     log: &State,
     manifest: &Manifest,
     ws: async_tungstenite::WebSocketStream<S>,
+    manifest_rx: async_broadcast::Receiver<Manifest>,
+    peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
 ) -> exn::Result<(Manifest, SyncHandle), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (remote, remote_vv, ws) = exchange_hello(log, manifest, ws).await?;
-    let handle = sync_after_hello(executor, log, ws, &remote_vv).await?;
+    let remote_id = remote.id.clone();
+    let handle = sync_after_hello(executor, log, ws, &remote_vv, manifest_rx, peers, remote_id)
+        .await?;
     Ok((remote, handle))
 }
 
@@ -224,6 +236,8 @@ pub async fn dial(
     log: &State,
     manifest: &Manifest,
     addr: std::net::SocketAddr,
+    manifest_rx: async_broadcast::Receiver<Manifest>,
+    peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
 ) -> exn::Result<(Manifest, SyncHandle), Error> {
     let stream = async_net::TcpStream::connect(addr)
         .await
@@ -232,7 +246,7 @@ pub async fn dial(
     let (ws, _) = async_tungstenite::client_async(&url, stream)
         .await
         .or_raise(|| Error(format!("WS handshake with {addr}")))?;
-    join_websocket(executor, log, manifest, ws).await
+    join_websocket(executor, log, manifest, ws, manifest_rx, peers).await
 }
 
 /// Accept an inbound TCP connection, upgrade to `WebSocket`, exchange hello,
@@ -244,12 +258,16 @@ pub async fn accept(
     log: &State,
     manifest: &Manifest,
     stream: async_net::TcpStream,
+    manifest_rx: async_broadcast::Receiver<Manifest>,
+    peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
 ) -> exn::Result<(Manifest, SyncHandle), Error> {
     let ws = async_tungstenite::accept_async(stream)
         .await
         .or_raise(|| Error("WS accept".into()))?;
     let (remote, remote_vv, ws) = exchange_hello(log, manifest, ws).await?;
-    let handle = sync_after_hello(executor, log, ws, &remote_vv).await?;
+    let remote_id = remote.id.clone();
+    let handle = sync_after_hello(executor, log, ws, &remote_vv, manifest_rx, peers, remote_id)
+        .await?;
     Ok((remote, handle))
 }
 
@@ -257,12 +275,17 @@ pub async fn accept(
 ///
 /// Uses two concurrent tasks sharing the `WebSocket` via a channel:
 /// - A reader task pulls messages from the WS and forwards to a channel.
-/// - The main loop selects between local broadcast and remote channel.
+/// - The main loop selects between local broadcast, manifest broadcast,
+///   and remote channel.
+#[allow(clippy::too_many_lines)]
 async fn sync_loop<S>(
     executor: Arc<async_executor::Executor<'static>>,
     log: State,
     mut ws: async_tungstenite::WebSocketStream<S>,
     mut peer_vv: loro::VersionVector,
+    mut manifest_rx: async_broadcast::Receiver<Manifest>,
+    peers: Arc<Mutex<HashMap<NodeId, Manifest>>>,
+    remote_id: NodeId,
 ) -> exn::Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -271,7 +294,7 @@ where
     let (remote_tx, remote_rx) = async_channel::bounded::<Option<WireMessage>>(16);
 
     // Channel for outbound messages to send over WS.
-    let (outbound_tx, outbound_rx) = async_channel::bounded::<Vec<u8>>(16);
+    let (outbound_tx, outbound_rx) = async_channel::bounded::<WireMessage>(16);
 
     // Task: WS reader + writer. Owns the WebSocket.
     let ws_task: async_executor::Task<exn::Result<(), Error>> = executor.spawn(async move {
@@ -280,7 +303,7 @@ where
         loop {
             enum Action {
                 Received(Option<WireMessage>),
-                Outbound(Vec<u8>),
+                Outbound(WireMessage),
             }
 
             let action = futures_lite::future::or(
@@ -302,29 +325,37 @@ where
                         return Ok(());
                     }
                 }
-                Action::Outbound(data) => {
-                    let msg = WireMessage::Update(data);
+                Action::Outbound(msg) => {
                     ws_send(&mut ws, &msg).await?;
                 }
             }
         }
     });
 
-    // Main loop: react to local changes and remote messages.
+    // Main loop: react to local changes, manifest changes, and remote messages.
     let mut receiver = log.new_broadcast_receiver();
 
     let result: exn::Result<(), Error> = async {
         loop {
             enum Branch {
                 LocalChange,
+                ManifestChange(Manifest),
                 Remote(Option<WireMessage>),
             }
 
             let branch = futures_lite::future::or(
-                async {
-                    let _ = receiver.next().await;
-                    Branch::LocalChange
-                },
+                futures_lite::future::or(
+                    async {
+                        let _ = receiver.next().await;
+                        Branch::LocalChange
+                    },
+                    async {
+                        manifest_rx
+                            .recv()
+                            .await
+                            .map_or(Branch::Remote(None), Branch::ManifestChange)
+                    },
+                ),
                 async {
                     remote_rx
                         .recv()
@@ -341,15 +372,28 @@ where
                         .or_raise(|| Error("export local updates for peer".into()))?;
                     if !updates.is_empty() {
                         tracing::trace!(size = updates.len(), "sending update to peer");
-                        let _ = outbound_tx.send(updates).await;
+                        let _ = outbound_tx.send(WireMessage::Update(updates)).await;
                         peer_vv = log.oplog_vv();
                     }
+                }
+                Branch::ManifestChange(manifest) => {
+                    tracing::debug!("sending manifest update to peer");
+                    let _ = outbound_tx
+                        .send(WireMessage::ManifestUpdate(manifest))
+                        .await;
                 }
                 Branch::Remote(Some(WireMessage::Update(data))) => {
                     tracing::trace!(size = data.len(), "imported update from peer");
                     log.import_remote(&data)
                         .or_raise(|| Error("import remote update".into()))?;
                     peer_vv = log.oplog_vv();
+                }
+                Branch::Remote(Some(WireMessage::ManifestUpdate(manifest))) => {
+                    tracing::debug!(peer = %manifest, "received manifest update from peer");
+                    peers
+                        .lock()
+                        .expect("poisoned")
+                        .insert(remote_id.clone(), manifest);
                 }
                 Branch::Remote(Some(WireMessage::Hello { .. } | WireMessage::Sync(_))) => {
                     exn::bail!(Error("unexpected Hello/Sync after handshake".into(),));

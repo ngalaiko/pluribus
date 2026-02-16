@@ -201,7 +201,8 @@ fn build_context(entries: &[Entry]) -> Vec<Message> {
 /// Contains: identity, network state, memory, schedule instructions,
 /// and an optional chat-specific hint.
 fn build_system_message(net: &Handle, state: &State, chat: &dyn chat::Chat) -> Message {
-    let self_name = &net.self_manifest().name;
+    let manifest = net.self_manifest();
+    let self_name = &manifest.name;
 
     let peers_section = {
         let others = net.others();
@@ -368,6 +369,7 @@ async fn execute_remote_calls(
 ) {
     let tools = tools::resolve(state);
     let local_defs = tools.defs();
+    net.update_tools(&local_defs);
 
     for call in tool_calls {
         let name = ToolName::new(&call.name);
@@ -407,7 +409,9 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
 ) {
     for _ in 0..MAX_ITERATIONS {
         let local_tools = Arc::new(tools::resolve(state));
-        let all_defs = all_tool_defs(&local_tools.defs(), net);
+        let local_defs = local_tools.defs();
+        net.update_tools(&local_defs);
+        let all_defs = all_tool_defs(&local_defs, net);
         let entries = state.history().messages();
         let cursor = entries.len();
         let mut messages = build_context(&entries);
@@ -440,7 +444,6 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
         }
 
         // Partition: local vs remote
-        let local_defs = local_tools.defs();
         let mut local = Vec::new();
         let mut remote = Vec::new();
 
