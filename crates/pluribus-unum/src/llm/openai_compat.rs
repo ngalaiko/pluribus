@@ -21,7 +21,7 @@ pub fn to_wire_message(msg: &Message) -> WireMessage<'_> {
                 content: WireContent::Owned(text),
             }
         }
-        Message::User { content } => {
+        Message::Scheduled { content } | Message::User { content } => {
             let text: String = content
                 .iter()
                 .filter_map(|p| p.as_text())

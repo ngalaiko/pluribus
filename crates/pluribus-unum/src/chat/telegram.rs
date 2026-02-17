@@ -200,7 +200,10 @@ impl crate::chat::Chat for Chat {
                 return;
             }
             match &entry.message {
-                Message::User { .. } | Message::System { .. } | Message::Tool { .. } => {}
+                Message::User { .. }
+                | Message::System { .. }
+                | Message::Scheduled { .. }
+                | Message::Tool { .. } => {}
 
                 Message::Assistant { tool_calls, .. } => {
                     let streaming = {

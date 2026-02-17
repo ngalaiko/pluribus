@@ -226,6 +226,9 @@ pub enum Message {
     #[serde(rename = "system")]
     System { content: Vec<ContentPart> },
 
+    #[serde(rename = "scheduled")]
+    Scheduled { content: Vec<ContentPart> },
+
     #[serde(rename = "user")]
     User { content: Vec<ContentPart> },
 
@@ -258,6 +261,14 @@ impl Message {
     #[must_use]
     pub fn system(text: impl Into<String>) -> Self {
         Self::System {
+            content: vec![ContentPart::text(text)],
+        }
+    }
+
+    /// Create a scheduled message from a text string.
+    #[must_use]
+    pub fn scheduled(text: impl Into<String>) -> Self {
+        Self::Scheduled {
             content: vec![ContentPart::text(text)],
         }
     }
@@ -313,6 +324,7 @@ impl Message {
     pub fn text(&self) -> String {
         let parts = match self {
             Self::System { content }
+            | Self::Scheduled { content }
             | Self::User { content }
             | Self::Assistant { content, .. }
             | Self::Tool { content, .. } => content,
@@ -371,6 +383,9 @@ impl fmt::Display for Message {
         match self {
             Self::System { .. } => {
                 write!(f, "[system] {}", truncate(&self.text(), MAX))
+            }
+            Self::Scheduled { .. } => {
+                write!(f, "[scheduled] {}", truncate(&self.text(), MAX))
             }
             Self::User { .. } => {
                 write!(f, "[user] {}", truncate(&self.text(), MAX))

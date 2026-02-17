@@ -89,7 +89,7 @@ fn display_entry(this_node_id: &NodeId, entry: &Entry) {
                 println!("[{origin}] [tool result] {text}");
             }
         }
-        Message::System { .. } => {}
+        Message::System { .. } | Message::Scheduled { .. } => {}
     }
 }
 

@@ -146,6 +146,19 @@ fn all_tool_defs(local_defs: &[ToolDef], net: &Handle) -> Vec<ToolDef> {
 /// and results. Older messages have tool calls stripped from `Assistant`
 /// messages and `Tool` result messages are dropped entirely.
 fn build_context(entries: &[Entry]) -> Vec<Message> {
+    // Find the last user message index — everything from here onward is the
+    // "current turn" and must be kept intact (tool calls + results).
+    let last_user = entries
+        .iter()
+        .rposition(|e| matches!(e.message, Message::User { .. } | Message::Scheduled { .. }));
+
+    // Scheduled prompts are self-contained — no prior history.
+    if let Some(lu) = last_user {
+        if matches!(entries[lu].message, Message::Scheduled { .. }) {
+            return entries[lu..].iter().map(|e| e.message.clone()).collect();
+        }
+    }
+
     // Find the window start: the Nth user message from the end.
     let window_start = entries
         .iter()
@@ -154,12 +167,6 @@ fn build_context(entries: &[Entry]) -> Vec<Message> {
         .rev()
         .nth(CONTEXT_USER_MESSAGES - 1)
         .map_or(0, |(i, _)| i);
-
-    // Find the last user message index — everything from here onward is the
-    // "current turn" and must be kept intact (tool calls + results).
-    let last_user = entries
-        .iter()
-        .rposition(|e| matches!(e.message, Message::User { .. }));
 
     let windowed = &entries[window_start..];
 
@@ -176,7 +183,9 @@ fn build_context(entries: &[Entry]) -> Vec<Message> {
 
             // Historical: strip tool overhead and reasoning.
             match &e.message {
-                Message::System { .. } | Message::User { .. } => Some(e.message.clone()),
+                Message::System { .. } | Message::Scheduled { .. } | Message::User { .. } => {
+                    Some(e.message.clone())
+                }
                 Message::Assistant { content, .. } => {
                     if content.is_empty() {
                         // Tool-only assistant message — drop it.
@@ -303,7 +312,7 @@ async fn run_scheduler(state: &State, net: &Handle) {
 
             if should_fire {
                 tracing::info!(id, prompt = %schedule.prompt, "schedule fired");
-                let entry = Entry::new(Message::user(&schedule.prompt), node_id.clone());
+                let entry = Entry::new(Message::scheduled(&schedule.prompt), node_id.clone());
                 if state.history().push(&entry).is_err() {
                     return;
                 }
@@ -342,8 +351,8 @@ async fn run<P: Provider, C: chat::Chat>(
 
     while let Some(entry) = stream.next().await {
         match &entry.message {
-            // User message we originated → run tool loop
-            Message::User { .. } if entry.origin == node_id => {
+            // User or scheduled message we originated → run tool loop
+            Message::User { .. } | Message::Scheduled { .. } if entry.origin == node_id => {
                 tool_loop(entry.id, llm, &node_id, state, net, options, chat, executor).await;
             }
 
