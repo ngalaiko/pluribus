@@ -1,5 +1,5 @@
-pub mod deepseek;
 mod openai_compat;
+pub mod openrouter;
 
 use futures_lite::StreamExt;
 use pluribus_frequency::state::State;
@@ -8,8 +8,6 @@ use std::{fmt, pin::Pin};
 
 use futures_lite::Stream;
 use pluribus_frequency::protocol::{ContentPart, Message, ToolCall, ToolDef};
-
-use self::deepseek::{DeepSeek, DeepSeekModel};
 
 /// An incremental event from an LLM streaming response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,19 +164,19 @@ pub async fn collect_response(mut stream: LlmEventStream<'_>) -> exn::Result<Mes
     ))
 }
 
-/// Resolve the `DeepSeek` LLM: try stored key, wait for peer sync, or
+/// Resolve the `OpenRouter` LLM: try stored key, wait for peer sync, or
 /// prompt the user.
-pub async fn resolve(state: &State) -> DeepSeek {
+pub async fn resolve(state: &State) -> openrouter::OpenRouter {
     let config = state.configuration();
 
     // Try stored key first.
-    if let Some(llm) = deepseek::from_config(&config).await {
+    if let Some(llm) = openrouter::from_config(&config).await {
         return llm;
     }
 
     // Wait briefly for a peer to sync the key.
     {
-        tracing::debug!("waiting for peers to sync DeepSeek API key");
+        tracing::debug!("waiting for peers to sync OpenRouter API key");
         let mut receiver = state.new_broadcast_receiver();
         let timeout = async_io::Timer::after(std::time::Duration::from_secs(5));
         let got_key = futures_lite::future::or(
@@ -192,7 +190,7 @@ pub async fn resolve(state: &State) -> DeepSeek {
                     if receiver.next().await.is_none() {
                         return false;
                     }
-                    if deepseek::from_config(&config).await.is_some() {
+                    if openrouter::from_config(&config).await.is_some() {
                         return true;
                     }
                 }
@@ -201,10 +199,10 @@ pub async fn resolve(state: &State) -> DeepSeek {
         .await;
 
         if got_key {
-            if let Some(llm) = deepseek::from_config(&config).await {
+            if let Some(llm) = openrouter::from_config(&config).await {
                 return llm;
             }
-            tracing::warn!("DeepSeek API key from peer is invalid");
+            tracing::warn!("OpenRouter API key from peer is invalid");
         } else {
             tracing::debug!("no peer sync received, will prompt for key");
         }
@@ -212,24 +210,28 @@ pub async fn resolve(state: &State) -> DeepSeek {
 
     // Prompt the user.
     loop {
-        eprint!("Enter DeepSeek API key: ");
-        let key = blocking::unblock(|| {
-            let mut buf = String::new();
-            std::io::stdin().read_line(&mut buf).ok();
-            buf.trim().to_owned()
-        })
-        .await;
+        eprint!("Enter OpenRouter API key: ");
+        let key = read_line_trimmed().await;
         if key.is_empty() {
             continue;
         }
-        tracing::debug!("validating DeepSeek API key");
-        match DeepSeek::new(&key, DeepSeekModel::Chat).await {
+        tracing::debug!("validating OpenRouter API key");
+        match openrouter::OpenRouter::new(&key).await {
             Ok(llm) => {
-                tracing::debug!("DeepSeek API key valid");
-                let _ = deepseek::set_api_key(&config, &key);
+                tracing::info!("OpenRouter API key valid");
+                let _ = openrouter::set_api_key(&config, &key);
                 return llm;
             }
-            Err(e) => tracing::warn!(%e, "DeepSeek API key invalid"),
+            Err(e) => tracing::warn!(%e, "OpenRouter API key invalid"),
         }
     }
+}
+
+async fn read_line_trimmed() -> String {
+    blocking::unblock(|| {
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf).ok();
+        buf.trim().to_owned()
+    })
+    .await
 }
