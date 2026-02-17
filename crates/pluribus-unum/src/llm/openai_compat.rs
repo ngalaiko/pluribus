@@ -22,14 +22,24 @@ pub fn to_wire_message(msg: &Message) -> WireMessage<'_> {
             }
         }
         Message::Scheduled { content } | Message::User { content } => {
-            let text: String = content
+            let parts = content
                 .iter()
-                .filter_map(|p| p.as_text())
-                .collect::<Vec<_>>()
-                .join("");
-            WireMessage::User {
-                content: WireContent::Owned(text),
-            }
+                .map(|p| match p {
+                    pluribus_frequency::protocol::ContentPart::Text { text } => {
+                        WireContentPart::Text {
+                            text: text.clone(),
+                        }
+                    }
+                    pluribus_frequency::protocol::ContentPart::Image { data, .. } => {
+                        WireContentPart::ImageUrl {
+                            image_url: WireImageUrl {
+                                url: data.clone(),
+                            },
+                        }
+                    }
+                })
+                .collect();
+            WireMessage::User { content: parts }
         }
         Message::Assistant {
             content,
@@ -255,6 +265,22 @@ impl Serialize for WireContent<'_> {
     }
 }
 
+/// A single content part in a user message.
+#[derive(Serialize)]
+#[serde(tag = "type")]
+pub enum WireContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: WireImageUrl },
+}
+
+/// Image URL payload for the `OpenAI` vision API.
+#[derive(Serialize)]
+pub struct WireImageUrl {
+    pub url: String,
+}
+
 /// Thinking mode configuration for models that support chain-of-thought.
 #[derive(Serialize)]
 pub struct Thinking {
@@ -290,7 +316,7 @@ pub enum WireMessage<'a> {
     System { content: WireContent<'a> },
 
     #[serde(rename = "user")]
-    User { content: WireContent<'a> },
+    User { content: Vec<WireContentPart> },
 
     #[serde(rename = "assistant")]
     Assistant {

@@ -163,13 +163,42 @@ impl crate::chat::Chat for Chat {
                                     state.offset = update.update_id + 1;
                                 }
                                 if let Some(msg) = update.message {
-                                    if msg.chat.id == chat_id {
-                                        if let Some(text) = msg.text {
-                                            if !text.is_empty() && !text.starts_with('/') {
-                                                state
-                                                    .buffer
-                                                    .push_back(vec![ContentPart::text(text)]);
+                                    if msg.chat.id != chat_id {
+                                        {}
+                                    } else if let Some(photos) = msg.photo {
+                                        let mut parts = Vec::new();
+                                        // Pick largest photo (last element).
+                                        if let Some(photo) = photos.last() {
+                                            match self.api.get_file(&photo.file_id).await {
+                                                Ok(tg_file) => {
+                                                    if let Some(path) = tg_file.file_path {
+                                                        let url = self.api.file_url(&path);
+                                                        parts.push(ContentPart::image(
+                                                            "image/jpeg",
+                                                            url,
+                                                        ));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "Telegram getFile error: {e}"
+                                                    );
+                                                }
                                             }
+                                        }
+                                        if let Some(caption) = msg.caption {
+                                            if !caption.is_empty() {
+                                                parts.push(ContentPart::text(caption));
+                                            }
+                                        }
+                                        if !parts.is_empty() {
+                                            state.buffer.push_back(parts);
+                                        }
+                                    } else if let Some(text) = msg.text {
+                                        if !text.is_empty() && !text.starts_with('/') {
+                                            state
+                                                .buffer
+                                                .push_back(vec![ContentPart::text(text)]);
                                         }
                                     }
                                 }

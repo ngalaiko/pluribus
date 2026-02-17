@@ -46,6 +46,18 @@ pub struct TgMessage {
     pub chat: TgChat,
     pub text: Option<String>,
     pub from: Option<TgUser>,
+    pub photo: Option<Vec<PhotoSize>>,
+    pub caption: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PhotoSize {
+    pub file_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct TgFile {
+    pub file_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +112,7 @@ struct EditMessageBody<'a> {
 pub struct ApiClient {
     http: isahc::HttpClient,
     base_url: String,
+    bot_token: String,
 }
 
 impl ApiClient {
@@ -107,6 +120,7 @@ impl ApiClient {
         Self {
             http: isahc::HttpClient::new().expect("create HTTP client"),
             base_url: format!("https://api.telegram.org/bot{bot_token}"),
+            bot_token: bot_token.to_owned(),
         }
     }
 
@@ -230,6 +244,40 @@ impl ApiClient {
         // Consume body to release the connection.
         let _ = response.text().await;
         Ok(())
+    }
+
+    pub async fn get_file(&self, file_id: &str) -> Result<TgFile, String> {
+        let url = format!("{}/getFile", self.base_url);
+        let body = serde_json::json!({ "file_id": file_id });
+        let json = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+
+        let request = isahc::Request::post(&url)
+            .header("Content-Type", "application/json")
+            .body(json)
+            .map_err(|e: isahc::http::Error| e.to_string())?;
+
+        let mut response = self
+            .http
+            .send_async(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        let text = response.text().await.map_err(|e| e.to_string())?;
+        let parsed: ApiResponse<TgFile> =
+            serde_json::from_str(&text).map_err(|e| e.to_string())?;
+
+        if parsed.ok {
+            parsed.result.ok_or_else(|| "no result".into())
+        } else {
+            Err(parsed.description.unwrap_or_else(|| "unknown error".into()))
+        }
+    }
+
+    #[must_use]
+    pub fn file_url(&self, file_path: &str) -> String {
+        format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot_token, file_path
+        )
     }
 }
 

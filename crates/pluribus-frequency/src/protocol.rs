@@ -198,6 +198,8 @@ const fn is_false(v: &bool) -> bool {
 pub enum ContentPart {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image { mime_type: String, data: String },
 }
 
 impl ContentPart {
@@ -207,11 +209,21 @@ impl ContentPart {
         Self::Text { text: s.into() }
     }
 
+    /// Create an image content part from base64-encoded data.
+    #[must_use]
+    pub fn image(mime_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self::Image {
+            mime_type: mime_type.into(),
+            data: data.into(),
+        }
+    }
+
     /// Return the text content, if this is a text part.
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } => Some(text),
+            Self::Image { .. } => None,
         }
     }
 }
@@ -387,8 +399,18 @@ impl fmt::Display for Message {
             Self::Scheduled { .. } => {
                 write!(f, "[scheduled] {}", truncate(&self.text(), MAX))
             }
-            Self::User { .. } => {
-                write!(f, "[user] {}", truncate(&self.text(), MAX))
+            Self::User { content } => {
+                let has_image = content
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::Image { .. }));
+                let text = self.text();
+                if has_image && text.is_empty() {
+                    write!(f, "[user] [image]")
+                } else if has_image {
+                    write!(f, "[user] [image] {}", truncate(&text, MAX))
+                } else {
+                    write!(f, "[user] {}", truncate(&text, MAX))
+                }
             }
             Self::Assistant {
                 tool_calls,
