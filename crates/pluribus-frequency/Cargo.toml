@@ -22,6 +22,7 @@ async-channel = { workspace = true }
 serde_bytes = { workspace = true }
 futures-sink = { workspace = true }
 tracing = { workspace = true }
+ulid = { workspace = true }
 async-executor = { workspace = true }
 async-io = { workspace = true }
 async-net = { workspace = true }

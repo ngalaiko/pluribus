@@ -19,23 +19,61 @@ const INCREMENTAL_FILE: &str = "frequency.incremental";
 const HISTORY_KEY: &str = "history";
 const CONFIGURATION_KEY: &str = "configuration";
 
+/// Unique identifier for an [`Entry`], backed by a ULID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct EntryId(ulid::Ulid);
+
+impl EntryId {
+    /// Generate a fresh, monotonic entry ID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(ulid::Ulid::new())
+    }
+}
+
+impl Default for EntryId {
+    fn default() -> Self {
+        Self(ulid::Ulid::nil())
+    }
+}
+
+impl fmt::Display for EntryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A message with distributed CRDT metadata.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
+    #[serde(default)]
+    pub id: EntryId,
     pub origin: NodeId,
     pub timestamp: DateTime<Utc>,
     pub message: Message,
+    #[serde(default)]
+    pub in_response_to: Option<EntryId>,
 }
 
 impl Entry {
-    /// Create a new entry with a fresh [`MessageId`] and the current timestamp.
+    /// Create a new entry with a fresh [`EntryId`] and the current timestamp.
     #[must_use]
     pub fn new(message: Message, origin: NodeId) -> Self {
         Self {
+            id: EntryId::new(),
             origin,
             timestamp: chrono::Utc::now(),
             message,
+            in_response_to: None,
         }
+    }
+
+    /// Set the entry this one responds to.
+    #[must_use]
+    pub const fn with_response_to(mut self, id: EntryId) -> Self {
+        self.in_response_to = Some(id);
+        self
     }
 }
 

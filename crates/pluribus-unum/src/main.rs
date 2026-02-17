@@ -17,7 +17,7 @@ use smol_macros::main;
 
 use pluribus_frequency::network;
 use pluribus_frequency::protocol::{Message, NodeId, ToolCall, ToolDef, ToolName};
-use pluribus_frequency::state::{Entry, State};
+use pluribus_frequency::state::{Entry, EntryId, State};
 use pluribus_frequency::Handle;
 
 use crate::llm::{collect_response, GenOptions, Provider};
@@ -344,7 +344,7 @@ async fn run<P: Provider, C: chat::Chat>(
         match &entry.message {
             // User message we originated → run tool loop
             Message::User { .. } if entry.origin == node_id => {
-                tool_loop(llm, &node_id, state, net, options, chat, executor).await;
+                tool_loop(entry.id, llm, &node_id, state, net, options, chat, executor).await;
             }
 
             // Remote tool call we can handle
@@ -352,7 +352,7 @@ async fn run<P: Provider, C: chat::Chat>(
                 if entry.origin == node_id {
                     continue; // We're the LLM node, tool_loop handles this
                 }
-                execute_remote_calls(tool_calls, &node_id, state, net).await;
+                execute_remote_calls(entry.id, tool_calls, &node_id, state, net).await;
             }
 
             _ => {}
@@ -362,6 +362,7 @@ async fn run<P: Provider, C: chat::Chat>(
 
 /// Non-LLM nodes: execute tool calls they own.
 async fn execute_remote_calls(
+    assistant_id: EntryId,
     tool_calls: &[ToolCall],
     node_id: &NodeId,
     state: &State,
@@ -392,13 +393,16 @@ async fn execute_remote_calls(
         let entry = Entry::new(
             Message::tool_result(&call.id, content, is_error),
             node_id.clone(),
-        );
+        )
+        .with_response_to(assistant_id);
         let _ = state.history().push(&entry);
     }
 }
 
 /// Run the tool loop for a single user message until the LLM is done.
+#[allow(clippy::too_many_arguments)]
 async fn tool_loop<P: Provider, C: chat::Chat>(
+    trigger_id: EntryId,
     llm: &P,
     node_id: &NodeId,
     state: &State,
@@ -427,7 +431,8 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
                     let entry = Entry::new(
                         Message::assistant(format!("LLM error: {e}")),
                         node_id.clone(),
-                    );
+                    )
+                    .with_response_to(trigger_id);
                     let _ = state.history().push(&entry);
                     return;
                 }
@@ -435,7 +440,8 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
         };
 
         let tool_calls = response.tool_calls().to_vec();
-        let entry = Entry::new(response, node_id.clone());
+        let entry = Entry::new(response, node_id.clone()).with_response_to(trigger_id);
+        let assistant_id = entry.id;
         let _ = state.history().push(&entry);
 
         // No tool calls — LLM is done.
@@ -491,7 +497,8 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
             let entry = Entry::new(
                 Message::tool_result(&call_id, content, is_error),
                 node_id.clone(),
-            );
+            )
+            .with_response_to(assistant_id);
             let _ = state.history().push(&entry);
         }
 
@@ -508,7 +515,8 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
     let entry = Entry::new(
         Message::assistant("Stopped: too many tool iterations."),
         node_id.clone(),
-    );
+    )
+    .with_response_to(trigger_id);
     let _ = state.history().push(&entry);
 }
 

@@ -39,6 +39,7 @@ dom_smoothie = "0.15"
 pulldown-cmark = { version = "0.12", default-features = false }
 is-terminal = "0.4"
 serial_test = "3"
+ulid = { version = "1", features = ["serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
