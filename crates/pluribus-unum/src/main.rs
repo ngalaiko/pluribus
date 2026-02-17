@@ -31,6 +31,15 @@ const PORT: u16 = 8613;
 
 #[apply(main!)]
 async fn main(executor: Arc<async_executor::Executor<'static>>) {
+    tracing_subscriber::fmt()
+        .compact()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,loro_internal=warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let network = network::tailscale(PORT).await.expect("tailscale identity");
     let data_dir = dirs::data_dir()
         .expect("could not determine data directory")
