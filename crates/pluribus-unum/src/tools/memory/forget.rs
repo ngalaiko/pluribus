@@ -24,7 +24,7 @@ impl crate::tools::Tool for Tool {
     fn def(&self) -> pluribus_frequency::protocol::ToolDef {
         pluribus_frequency::protocol::ToolDef::new(
             pluribus_frequency::protocol::ToolName::new(TOOL_NAME),
-            "Forgets a piece of information from memory. Input is the key to forget.",
+            "Forgets a piece of information from memory. Input is the key to forget. Example: {\"key\": \"user_name\"}",
         )
     }
 

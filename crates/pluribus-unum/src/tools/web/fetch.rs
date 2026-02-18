@@ -24,7 +24,7 @@ impl crate::tools::Tool for Tool {
     fn def(&self) -> pluribus_frequency::protocol::ToolDef {
         pluribus_frequency::protocol::ToolDef::new(
             pluribus_frequency::protocol::ToolName::new("web_fetch"),
-            "Fetch a URL and return its text content (HTML parsed, scripts/styles removed). Max 20KB.",
+            "Fetch a URL and return its text content (HTML parsed, scripts/styles removed). Max 20KB. Example: {\"url\": \"https://example.com\"}",
         )
     }
 

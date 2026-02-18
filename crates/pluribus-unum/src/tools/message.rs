@@ -35,7 +35,7 @@ impl crate::tools::Tool for SendMessageTool {
     fn def(&self) -> ToolDef {
         ToolDef::new(
             ToolName::new("send_message"),
-            "Send a message to the user via Telegram.",
+            "Send a message to the user via Telegram. Example: {\"message\": \"Hello! The weather today is sunny.\"}",
         )
     }
 
@@ -63,7 +63,7 @@ impl Provider for Message {
         } else {
             tools.register(super::disabled_tool(
                 "send_message",
-                "Send a message to the user.",
+                "Send a message to the user. Example: {\"message\": \"Hello! The weather today is sunny.\"}",
                 "No messaging backend connected",
             ));
         }

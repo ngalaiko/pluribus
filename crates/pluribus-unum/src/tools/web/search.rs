@@ -39,9 +39,9 @@ impl crate::tools::Tool for SearchTool {
 
     fn def(&self) -> ToolDef {
         let desc = if self.exa_connected {
-            "Search the web. Providers: duckduckgo (default, free), exa (AI-powered, higher quality)."
+            "Search the web. Providers: duckduckgo (default, free), exa (AI-powered, higher quality). Example: {\"query\": \"rust async programming\"}"
         } else {
-            "Search the web using DuckDuckGo."
+            "Search the web using DuckDuckGo. Example: {\"query\": \"rust async programming\"}"
         };
         ToolDef::new(ToolName::new("web_search"), desc)
     }
@@ -85,7 +85,7 @@ pub fn resolve(config: &Configuration) -> Tools {
         tools.register(crate::tools::connect_tool(
             exa::config_key(),
             "connect_exa",
-            "Connect Exa AI-powered web search. Higher quality results than DuckDuckGo. Get an API key at exa.ai.",
+            "Connect Exa AI-powered web search. Higher quality results than DuckDuckGo. Get an API key at exa.ai. Example: {\"api_key\": \"your-exa-api-key\"}",
             config.clone(),
         ));
     }

@@ -32,7 +32,7 @@ impl Provider for Geocoding {
                 tools.register(crate::tools::connect_tool(
                     KEY_MAPSCO_API_KEY,
                     "connect_mapsco",
-                    "Connect maps.co geocoding service. Get a free API key at geocode.maps.co.",
+                    "Connect maps.co geocoding service. Get a free API key at geocode.maps.co. Example: {\"api_key\": \"your-maps-co-api-key\"}",
                     config.clone(),
                 ));
             }
@@ -73,7 +73,7 @@ impl crate::tools::Tool for ForwardTool {
     fn def(&self) -> ToolDef {
         ToolDef::new(
             ToolName::new("geocode"),
-            "Forward geocode an address or place name to coordinates (latitude/longitude). Powered by geocode.maps.co.",
+            "Forward geocode an address or place name to coordinates (latitude/longitude). Powered by geocode.maps.co. Example: {\"query\": \"Eiffel Tower, Paris\"}",
         )
     }
 
@@ -128,7 +128,7 @@ impl crate::tools::Tool for ReverseTool {
     fn def(&self) -> ToolDef {
         ToolDef::new(
             ToolName::new("reverseGeocode"),
-            "Reverse geocode coordinates (latitude/longitude) to an address. Powered by geocode.maps.co.",
+            "Reverse geocode coordinates (latitude/longitude) to an address. Powered by geocode.maps.co. Example: {\"lat\": 48.8584, \"lon\": 2.2945}",
         )
     }
 

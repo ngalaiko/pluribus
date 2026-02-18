@@ -278,7 +278,12 @@ The prompt runs without conversation history — write it as a self-contained in
 - One-shot: provide `at` (RFC 3339 datetime). Auto-deleted after firing.
 - Recurring: provide `cron` (5-field expression). Runs until cancelled.
 
-Use getCurrentTime before computing schedule times.{chat_hint_section}"
+Use getCurrentTime before computing schedule times.
+Use send_message explicitly to send output from schedules, as they don't have conversation context.
+
+## Chat
+
+{chat_hint_section}"
     ))
 }
 

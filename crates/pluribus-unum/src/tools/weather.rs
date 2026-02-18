@@ -37,7 +37,7 @@ impl Provider for Weather {
             geocode::State::Disconnected => {
                 tools.register(crate::tools::disabled_tool(
                     "getWeatherByLocation",
-                    "Get weather by location name.",
+                    "Get weather by location name. Example: {\"location\": \"Oslo, Norway\"}",
                     "Requires geocoding backend.",
                 ));
             }
@@ -66,7 +66,7 @@ impl crate::tools::Tool for ForecastTool {
     fn def(&self) -> ToolDef {
         ToolDef::new(
             ToolName::new("getWeather"),
-            "Get current weather and short-term forecast for coordinates (lat, lon). Data from MET Norway (yr.no).",
+            "Get current weather and short-term forecast for coordinates (lat, lon). Data from MET Norway (yr.no). Example: {\"lat\": 59.91, \"lon\": 10.75}",
         )
     }
 
@@ -97,7 +97,7 @@ impl crate::tools::Tool for ForecastByNameTool {
     fn def(&self) -> ToolDef {
         ToolDef::new(
             ToolName::new("getWeatherByLocation"),
-            "Get current weather and short-term forecast for a location name. Geocodes the name then fetches weather. Data from MET Norway (yr.no).",
+            "Get current weather and short-term forecast for a location name. Geocodes the name then fetches weather. Data from MET Norway (yr.no). Example: {\"location\": \"Oslo, Norway\"}",
         )
     }
 

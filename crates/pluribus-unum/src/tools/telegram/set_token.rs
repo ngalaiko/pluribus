@@ -30,7 +30,7 @@ impl crate::tools::Tool for Tool {
     fn def(&self) -> ToolDef {
         ToolDef::new(
             ToolName::new("setTelegramToken"),
-            "Validates a Telegram bot token and stores it in the configuration. Returns the bot name on success.",
+            "Validates a Telegram bot token and stores it in the configuration. Returns the bot name on success. Example: {\"token\": \"123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11\"}",
         )
     }
 

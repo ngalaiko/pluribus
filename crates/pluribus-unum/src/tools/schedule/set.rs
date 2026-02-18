@@ -34,7 +34,7 @@ impl crate::tools::Tool for Tool {
     fn def(&self) -> pluribus_frequency::protocol::ToolDef {
         pluribus_frequency::protocol::ToolDef::new(
             pluribus_frequency::protocol::ToolName::new("schedule_set"),
-            "Create or update a schedule. Provide exactly one of `at` (RFC 3339 datetime for one-shot) or `cron` (5-field cron expression for recurring).",
+            "Create or update a schedule. Provide exactly one of `at` (RFC 3339 datetime for one-shot) or `cron` (5-field cron expression for recurring). Example: {\"id\": \"morning-reminder\", \"prompt\": \"Good morning! Time to check the weather.\", \"cron\": \"0 8 * * *\"}",
         )
     }
 

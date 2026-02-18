@@ -23,7 +23,7 @@ impl crate::tools::Tool for Tool {
     fn def(&self) -> pluribus_frequency::protocol::ToolDef {
         pluribus_frequency::protocol::ToolDef::new(
             pluribus_frequency::protocol::ToolName::new("schedule_delete"),
-            "Delete a schedule by its id.",
+            "Delete a schedule by its id. Example: {\"id\": \"morning-reminder\"}",
         )
     }
 

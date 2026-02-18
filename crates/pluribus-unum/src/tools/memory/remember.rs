@@ -25,7 +25,7 @@ impl crate::tools::Tool for Tool {
     fn def(&self) -> pluribus_frequency::protocol::ToolDef {
         pluribus_frequency::protocol::ToolDef::new(
             pluribus_frequency::protocol::ToolName::new(TOOL_NAME),
-            "Remembers a piece of information in memory. Input is a (key, value) pair.",
+            "Remembers a piece of information in memory. Input is a (key, value) pair. Example: {\"key\": \"user_name\", \"value\": \"Alice\"}",
         )
     }
 
