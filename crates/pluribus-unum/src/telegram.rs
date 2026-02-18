@@ -184,6 +184,12 @@ impl ApiClient {
         text: &str,
         parse_mode: Option<&str>,
     ) -> Result<SentMessage, String> {
+        tracing::debug!(
+            chat_id,
+            parse_mode,
+            len = text.len(),
+            "Telegram sendMessage"
+        );
         let url = format!("{}/sendMessage", self.base_url);
         let truncated = truncate(text);
         let body = SendMessageBody {
@@ -221,6 +227,7 @@ impl ApiClient {
         text: &str,
         parse_mode: Option<&str>,
     ) -> Result<(), String> {
+        tracing::debug!(chat_id, message_id, parse_mode, "Telegram editMessageText");
         let url = format!("{}/editMessageText", self.base_url);
         let truncated = truncate(text);
         let body = EditMessageBody {
@@ -262,8 +269,7 @@ impl ApiClient {
             .await
             .map_err(|e| e.to_string())?;
         let text = response.text().await.map_err(|e| e.to_string())?;
-        let parsed: ApiResponse<TgFile> =
-            serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let parsed: ApiResponse<TgFile> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
 
         if parsed.ok {
             parsed.result.ok_or_else(|| "no result".into())

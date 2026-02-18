@@ -92,6 +92,9 @@ impl Chat {
             let html_text = crate::telegram::markdown::to_telegram_html(text);
             combine_reasoning_html(reasoning, &html_text)
         };
+        if combined.trim().is_empty() {
+            return None;
+        }
         match action {
             Action::Send => {
                 let result = if let Ok(sent) = self
@@ -156,16 +159,22 @@ impl crate::chat::Chat for Chat {
 
                 // Poll for new updates.
                 loop {
+                    tracing::trace!(offset = state.offset, "polling Telegram for updates");
                     match self.api.get_updates(state.offset, POLL_TIMEOUT).await {
                         Ok(updates) => {
+                            tracing::debug!(count = updates.len(), "received Telegram updates");
                             for update in updates {
                                 if update.update_id >= state.offset {
                                     state.offset = update.update_id + 1;
                                 }
                                 if let Some(msg) = update.message {
                                     if msg.chat.id != chat_id {
-                                        {}
+                                        tracing::trace!(
+                                            chat = msg.chat.id,
+                                            "ignoring message from different chat"
+                                        );
                                     } else if let Some(photos) = msg.photo {
+                                        tracing::info!("received Telegram photo message");
                                         let mut parts = Vec::new();
                                         // Pick largest photo (last element).
                                         if let Some(photo) = photos.last() {
@@ -180,9 +189,7 @@ impl crate::chat::Chat for Chat {
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    tracing::warn!(
-                                                        "Telegram getFile error: {e}"
-                                                    );
+                                                    tracing::warn!("Telegram getFile error: {e}");
                                                 }
                                             }
                                         }
@@ -196,9 +203,8 @@ impl crate::chat::Chat for Chat {
                                         }
                                     } else if let Some(text) = msg.text {
                                         if !text.is_empty() && !text.starts_with('/') {
-                                            state
-                                                .buffer
-                                                .push_back(vec![ContentPart::text(text)]);
+                                            tracing::info!("received Telegram text message");
+                                            state.buffer.push_back(vec![ContentPart::text(text)]);
                                         }
                                     }
                                 }
@@ -243,10 +249,16 @@ impl crate::chat::Chat for Chat {
                     let text = entry.message.text();
 
                     // Display text (with reasoning) — edit streaming message or send new.
-                    if !text.is_empty() {
-                        let html_text = crate::telegram::markdown::to_telegram_html(&text);
-                        let reasoning = entry.message.reasoning_content().unwrap_or_default();
-                        let html = combine_reasoning_html(reasoning, &html_text);
+                    let html_text = crate::telegram::markdown::to_telegram_html(&text);
+                    let reasoning = entry.message.reasoning_content().unwrap_or_default();
+                    let html = combine_reasoning_html(reasoning, &html_text);
+
+                    if !html.trim().is_empty() {
+                        tracing::debug!(
+                            streaming = streaming.is_some(),
+                            len = text.len(),
+                            "displaying assistant text on Telegram"
+                        );
                         let plain = format_plain_fallback(reasoning, &text);
 
                         if let Some(state) = streaming {
@@ -280,6 +292,10 @@ impl crate::chat::Chat for Chat {
 
                     // Display tool calls as a separate message (no reasoning).
                     if !tool_calls.is_empty() {
+                        tracing::debug!(
+                            count = tool_calls.len(),
+                            "displaying tool calls on Telegram"
+                        );
                         let tool_html: String = tool_calls
                             .iter()
                             .map(|c| {
@@ -334,10 +350,8 @@ impl crate::chat::Chat for Chat {
         Box::pin(stream.then(move |event| {
             let acc = Arc::clone(&acc);
             async move {
-                let is_content_delta = matches!(
-                    event,
-                    Ok(LlmEvent::Text(_) | LlmEvent::Reasoning(_))
-                );
+                let is_content_delta =
+                    matches!(event, Ok(LlmEvent::Text(_) | LlmEvent::Reasoning(_)));
 
                 if is_content_delta {
                     let (action, reasoning_snap, text_snap, msg_id) = {
