@@ -138,11 +138,22 @@ fn is_lowest_for_tool(my_id: &NodeId, tool_name: &ToolName, net: &Handle) -> boo
         .all(|m| *my_id < m.id)
 }
 
-/// Collect all tool definitions (local + others).
+/// Collect all tool definitions (local + others), deduplicating by name.
+/// Local tools take priority over remote ones.
 fn all_tool_defs(local_defs: &[ToolDef], net: &Handle) -> Vec<ToolDef> {
-    let mut defs = local_defs.to_vec();
+    let mut seen = std::collections::HashSet::new();
+    let mut defs = Vec::new();
+    for def in local_defs {
+        if seen.insert(def.name().clone()) {
+            defs.push(def.clone());
+        }
+    }
     for m in net.others() {
-        defs.extend(m.tools);
+        for def in m.tools {
+            if seen.insert(def.name().clone()) {
+                defs.push(def);
+            }
+        }
     }
     defs
 }
