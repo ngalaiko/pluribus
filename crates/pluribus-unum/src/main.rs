@@ -407,7 +407,20 @@ async fn execute_remote_calls(
     net.update_tools(&local_defs);
 
     for call in tool_calls {
-        let name = ToolName::new(&call.name);
+        let Ok(name) = ToolName::try_new(&call.name) else {
+            tracing::warn!(name = %call.name, "remote tool call with invalid name");
+            let entry = Entry::new(
+                Message::tool_result(
+                    &call.id,
+                    format!("invalid tool name: {:?}", call.name),
+                    true,
+                ),
+                node_id.clone(),
+            )
+            .with_response_to(assistant_id);
+            let _ = state.history().push(&entry);
+            continue;
+        };
         if !local_defs.iter().any(|d| d.name() == &name) {
             continue;
         }
