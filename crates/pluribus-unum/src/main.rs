@@ -35,7 +35,7 @@ async fn main(executor: Arc<async_executor::Executor<'static>>) {
         .compact()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,loro_internal=warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,loro_internal=warn,isahc=error")),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -46,8 +46,13 @@ async fn main(executor: Arc<async_executor::Executor<'static>>) {
         .join("pluribus");
 
     let state = State::open(&data_dir).expect("failed to open log");
+    let browser = if tools::browser::chrome_available() {
+        tools::browser::Browser::new(executor.clone())
+    } else {
+        tools::browser::Browser::unavailable()
+    };
 
-    let initial_defs = tools::resolve(&state).defs();
+    let initial_defs = tools::resolve(&state, &browser).defs();
 
     let frequency = pluribus_frequency::join(executor.clone(), network, &state, initial_defs)
         .await
@@ -65,17 +70,17 @@ async fn main(executor: Arc<async_executor::Executor<'static>>) {
 
     if std::io::stdout().is_terminal() {
         let chat = chat::terminal();
-        run_interactive(&executor, llm, state, &frequency, &options, &chat).await;
+        run_interactive(&executor, llm, state, &frequency, &options, &chat, &browser).await;
     } else if let (Some(token), Some(chat_id)) = (
         tools::telegram::bot_token(&config),
         tools::telegram::chat_id(&config),
     ) {
         tracing::info!(chat_id, "using Telegram chat");
         let chat = chat::telegram(&token, chat_id);
-        run_interactive(&executor, llm, state, &frequency, &options, &chat).await;
+        run_interactive(&executor, llm, state, &frequency, &options, &chat, &browser).await;
     } else {
         let chat = chat::noop();
-        run_interactive(&executor, llm, state, &frequency, &options, &chat).await;
+        run_interactive(&executor, llm, state, &frequency, &options, &chat, &browser).await;
     }
 }
 
@@ -86,11 +91,12 @@ async fn run_interactive<P: Provider, C: chat::Chat>(
     frequency: &Handle,
     options: &GenOptions,
     chat: &C,
+    browser: &tools::browser::Browser,
 ) {
     let node_id = frequency.self_manifest().id.clone();
 
     futures_lite::future::zip(
-        run(executor, &llm, &state, frequency, options, chat),
+        run(executor, &llm, &state, frequency, options, chat, browser),
         futures_lite::future::zip(
             async {
                 let mut stream = if chat.show_full_history() {
@@ -370,6 +376,7 @@ async fn run<P: Provider, C: chat::Chat>(
     net: &Handle,
     options: &GenOptions,
     chat: &C,
+    browser: &tools::browser::Browser,
 ) {
     let node_id = net.self_manifest().id.clone();
     let mut stream = state.history().listen_live();
@@ -378,7 +385,11 @@ async fn run<P: Provider, C: chat::Chat>(
         match &entry.message {
             // User or scheduled message we originated → run tool loop
             Message::User { .. } | Message::Scheduled { .. } if entry.origin == node_id => {
-                tool_loop(entry.id, llm, &node_id, state, net, options, chat, executor).await;
+                tracing::info!("user/scheduled message received, starting tool loop");
+                tool_loop(
+                    entry.id, llm, &node_id, state, net, options, chat, executor, browser,
+                )
+                .await;
             }
 
             // Remote tool call we can handle
@@ -386,10 +397,13 @@ async fn run<P: Provider, C: chat::Chat>(
                 if entry.origin == node_id {
                     continue; // We're the LLM node, tool_loop handles this
                 }
-                execute_remote_calls(entry.id, tool_calls, &node_id, state, net).await;
+                tracing::info!(count = tool_calls.len(), origin = %entry.origin, "dispatching remote tool calls");
+                execute_remote_calls(entry.id, tool_calls, &node_id, state, net, browser).await;
             }
 
-            _ => {}
+            _ => {
+                tracing::trace!(message = ?entry.message, "ignored event");
+            }
         }
     }
 }
@@ -401,8 +415,9 @@ async fn execute_remote_calls(
     node_id: &NodeId,
     state: &State,
     net: &Handle,
+    browser: &tools::browser::Browser,
 ) {
-    let tools = tools::resolve(state);
+    let tools = tools::resolve(state, browser);
     let local_defs = tools.defs();
     net.update_tools(&local_defs);
 
@@ -428,14 +443,33 @@ async fn execute_remote_calls(
             continue;
         }
 
+        tracing::info!(tool = %name, "executing remote tool call");
+
         let input: serde_json::Value = serde_json::from_str(&call.arguments)
             .unwrap_or_else(|_| serde_json::Value::Object(Map::default()));
 
-        let result = tools.execute(&name, input).await;
+        let timeout = tools.timeout(&name);
+        let result = futures_lite::future::or(
+            tools.execute(&name, input),
+            async {
+                async_io::Timer::after(timeout).await;
+                Err(format!(
+                    "tool execution timed out after {}s",
+                    timeout.as_secs()
+                ))
+            },
+        )
+        .await;
         let (content, is_error) = match &result {
             Ok(v) => (serde_json::to_string(v).unwrap_or_default(), false),
             Err(e) => (e.clone(), true),
         };
+
+        if is_error {
+            tracing::warn!(tool = %name, "remote tool call failed");
+        } else {
+            tracing::info!(tool = %name, "remote tool call succeeded");
+        }
 
         let entry = Entry::new(
             Message::tool_result(&call.id, content, is_error),
@@ -447,7 +481,7 @@ async fn execute_remote_calls(
 }
 
 /// Run the tool loop for a single user message until the LLM is done.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn tool_loop<P: Provider, C: chat::Chat>(
     trigger_id: EntryId,
     llm: &P,
@@ -457,9 +491,10 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
     options: &GenOptions,
     chat: &C,
     executor: &Arc<async_executor::Executor<'static>>,
+    browser: &tools::browser::Browser,
 ) {
-    for _ in 0..MAX_ITERATIONS {
-        let local_tools = Arc::new(tools::resolve(state));
+    for iteration in 0..MAX_ITERATIONS {
+        let local_tools = Arc::new(tools::resolve(state, browser));
         let local_defs = local_tools.defs();
         net.update_tools(&local_defs);
         let all_defs = all_tool_defs(&local_defs, net);
@@ -467,6 +502,13 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
         let cursor = entries.len();
         let mut messages = build_context(&entries);
         messages.insert(0, build_system_message(net, state, chat));
+
+        tracing::info!(
+            iteration,
+            messages = messages.len(),
+            tools = all_defs.len(),
+            "calling LLM"
+        );
 
         let response = {
             let stream = llm.complete_stream(&messages, &all_defs, options);
@@ -493,15 +535,35 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
 
         // No tool calls — LLM is done.
         if tool_calls.is_empty() {
+            tracing::info!(iteration, "LLM done, no tool calls");
             return;
         }
+
+        tracing::info!(
+            iteration,
+            count = tool_calls.len(),
+            "LLM requested tool calls"
+        );
 
         // Partition: local vs remote
         let mut local = Vec::new();
         let mut remote = Vec::new();
 
         for call in &tool_calls {
-            let name = ToolName::new(&call.name);
+            let Ok(name) = ToolName::try_new(&call.name) else {
+                tracing::warn!(name = %call.name, "skipping tool call with invalid name");
+                let entry = Entry::new(
+                    Message::tool_result(
+                        &call.id,
+                        format!("invalid tool name: {:?}", call.name),
+                        true,
+                    ),
+                    node_id.clone(),
+                )
+                .with_response_to(assistant_id);
+                let _ = state.history().push(&entry);
+                continue;
+            };
             if local_defs.iter().any(|d| d.name() == &name) {
                 local.push(call);
             } else {
@@ -509,23 +571,42 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
             }
         }
 
+        tracing::info!(
+            local = local.len(),
+            remote = remote.len(),
+            "partitioned tool calls"
+        );
+
         // Execute local tools in parallel
         let local_tasks: Vec<_> = local
             .into_iter()
-            .map(|call| {
+            .filter_map(|call| {
                 let tools = Arc::clone(&local_tools);
-                let name = ToolName::new(&call.name);
+                let Ok(name) = ToolName::try_new(&call.name) else {
+                    return None;
+                };
+                let timeout = tools.timeout(&name);
                 let input: serde_json::Value = serde_json::from_str(&call.arguments)
                     .unwrap_or_else(|_| serde_json::Value::Object(Map::default()));
                 let call_id = call.id.clone();
-                executor.spawn(async move {
-                    let result = tools.execute(&name, input).await;
+                Some(executor.spawn(async move {
+                    let result = futures_lite::future::or(
+                        tools.execute(&name, input),
+                        async {
+                            async_io::Timer::after(timeout).await;
+                            Err(format!(
+                                "tool execution timed out after {}s",
+                                timeout.as_secs()
+                            ))
+                        },
+                    )
+                    .await;
                     let (content, is_error) = match &result {
                         Ok(v) => (serde_json::to_string(v).unwrap_or_default(), false),
                         Err(e) => (e.clone(), true),
                     };
-                    (call_id, content, is_error)
-                })
+                    (call_id, name, content, is_error)
+                }))
             })
             .collect();
 
@@ -539,7 +620,12 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
 
         // Collect local results
         for task in local_tasks {
-            let (call_id, content, is_error) = task.await;
+            let (call_id, name, content, is_error) = task.await;
+            if is_error {
+                tracing::warn!(tool = %name, "local tool call failed");
+            } else {
+                tracing::info!(tool = %name, "local tool call succeeded");
+            }
             pending_remote.remove(&call_id); // shouldn't be there, but safe
             let entry = Entry::new(
                 Message::tool_result(&call_id, content, is_error),
@@ -551,14 +637,22 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
 
         // Wait for remote results
         if !pending_remote.is_empty() {
+            tracing::info!(
+                count = pending_remote.len(),
+                "waiting for remote tool results"
+            );
             let stream = state.history().listen_since(cursor);
-            wait_for_results(stream, &pending_remote, Duration::from_secs(120)).await;
+            wait_for_results(stream, &pending_remote, Duration::from_secs(5)).await;
         }
 
         // All results in — loop back to LLM
     }
 
     // Hit max iterations
+    tracing::warn!(
+        max = MAX_ITERATIONS,
+        "max iterations reached, stopping tool loop"
+    );
     let entry = Entry::new(
         Message::assistant("Stopped: too many tool iterations."),
         node_id.clone(),

@@ -15,8 +15,15 @@ path = "src/main.rs"
 pluribus-frequency = { workspace = true}
 dirs = { workspace = true }
 futures-lite = { workspace = true }
+futures-sink = { workspace = true }
 serde_json = { workspace = true }
+async-broadcast = { workspace = true }
+async-channel = { workspace = true }
+async-lock = { workspace = true }
 async-executor = { workspace = true }
+async-io = { workspace = true }
+async-net = { workspace = true }
+async-tungstenite = { workspace = true }
 smol-macros = { workspace = true }
 macro_rules_attribute = { workspace = true }
 is-terminal = { workspace = true }
@@ -25,7 +32,6 @@ blocking = { workspace = true }
 isahc = { workspace = true }
 dom_smoothie = { workspace = true }
 serde = { workspace = true }
-async-io = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 schemars = { workspace = true }

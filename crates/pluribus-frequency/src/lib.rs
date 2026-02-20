@@ -300,17 +300,8 @@ async fn network_event_loop<N: Network>(
                 executor
                     .spawn(async move {
                         tracing::info!(%name, %addr, "connecting to peer");
-                        connect_to_peer(
-                            ex,
-                            &log,
-                            &manifest,
-                            &peers,
-                            &id,
-                            &name,
-                            addr,
-                            manifest_tx,
-                        )
-                        .await;
+                        connect_to_peer(ex, &log, &manifest, &peers, &id, &name, addr, manifest_tx)
+                            .await;
                     })
                     .detach();
             }

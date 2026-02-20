@@ -1,3 +1,4 @@
+pub mod browser;
 mod current_time;
 mod geocode;
 pub mod memory;
@@ -9,6 +10,7 @@ mod web;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use pluribus_frequency::protocol::{ToolDef, ToolName};
 use pluribus_frequency::state::{Configuration, State};
@@ -22,15 +24,16 @@ pub trait Provider: Send + Sync {
 
 /// Build the tool set from current state.
 #[must_use]
-pub fn resolve(state: &State) -> Tools {
+pub fn resolve(state: &State, browser: &browser::Browser) -> Tools {
     let config = state.configuration();
-    let providers: Vec<Box<dyn Provider>> = vec![
-        Box::new(weather::Weather),
-        Box::new(memory::Memory),
-        Box::new(schedule::Scheduler),
-        Box::new(telegram::Telegram),
-        Box::new(message::Message),
-        Box::new(web::Web),
+    let providers: Vec<&dyn Provider> = vec![
+        &weather::Weather,
+        &memory::Memory,
+        &schedule::Scheduler,
+        &telegram::Telegram,
+        &message::Message,
+        &web::Web,
+        browser,
     ];
     let mut tools = Tools::new();
     tools.register(current_time::new());
@@ -52,6 +55,11 @@ pub trait Tool: Send + Sync + 'static {
 
     fn def(&self) -> ToolDef;
 
+    /// Maximum time to wait for this tool to complete before timing out.
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+
     /// Execute the tool with the given typed input.
     fn execute(
         &self,
@@ -62,6 +70,7 @@ pub trait Tool: Send + Sync + 'static {
 /// Type-erased version of [`Tool`].
 trait DynTool: Send + Sync {
     fn def(&self) -> ToolDef;
+    fn timeout(&self) -> Duration;
 
     fn execute_dyn(
         &self,
@@ -72,6 +81,10 @@ trait DynTool: Send + Sync {
 impl<T: Tool> DynTool for T {
     fn def(&self) -> ToolDef {
         Tool::def(self)
+    }
+
+    fn timeout(&self) -> Duration {
+        Tool::timeout(self)
     }
 
     fn execute_dyn(
@@ -118,6 +131,19 @@ impl Tools {
     #[must_use]
     pub fn defs(&self) -> Vec<ToolDef> {
         self.tools.iter().map(|t| t.def()).collect()
+    }
+
+    /// Return the timeout for the tool identified by `name`.
+    ///
+    /// Falls back to the default 5-second timeout if the tool is not found.
+    #[must_use]
+    pub fn timeout(&self, name: &ToolName) -> Duration {
+        for tool in &self.tools {
+            if tool.def().name() == name {
+                return tool.timeout();
+            }
+        }
+        Duration::from_secs(5)
     }
 
     /// Execute the tool identified by `name` with the given JSON input.

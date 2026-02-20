@@ -93,6 +93,7 @@ impl Provider for OpenRouter {
             async move {
                 match state {
                     State::New => {
+                        tracing::debug!(model = MODEL, "starting OpenRouter SSE stream");
                         match openai_compat::start_sse_stream(
                             &self.client,
                             &url,
@@ -105,22 +106,35 @@ impl Provider for OpenRouter {
                         .await
                         {
                             Ok(mut reader) => {
+                                tracing::debug!("OpenRouter SSE stream connected");
                                 match openai_compat::read_next_sse_event(&mut reader).await {
                                     Ok(Some(event)) => {
                                         Some((exn::Ok(event), State::Streaming(reader)))
                                     }
                                     Ok(None) => None,
-                                    Err(e) => Some((Err(e), State::Finished)),
+                                    Err(e) => {
+                                        tracing::warn!(%e, "OpenRouter SSE stream error on first event");
+                                        Some((Err(e), State::Finished))
+                                    }
                                 }
                             }
-                            Err(e) => Some((Err(e), State::Finished)),
+                            Err(e) => {
+                                tracing::warn!(%e, "failed to start OpenRouter SSE stream");
+                                Some((Err(e), State::Finished))
+                            }
                         }
                     }
                     State::Streaming(mut reader) => {
                         match openai_compat::read_next_sse_event(&mut reader).await {
                             Ok(Some(event)) => Some((exn::Ok(event), State::Streaming(reader))),
-                            Ok(None) => None,
-                            Err(e) => Some((Err(e), State::Finished)),
+                            Ok(None) => {
+                                tracing::debug!("OpenRouter SSE stream finished");
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "OpenRouter SSE stream error");
+                                Some((Err(e), State::Finished))
+                            }
                         }
                     }
                     State::Finished => None,

@@ -1977,8 +1977,13 @@ dependencies = [
 name = "pluribus-unum"
 version = "0.0.0"
 dependencies = [
+ "async-broadcast",
+ "async-channel 2.5.0",
  "async-executor",
  "async-io",
+ "async-lock",
+ "async-net",
+ "async-tungstenite",
  "blocking",
  "chrono",
  "croner",
@@ -1986,6 +1991,7 @@ dependencies = [
  "dom_smoothie",
  "exn",
  "futures-lite 2.6.1",
+ "futures-sink",
  "is-terminal",
  "isahc",
  "macro_rules_attribute",

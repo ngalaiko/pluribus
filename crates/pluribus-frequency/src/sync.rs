@@ -201,7 +201,15 @@ where
     let log = log.clone();
     let peer_vv = log.oplog_vv();
     let ex = Arc::clone(&executor);
-    let task = executor.spawn(sync_loop(ex, log, ws, peer_vv, manifest_rx, peers, remote_id));
+    let task = executor.spawn(sync_loop(
+        ex,
+        log,
+        ws,
+        peer_vv,
+        manifest_rx,
+        peers,
+        remote_id,
+    ));
 
     Ok(SyncHandle { task })
 }
@@ -222,8 +230,8 @@ where
 {
     let (remote, remote_vv, ws) = exchange_hello(log, manifest, ws).await?;
     let remote_id = remote.id.clone();
-    let handle = sync_after_hello(executor, log, ws, &remote_vv, manifest_rx, peers, remote_id)
-        .await?;
+    let handle =
+        sync_after_hello(executor, log, ws, &remote_vv, manifest_rx, peers, remote_id).await?;
     Ok((remote, handle))
 }
 
@@ -266,8 +274,8 @@ pub async fn accept(
         .or_raise(|| Error("WS accept".into()))?;
     let (remote, remote_vv, ws) = exchange_hello(log, manifest, ws).await?;
     let remote_id = remote.id.clone();
-    let handle = sync_after_hello(executor, log, ws, &remote_vv, manifest_rx, peers, remote_id)
-        .await?;
+    let handle =
+        sync_after_hello(executor, log, ws, &remote_vv, manifest_rx, peers, remote_id).await?;
     Ok((remote, handle))
 }
 

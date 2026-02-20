@@ -26,15 +26,11 @@ pub fn to_wire_message(msg: &Message) -> WireMessage<'_> {
                 .iter()
                 .map(|p| match p {
                     pluribus_frequency::protocol::ContentPart::Text { text } => {
-                        WireContentPart::Text {
-                            text: text.clone(),
-                        }
+                        WireContentPart::Text { text: text.clone() }
                     }
                     pluribus_frequency::protocol::ContentPart::Image { data, .. } => {
                         WireContentPart::ImageUrl {
-                            image_url: WireImageUrl {
-                                url: data.clone(),
-                            },
+                            image_url: WireImageUrl { url: data.clone() },
                         }
                     }
                 })
@@ -149,8 +145,10 @@ pub async fn read_next_sse_event(
 
         if let Some(reason) = choice.finish_reason.as_deref() {
             if reason == "length" {
+                tracing::warn!("response truncated (finish_reason=length)");
                 exn::bail!(LlmError::Truncated);
             }
+            tracing::debug!(reason, "SSE stream finish_reason received");
             return Ok(None);
         }
 
@@ -223,6 +221,14 @@ pub async fn start_sse_stream(
 
     let json_body = serde_json::to_vec(&body)
         .or_raise(|| LlmError::Network("serialize chat request".into()))?;
+
+    tracing::debug!(
+        model,
+        messages = messages.len(),
+        tools = tools.len(),
+        "sending chat completion request"
+    );
+
     let request = Request::post(url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
@@ -237,12 +243,14 @@ pub async fn start_sse_stream(
     if !status.is_success() {
         let mut response = response;
         let body = response.text().await.unwrap_or_default();
+        tracing::warn!(status = status.as_u16(), "chat completion API error");
         exn::bail!(LlmError::Api {
             status: status.as_u16(),
             body,
         });
     }
 
+    tracing::debug!("chat completion SSE stream started");
     Ok(BufReader::new(response.into_body()))
 }
 
