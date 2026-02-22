@@ -129,7 +129,11 @@ pub async fn read_next_sse_event(
             continue;
         }
 
-        let Some(data) = line.strip_prefix("data: ") else {
+        let data = if let Some(d) = line.strip_prefix("data: ") {
+            d
+        } else if let Some(d) = line.strip_prefix("data:") {
+            d
+        } else {
             continue;
         };
 
@@ -137,8 +141,18 @@ pub async fn read_next_sse_event(
             return Ok(None);
         }
 
-        let chunk: StreamChunk = serde_json::from_str(data)
-            .or_raise(|| LlmError::StreamParse("parse SSE chunk JSON".into()))?;
+        // Check for inline error responses (e.g. OpenRouter sends these for
+        // upstream provider failures like expired image URLs).
+        if let Ok(err) = serde_json::from_str::<StreamError>(data) {
+            exn::bail!(LlmError::Api {
+                status: err.error.code,
+                body: err.error.message,
+            });
+        }
+
+        let chunk: StreamChunk = serde_json::from_str(data).or_raise(|| {
+            LlmError::StreamParse(format!("parse SSE chunk JSON: {data}"))
+        })?;
         let Some(choice) = chunk.choices.into_iter().next() else {
             continue;
         };
@@ -373,6 +387,20 @@ pub struct WireFunction<'a> {
 }
 
 // -- SSE streaming wire types -----------------------------------------------
+
+/// An inline error returned inside an SSE stream (e.g. from `OpenRouter`).
+#[derive(Deserialize)]
+pub struct StreamError {
+    pub error: StreamErrorBody,
+}
+
+/// Body of an inline SSE stream error.
+#[derive(Deserialize)]
+pub struct StreamErrorBody {
+    pub message: String,
+    #[serde(default)]
+    pub code: u16,
+}
 
 #[derive(Deserialize)]
 pub struct StreamChunk {
