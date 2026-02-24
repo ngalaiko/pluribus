@@ -277,10 +277,13 @@ async fn network_event_loop<N: Network>(
                     continue;
                 }
 
+                tracing::info!(%name, %addr, "discovered peer");
+
                 // Already connected — skip.
                 {
                     let inner = peers.lock().expect("poisoned");
                     if inner.contains_key(&id) {
+                        tracing::debug!(%name, "peer already connected, skipping");
                         drop(inner);
                         continue;
                     }
@@ -289,6 +292,7 @@ async fn network_event_loop<N: Network>(
 
                 // Tie-break: only the node with the smaller ID dials out.
                 if self_id > id {
+                    tracing::debug!(%name, "waiting for peer to dial us");
                     continue;
                 }
 
