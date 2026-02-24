@@ -16,7 +16,7 @@ use serde_json::Map;
 use smol_macros::main;
 
 use pluribus_frequency::network;
-use pluribus_frequency::protocol::{Message, NodeId, ToolCall, ToolDef, ToolName};
+use pluribus_frequency::protocol::{ContentPart, Message, NodeId, ToolCall, ToolDef, ToolName};
 use pluribus_frequency::state::{Entry, EntryId, State};
 use pluribus_frequency::Handle;
 
@@ -171,7 +171,9 @@ fn all_tool_defs(local_defs: &[ToolDef], net: &Handle) -> Vec<ToolDef> {
 /// message onward) are kept verbatim so the LLM can see pending tool calls
 /// and results. Older messages have tool calls stripped from `Assistant`
 /// messages and `Tool` result messages are dropped entirely.
-fn build_context(entries: &[Entry]) -> Vec<Message> {
+/// Image links in historical messages are checked with HEAD requests and
+/// dropped when no longer accessible.
+async fn build_context(entries: &[Entry]) -> Vec<Message> {
     // Find the last user message index — everything from here onward is the
     // "current turn" and must be kept intact (tool calls + results).
     let last_user = entries
@@ -196,39 +198,73 @@ fn build_context(entries: &[Entry]) -> Vec<Message> {
 
     let windowed = &entries[window_start..];
 
-    windowed
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| {
-            let absolute = window_start + i;
-            let is_current_turn = last_user.is_some_and(|lu| absolute >= lu);
+    let mut messages = Vec::with_capacity(windowed.len());
+    for (i, e) in windowed.iter().enumerate() {
+        let absolute = window_start + i;
+        let is_current_turn = last_user.is_some_and(|lu| absolute >= lu);
 
-            if is_current_turn {
-                return Some(e.message.clone());
+        if is_current_turn {
+            messages.push(e.message.clone());
+            continue;
+        }
+
+        // Historical: strip tool overhead, reasoning, and inaccessible image links.
+        match &e.message {
+            Message::System { .. } | Message::Scheduled { .. } => {
+                messages.push(e.message.clone());
             }
-
-            // Historical: strip tool overhead and reasoning.
-            match &e.message {
-                Message::System { .. } | Message::Scheduled { .. } | Message::User { .. } => {
-                    Some(e.message.clone())
-                }
-                Message::Assistant { content, .. } => {
-                    if content.is_empty() {
-                        // Tool-only assistant message — drop it.
-                        None
-                    } else {
-                        // Keep text, strip tool calls and reasoning.
-                        Some(Message::Assistant {
-                            content: content.clone(),
-                            tool_calls: Vec::new(),
-                            reasoning_content: None,
-                        })
+            Message::User { content } => {
+                let mut parts = Vec::with_capacity(content.len());
+                for p in content {
+                    match p {
+                        ContentPart::Text { .. } => parts.push(p.clone()),
+                        ContentPart::Image { data, .. } => {
+                            if is_image_accessible(data).await {
+                                parts.push(p.clone());
+                            }
+                        }
                     }
                 }
-                Message::Tool { .. } => None,
+                if parts.is_empty() {
+                    // Image-only message where images are gone — placeholder.
+                    parts.push(ContentPart::text("[image]"));
+                }
+                messages.push(Message::User { content: parts });
             }
-        })
-        .collect()
+            Message::Assistant { content, .. } => {
+                if !content.is_empty() {
+                    // Keep text, strip tool calls and reasoning.
+                    messages.push(Message::Assistant {
+                        content: content.clone(),
+                        tool_calls: Vec::new(),
+                        reasoning_content: None,
+                    });
+                }
+            }
+            Message::Tool { .. } => {}
+        }
+    }
+    messages
+}
+
+/// Check whether an image is still accessible.
+///
+/// Returns `true` for inline (non-URL) data and for URLs that respond to a
+/// HEAD request with a success status. Returns `false` for URLs that fail.
+async fn is_image_accessible(data: &str) -> bool {
+    if !data.starts_with("http://") && !data.starts_with("https://") {
+        return true;
+    }
+    let Ok(request) = isahc::Request::head(data).body(()) else {
+        return false;
+    };
+    let Ok(client) = isahc::HttpClient::new() else {
+        return false;
+    };
+    client
+        .send_async(request)
+        .await
+        .is_ok_and(|resp| resp.status().is_success())
 }
 
 /// Build the system message for LLM evaluation.
@@ -500,7 +536,7 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
         let all_defs = all_tool_defs(&local_defs, net);
         let entries = state.history().messages();
         let cursor = entries.len();
-        let mut messages = build_context(&entries);
+        let mut messages = build_context(&entries).await;
         messages.insert(0, build_system_message(net, state, chat));
 
         tracing::info!(
