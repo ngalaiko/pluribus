@@ -1,5 +1,6 @@
 mod chat;
 mod geocoding;
+mod index;
 mod llm;
 mod telegram;
 mod tools;
@@ -94,17 +95,23 @@ async fn run_interactive<P: Provider, C: chat::Chat>(
     browser: &tools::browser::Browser,
 ) {
     let node_id = frequency.self_manifest().id.clone();
+    let index = index::Index::new(state.clone());
 
     futures_lite::future::zip(
-        run(executor, &llm, &state, frequency, options, chat, browser),
+        run(executor, &llm, &index, frequency, options, chat, browser),
         futures_lite::future::zip(
             async {
                 let mut stream = if chat.show_full_history() {
-                    state.history().listen().boxed()
+                    index.listen().boxed()
                 } else {
-                    state.history().listen_live().boxed()
+                    index.listen_live().boxed()
                 };
                 while let Some(entry) = stream.next().await {
+                    if let Some(root) = index.root(entry.id) {
+                        if matches!(root.message, Message::Scheduled { .. }) {
+                            continue;
+                        }
+                    }
                     chat.display(&node_id, &entry).await;
                 }
             },
@@ -117,13 +124,13 @@ async fn run_interactive<P: Provider, C: chat::Chat>(
                         }
                         let message = Message::User { content };
                         let entry = Entry::new(message, node_id.clone());
-                        if state.history().push(&entry).is_err() {
+                        if index.push(&entry).is_err() {
                             break;
                         }
                     }
                     state.leave();
                 },
-                run_scheduler(&state, frequency),
+                run_scheduler(&index, frequency),
             ),
         ),
     )
@@ -347,8 +354,9 @@ Use send_message explicitly to send output from schedules, as they don't have co
 ///
 /// When a schedule fires, a synthetic `User` message is pushed to history,
 /// which triggers the main agent loop to run an LLM turn.
-async fn run_scheduler(state: &State, net: &Handle) {
+async fn run_scheduler(index: &index::Index, net: &Handle) {
     let node_id = net.self_manifest().id.clone();
+    let state = index.state();
 
     loop {
         async_io::Timer::after(Duration::from_secs(30)).await;
@@ -380,7 +388,7 @@ async fn run_scheduler(state: &State, net: &Handle) {
             if should_fire {
                 tracing::info!(id, prompt = %schedule.prompt, "schedule fired");
                 let entry = Entry::new(Message::scheduled(&schedule.prompt), node_id.clone());
-                if state.history().push(&entry).is_err() {
+                if index.push(&entry).is_err() {
                     return;
                 }
 
@@ -408,22 +416,32 @@ async fn run_scheduler(state: &State, net: &Handle) {
 async fn run<P: Provider, C: chat::Chat>(
     executor: &Arc<async_executor::Executor<'static>>,
     llm: &P,
-    state: &State,
+    index: &index::Index,
     net: &Handle,
     options: &GenOptions,
     chat: &C,
     browser: &tools::browser::Browser,
 ) {
     let node_id = net.self_manifest().id.clone();
-    let mut stream = state.history().listen_live();
+    let noop = chat::noop();
+    let mut stream = index.listen_live();
 
     while let Some(entry) = stream.next().await {
         match &entry.message {
-            // User or scheduled message we originated → run tool loop
-            Message::User { .. } | Message::Scheduled { .. } if entry.origin == node_id => {
-                tracing::info!("user/scheduled message received, starting tool loop");
+            // Scheduled message we originated → run tool loop with noop display
+            Message::Scheduled { .. } if entry.origin == node_id => {
+                tracing::info!("scheduled message received, starting tool loop");
                 tool_loop(
-                    entry.id, llm, &node_id, state, net, options, chat, executor, browser,
+                    entry.id, llm, &node_id, index, net, options, &noop, executor, browser,
+                )
+                .await;
+            }
+
+            // User message we originated → run tool loop with real chat
+            Message::User { .. } if entry.origin == node_id => {
+                tracing::info!("user message received, starting tool loop");
+                tool_loop(
+                    entry.id, llm, &node_id, index, net, options, chat, executor, browser,
                 )
                 .await;
             }
@@ -434,7 +452,7 @@ async fn run<P: Provider, C: chat::Chat>(
                     continue; // We're the LLM node, tool_loop handles this
                 }
                 tracing::info!(count = tool_calls.len(), origin = %entry.origin, "dispatching remote tool calls");
-                execute_remote_calls(entry.id, tool_calls, &node_id, state, net, browser).await;
+                execute_remote_calls(entry.id, tool_calls, &node_id, index, net, browser).await;
             }
 
             _ => {
@@ -449,10 +467,11 @@ async fn execute_remote_calls(
     assistant_id: EntryId,
     tool_calls: &[ToolCall],
     node_id: &NodeId,
-    state: &State,
+    index: &index::Index,
     net: &Handle,
     browser: &tools::browser::Browser,
 ) {
+    let state = index.state();
     let tools = tools::resolve(state, browser);
     let local_defs = tools.defs();
     net.update_tools(&local_defs);
@@ -469,7 +488,7 @@ async fn execute_remote_calls(
                 node_id.clone(),
             )
             .with_response_to(assistant_id);
-            let _ = state.history().push(&entry);
+            let _ = index.push(&entry);
             continue;
         };
         if !local_defs.iter().any(|d| d.name() == &name) {
@@ -512,7 +531,7 @@ async fn execute_remote_calls(
             node_id.clone(),
         )
         .with_response_to(assistant_id);
-        let _ = state.history().push(&entry);
+        let _ = index.push(&entry);
     }
 }
 
@@ -522,19 +541,21 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
     trigger_id: EntryId,
     llm: &P,
     node_id: &NodeId,
-    state: &State,
+    index: &index::Index,
     net: &Handle,
     options: &GenOptions,
     chat: &C,
     executor: &Arc<async_executor::Executor<'static>>,
     browser: &tools::browser::Browser,
 ) {
+    let state = index.state();
+
     for iteration in 0..MAX_ITERATIONS {
         let local_tools = Arc::new(tools::resolve(state, browser));
         let local_defs = local_tools.defs();
         net.update_tools(&local_defs);
         let all_defs = all_tool_defs(&local_defs, net);
-        let entries = state.history().messages();
+        let entries = index.entries();
         let cursor = entries.len();
         let mut messages = build_context(&entries).await;
         messages.insert(0, build_system_message(net, state, chat));
@@ -558,7 +579,7 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
                         node_id.clone(),
                     )
                     .with_response_to(trigger_id);
-                    let _ = state.history().push(&entry);
+                    let _ = index.push(&entry);
                     return;
                 }
             }
@@ -567,7 +588,7 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
         let tool_calls = response.tool_calls().to_vec();
         let entry = Entry::new(response, node_id.clone()).with_response_to(trigger_id);
         let assistant_id = entry.id;
-        let _ = state.history().push(&entry);
+        let _ = index.push(&entry);
 
         // No tool calls — LLM is done.
         if tool_calls.is_empty() {
@@ -597,7 +618,7 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
                     node_id.clone(),
                 )
                 .with_response_to(assistant_id);
-                let _ = state.history().push(&entry);
+                let _ = index.push(&entry);
                 continue;
             };
             if local_defs.iter().any(|d| d.name() == &name) {
@@ -668,7 +689,7 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
                 node_id.clone(),
             )
             .with_response_to(assistant_id);
-            let _ = state.history().push(&entry);
+            let _ = index.push(&entry);
         }
 
         // Wait for remote results
@@ -677,7 +698,7 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
                 count = pending_remote.len(),
                 "waiting for remote tool results"
             );
-            let stream = state.history().listen_since(cursor);
+            let stream = index.listen_since(cursor);
             wait_for_results(stream, &pending_remote, Duration::from_secs(5)).await;
         }
 
@@ -694,7 +715,7 @@ async fn tool_loop<P: Provider, C: chat::Chat>(
         node_id.clone(),
     )
     .with_response_to(trigger_id);
-    let _ = state.history().push(&entry);
+    let _ = index.push(&entry);
 }
 
 async fn wait_for_results(
