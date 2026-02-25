@@ -58,7 +58,6 @@ pub enum LlmError {
     Api { status: u16, body: String },
     Network(String),
     StreamParse(String),
-    Truncated,
 }
 
 impl fmt::Display for LlmError {
@@ -67,7 +66,6 @@ impl fmt::Display for LlmError {
             Self::Api { status, body } => write!(f, "API error ({status}): {body}"),
             Self::Network(msg) => write!(f, "network error: {msg}"),
             Self::StreamParse(msg) => write!(f, "stream parse error: {msg}"),
-            Self::Truncated => f.write_str("response truncated"),
         }
     }
 }

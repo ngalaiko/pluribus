@@ -157,15 +157,13 @@ pub async fn read_next_sse_event(
             continue;
         };
 
-        if let Some(reason) = choice.finish_reason.as_deref() {
-            if reason == "length" {
-                tracing::warn!("response truncated (finish_reason=length)");
-                exn::bail!(LlmError::Truncated);
-            }
-            tracing::debug!(reason, "SSE stream finish_reason received");
-            return Ok(None);
+        let finished = choice.finish_reason.as_deref();
+        if matches!(finished, Some("length")) {
+            tracing::warn!("response truncated (finish_reason=length)");
         }
 
+        // Process content before checking finish_reason — the final chunk
+        // can carry both a content delta and a finish reason.
         if let Some(reasoning) = choice.delta.reasoning_content {
             if !reasoning.is_empty() {
                 return Ok(Some(LlmEvent::Reasoning(reasoning)));
@@ -193,6 +191,11 @@ pub async fn read_next_sse_event(
                     arguments_delta: args,
                 }));
             }
+        }
+
+        // No content in this chunk — if the stream is finished, signal end.
+        if finished.is_some() {
+            return Ok(None);
         }
     }
 }
