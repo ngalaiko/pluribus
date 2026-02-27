@@ -1,4 +1,3 @@
-mod openai_compat;
 pub mod openrouter;
 
 use futures_lite::StreamExt;
@@ -48,8 +47,19 @@ pub struct GenOptions {
     pub top_p: Option<f64>,
     pub stop: Option<Vec<String>>,
     pub seed: Option<i64>,
-    /// Enable chain-of-thought reasoning (model decides depth).
-    pub thinking: bool,
+    /// Enable chain-of-thought reasoning with a given effort level.
+    pub reasoning: Option<ReasoningEffort>,
+}
+
+/// Reasoning effort level for chain-of-thought.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ReasoningEffort {
+    XHigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
 }
 
 /// Errors from LLM operations.

@@ -64,7 +64,7 @@ async fn main(executor: Arc<async_executor::Executor<'static>>) {
     let llm = llm::resolve(&state).await;
 
     let options = GenOptions {
-        thinking: true,
+        reasoning: Some(llm::ReasoningEffort::Medium),
         ..GenOptions::default()
     };
     let config = state.configuration();
