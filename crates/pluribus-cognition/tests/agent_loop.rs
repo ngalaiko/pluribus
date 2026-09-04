@@ -1,0 +1,395 @@
+//! Drives the real echo plugin through the agent loop.
+
+use pluribus_cognition::{Agent, AuthorityResolver, Router, Subscriptions};
+use pluribus_core::{
+    AppendRequest, Audience, Authority, AuthorityId, BlobStore, CapabilityName, CommittedEvent,
+    ConstraintPolicy, ConstraintSet, DeliveryStore, EventId, EventMetadataSource, EventPayload,
+    EventStore, EventTypeRegistry, Grant, InMemoryBlobStore, Origin, OriginKind, PrincipalKind,
+    PrincipalRef, StateStore, StreamId, StreamKind,
+};
+use pluribus_plugin_package::PluginPackage;
+use pluribus_runtime_wasm::{
+    Delivery, Principal, PrincipalKind as RuntimePrincipalKind, Runtime, RuntimeLimits,
+};
+use pluribus_store_sqlite::SqliteEventStore;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct Metadata(AtomicU64);
+
+impl EventMetadataSource for Metadata {
+    fn next_event_id(&self) -> EventId {
+        EventId::new(format!("event-{}", self.0.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    fn now_ms(&self) -> i64 {
+        1_700_000_000_000
+    }
+}
+
+struct AllowAll;
+
+impl ConstraintPolicy for AllowAll {
+    fn allows(&self, _grant: &Grant, _request: &[u8]) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+/// Grants exactly the listed capabilities to every request.
+struct Standing(Vec<String>);
+
+#[async_trait::async_trait]
+impl AuthorityResolver for Standing {
+    async fn resolve(&self, _event: &CommittedEvent) -> Result<Authority, String> {
+        let mut grants: BTreeMap<CapabilityName, Vec<Grant>> = BTreeMap::new();
+        for name in &self.0 {
+            let capability = CapabilityName::new(name.clone());
+            grants.insert(
+                capability.clone(),
+                vec![Grant {
+                    capability,
+                    provider: None,
+                    constraints: ConstraintSet::canonical_json(b"{}".to_vec()),
+                }],
+            );
+        }
+        Ok(Authority {
+            schema: Authority::SCHEMA.into(),
+            authority_id: AuthorityId::new("authority-1"),
+            agent: agent_principal(),
+            origin: Origin {
+                kind: OriginKind::Autonomous,
+                principal: None,
+                connector: None,
+                conversation_id: None,
+                source_event_id: EventId::new("origin-1"),
+                trusted: true,
+            },
+            delegation_chain: Vec::new(),
+            grants,
+            audiences: Vec::<Audience>::new(),
+            parent_authority: None,
+            issued_at_ms: 0,
+            expires_at_ms: None,
+            max_depth: 4,
+            current_depth: 0,
+        })
+    }
+}
+
+fn agent_principal() -> PrincipalRef {
+    PrincipalRef::new(PrincipalKind::Agent, "personal")
+}
+
+fn package() -> PluginPackage {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/echo");
+    PluginPackage::load(&path).unwrap()
+}
+
+fn delivery() -> Delivery {
+    Delivery {
+        instance_id: "echo-1".into(),
+        agent: Principal {
+            kind: RuntimePrincipalKind::Agent,
+            id: "personal".into(),
+        },
+        actor: Principal {
+            kind: RuntimePrincipalKind::Human,
+            id: "operator".into(),
+        },
+        authority_id: "authority-1".into(),
+        activity_id: "activity-1".into(),
+        correlation_id: "correlation-1".into(),
+        origin_event_id: "origin-1".into(),
+        depth: 0,
+        deadline_at_ms: None,
+        visible_blobs: Vec::new(),
+    }
+}
+
+type TestAgent = Agent<AllowAll, Standing>;
+
+async fn build(grants: &[&str]) -> (TestAgent, Arc<SqliteEventStore<Metadata>>) {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1)))
+            .await
+            .unwrap(),
+    );
+    let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::default());
+    let runtime = Runtime::new(
+        RuntimeLimits::default(),
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&store) as Arc<dyn EventStore>,
+        blobs,
+        Arc::clone(&store) as Arc<dyn DeliveryStore>,
+    )
+    .unwrap();
+    let router = Router::new(
+        StreamId::new("personal"),
+        agent_principal(),
+        Arc::clone(&store) as Arc<dyn EventStore>,
+        Arc::new(EventTypeRegistry::core()),
+        AllowAll,
+    );
+    let mut agent = Agent::new(
+        router,
+        Standing(grants.iter().map(|name| (*name).to_owned()).collect()),
+        runtime,
+        Arc::clone(&store) as Arc<dyn EventStore>,
+        StreamId::new("personal"),
+        agent_principal(),
+    );
+    let installed = agent
+        .install_package(
+            &package(),
+            &json!({}),
+            delivery(),
+            std::collections::BTreeMap::from([(
+                String::new(),
+                pluribus_cognition::ComponentInstall::default(),
+            )]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(installed, ["echo-1"]);
+    (agent, store)
+}
+
+async fn request(store: &Arc<SqliteEventStore<Metadata>>, message: &str) -> CommittedEvent {
+    store
+        .append(AppendRequest {
+            stream_id: StreamId::new("personal"),
+            stream_kind: StreamKind::Agent,
+            observed_at_ms: None,
+            event_type: "capability.requested".into(),
+            payload_schema: "pluribus.capability-request/1".into(),
+            payload: EventPayload::CanonicalJson(
+                serde_json::to_vec(&json!({
+                    "capability": "system.echo",
+                    "arguments": {"message": message},
+                }))
+                .unwrap(),
+            ),
+            actor: PrincipalRef::new(PrincipalKind::Component, "rlm-1"),
+            authority_id: Some(AuthorityId::new("authority-1")),
+            activity_id: Some("activity-1".into()),
+            correlation_id: Some("correlation-1".into()),
+            causation_id: None,
+            deduplication_key: None,
+        })
+        .await
+        .unwrap()
+}
+
+async fn types(store: &Arc<SqliteEventStore<Metadata>>) -> Vec<String> {
+    store
+        .read(&StreamId::new("personal"), 0, 200)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|event| event.request.event_type)
+        .collect()
+}
+
+fn payload(event: &CommittedEvent) -> Value {
+    let EventPayload::CanonicalJson(bytes) = &event.request.payload else {
+        panic!("expected JSON")
+    };
+    serde_json::from_slice(bytes).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_request_reaches_the_provider_and_completes() {
+    let (mut agent, store) = build(&["system.echo"]).await;
+    let event = request(&store, "hello").await;
+
+    let progress = agent.tick_wait(1).await.unwrap();
+
+    assert_eq!(progress.requests_gated, 1);
+    assert_eq!(progress.requests_denied, 0);
+    assert_eq!(progress.deliveries, 1);
+    let result = agent.result_for(&event.event_id).await.unwrap().unwrap();
+    assert_eq!(result.request.event_type, "capability.completed");
+    assert_eq!(payload(&result)["output"]["message"], json!("hello"));
+    assert!(types(&store).await.contains(&"policy.decision".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ungranted_request_never_reaches_the_provider() {
+    let (mut agent, store) = build(&[]).await;
+    let event = request(&store, "hello").await;
+
+    let progress = agent.tick_wait(1).await.unwrap();
+
+    assert_eq!(progress.requests_denied, 1);
+    let result = agent.result_for(&event.event_id).await.unwrap().unwrap();
+    assert_eq!(result.request.event_type, "capability.denied");
+    let committed = types(&store).await;
+    assert!(
+        !committed.contains(&"capability.completed".to_owned()),
+        "a denied request must not execute: {committed:?}"
+    );
+    assert!(
+        !committed.contains(&"capability.output".to_owned()),
+        "a denied request must not even emit progress: {committed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_pass_does_not_repeat_a_completed_request() {
+    let (mut agent, store) = build(&["system.echo"]).await;
+    request(&store, "hello").await;
+
+    agent.tick_wait(1).await.unwrap();
+    let second = agent.tick_wait(2).await.unwrap();
+
+    assert!(
+        second.is_idle(),
+        "a settled request must not be delivered again: {second:?}"
+    );
+    let completions = types(&store)
+        .await
+        .into_iter()
+        .filter(|event_type| event_type == "capability.completed")
+        .count();
+    assert_eq!(completions, 1, "the effect must not repeat");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_loop_is_idle_with_nothing_to_do() {
+    let (mut agent, _store) = build(&["system.echo"]).await;
+
+    assert!(agent.tick_wait(1).await.unwrap().is_idle());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_due_timer_fires_once() {
+    let (mut agent, store) = build(&["system.echo"]).await;
+    store
+        .append(AppendRequest {
+            stream_id: StreamId::new("personal"),
+            stream_kind: StreamKind::Agent,
+            observed_at_ms: None,
+            event_type: "timer.set".into(),
+            payload_schema: "pluribus.timer-set/1".into(),
+            payload: EventPayload::CanonicalJson(
+                serde_json::to_vec(&json!({"dueAtMs": 500})).unwrap(),
+            ),
+            actor: PrincipalRef::new(PrincipalKind::Component, "echo-1"),
+            authority_id: None,
+            activity_id: None,
+            correlation_id: None,
+            causation_id: None,
+            deduplication_key: None,
+        })
+        .await
+        .unwrap();
+
+    let early = agent.tick_wait(100).await.unwrap();
+    let due = agent.tick_wait(500).await.unwrap();
+    let after = agent.tick_wait(900).await.unwrap();
+
+    assert_eq!(
+        early.timers_fired, 0,
+        "a timer must not fire before it is due"
+    );
+    assert_eq!(due.timers_fired, 1);
+    assert_eq!(after.timers_fired, 0, "a fired timer must not re-fire");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn several_requests_settle_in_serialized_passes() {
+    let (mut agent, store) = build(&["system.echo"]).await;
+    let first = request(&store, "one").await;
+    let second = request(&store, "two").await;
+
+    agent.tick_wait(1).await.unwrap();
+    agent.tick_wait(1).await.unwrap();
+
+    assert_eq!(
+        agent
+            .result_for(&first.event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request
+            .event_type,
+        "capability.completed"
+    );
+    assert_eq!(
+        agent
+            .result_for(&second.event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request
+            .event_type,
+        "capability.completed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_an_instance_stops_delivering_to_it() {
+    let (mut agent, store) = build(&["system.echo"]).await;
+    agent.remove("echo-1", 0).await.unwrap();
+    let event = request(&store, "hello").await;
+
+    let progress = agent.tick_wait(1).await.unwrap();
+
+    assert_eq!(progress.deliveries, 0);
+    let result = agent.result_for(&event.event_id).await.unwrap().unwrap();
+    assert_eq!(
+        result.request.event_type, "capability.denied",
+        "with no provider the request terminates instead of hanging"
+    );
+}
+
+#[test]
+fn subscriptions_come_from_the_manifest() {
+    let subscriptions =
+        Subscriptions::from_manifest(package().component("").unwrap().manifest(), &[]);
+
+    assert_eq!(subscriptions.capabilities, ["system.echo"]);
+    assert!(!subscriptions.whole_stream);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_request_does_not_hide_later_requests() {
+    let (agent, store) = build(&["system.echo"]).await;
+    let mut agent = agent.with_batch(1);
+    let first = request(&store, "first").await;
+    let mut denied = first.request.clone();
+    denied.event_type = "capability.denied".into();
+    denied.causation_id = Some(first.event_id.clone());
+    store.append(denied).await.unwrap();
+    let second = request(&store, "second").await;
+    for _ in 0..10 {
+        agent.tick_wait(1).await.unwrap();
+    }
+    assert_eq!(
+        agent
+            .result_for(&second.event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request
+            .event_type,
+        "capability.completed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_wait_until_the_gate_reaches_them() {
+    let (agent, store) = build(&["system.echo"]).await;
+    let mut agent = agent.with_batch(1);
+    let first = request(&store, "first").await;
+    let second = request(&store, "second").await;
+    agent.tick_wait(1).await.unwrap();
+    assert!(agent.result_for(&first.event_id).await.unwrap().is_some());
+    assert!(agent.result_for(&second.event_id).await.unwrap().is_none());
+    agent.tick_wait(1).await.unwrap();
+    assert!(agent.result_for(&second.event_id).await.unwrap().is_some());
+}

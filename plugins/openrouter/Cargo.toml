@@ -1,0 +1,16 @@
+[package]
+name = "pluribus-plugin-openrouter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+base64 = { workspace = true, features = ["alloc"] }
+pluribus-model = { path = "../../crates/pluribus-model" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+wit-bindgen = { workspace = true }

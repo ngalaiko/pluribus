@@ -1,0 +1,33 @@
+[package]
+name = "pluribus-plugin-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "client/src/lib.rs"
+
+[[bin]]
+name = "pluribus-shell-executor"
+path = "executor/src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+wit-bindgen = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# The executor is native only; the client component targets wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { workspace = true, features = ["derive"] }
+pluribus-log = { path = "../../crates/pluribus-log" }
+pluribus-paths = { path = "../../crates/pluribus-paths" }
+rustix = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(any(target_os = "linux", target_os = "android"))))'.dependencies]
+nix = { workspace = true, features = ["socket", "user"] }

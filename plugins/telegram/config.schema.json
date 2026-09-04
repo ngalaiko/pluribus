@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "credential_handle"
+  ],
+  "properties": {
+    "credential_handle": {
+      "type": "string",
+      "minLength": 1
+    },
+    "poll_timeout_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 50,
+      "default": 30
+    },
+    "trusted_senders": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9]+$"
+      },
+      "uniqueItems": true,
+      "default": [],
+      "description": "Telegram sender IDs admitted by receive. All other senders are ignored."
+    }
+  }
+}

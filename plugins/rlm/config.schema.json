@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "js": {
+      "type": "object",
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

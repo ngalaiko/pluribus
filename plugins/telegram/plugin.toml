@@ -1,0 +1,122 @@
+abi = "pluribus:plugin@1.0.0"
+manifest_version = 1
+id = "dev.pluribus.telegram"
+name = "Telegram"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+[[credentials]]
+components = ["receive", "send"]
+id = "bot-token"
+display_name = "Telegram bot token"
+description = "Authenticate one Telegram bot."
+config_pointer = "/credential_handle"
+input_schema = "schemas/credential.input.json"
+flow_schema = "pluribus:credential/static-http@1"
+flow = "flows/bot-token.json"
+
+
+[components.receive]
+world = "pluribus:plugin/plugin@1.0.0"
+component = "components/receive.wasm"
+digest = "sha256:dev"
+config_schema = "config.schema.json"
+config_pointer = ""
+imports = ["pluribus:plugin/blobs@1.0.0", "pluribus:plugin/events@1.0.0", "pluribus:plugin/http@1.0.0", "pluribus:plugin/state@1.0.0"]
+subscribes = ["timer.fired"]
+emits = ["observation.received", "timer.set", "telegram.media-ready", "telegram.media-failed"]
+
+[[components.receive.requested_capabilities]]
+name = "net.http"
+required = true
+reason = "Poll Telegram updates and download received media"
+constraints = { origins = ["https://api.telegram.org"], methods = ["GET", "POST"] }
+
+[components.send]
+world = "pluribus:plugin/plugin@1.0.0"
+component = "components/send.wasm"
+digest = "sha256:dev"
+config_schema = "config.schema.json"
+config_pointer = ""
+imports = ["pluribus:plugin/blobs@1.0.0", "pluribus:plugin/http@1.0.0"]
+subscribes = []
+emits = ["capability.completed", "capability.failed"]
+
+[[components.send.requested_capabilities]]
+name = "net.http"
+required = true
+reason = "Send Telegram messages and media"
+constraints = { origins = ["https://api.telegram.org"], methods = ["GET", "POST"] }
+
+[[components.send.provides]]
+capability = "telegram.reply"
+description = "Answer a Telegram conversation with text. Every connector provides <provider>.reply; richer sends have their own capabilities."
+arguments_schema = "schemas/reply.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[components.send.provides]]
+capability = "telegram.send-message"
+description = "Send plain text to a Telegram conversation."
+arguments_schema = "schemas/send-message.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[components.send.provides]]
+capability = "telegram.send-draft"
+description = "Update an ephemeral streaming draft in a Telegram private chat."
+arguments_schema = "schemas/send-draft.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[components.send.provides]]
+capability = "telegram.send-media"
+description = "Send a visible blob as a photo, document, audio, voice, video, video note, animation, or sticker."
+arguments_schema = "schemas/send-media.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[components.send.provides]]
+capability = "telegram.send-media-group"
+description = "Send two to ten visible photo, video, audio, or document blobs as an album."
+arguments_schema = "schemas/send-media-group.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[components.send.provides]]
+capability = "telegram.send-location"
+description = "Send a Telegram location or named venue."
+arguments_schema = "schemas/send-location.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[components.send.provides]]
+capability = "telegram.react"
+description = "Set one emoji reaction on a Telegram message."
+arguments_schema = "schemas/react.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[components.send.provides]]
+capability = "telegram.edit-message"
+description = "Edit a Telegram message sent by this bot."
+arguments_schema = "schemas/edit-message.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[components.send.provides]]
+capability = "telegram.delete-message"
+description = "Delete a Telegram message where Telegram permits it."
+arguments_schema = "schemas/delete-message.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+

@@ -1,0 +1,119 @@
+package pluribus:plugin@1.0.0;
+
+/// Values shared by the host imports and the plugin export.
+interface types {
+  /// One canonical JSON value, UTF-8 encoded.
+  type json = list<u8>;
+
+  enum principal-kind {
+    human,
+    agent,
+    node,
+    component,
+    external,
+  }
+
+  record principal {
+    kind: principal-kind,
+    id: string,
+  }
+
+  /// Immutable content-addressed reference. `algorithm` is always `sha256`
+  /// and `digest` is lowercase hexadecimal.
+  record blob-ref {
+    algorithm: string,
+    digest: string,
+    size: u64,
+    media-type: string,
+  }
+
+  /// Small structured values travel inline. Large or binary values travel
+  /// by reference.
+  variant payload {
+    json(json),
+    blob(blob-ref),
+  }
+
+  /// Bounded read from a blob, an HTTP response stream, or a local socket.
+  /// `closed` means no bytes follow the ones returned.
+  record chunk {
+    bytes: list<u8>,
+    closed: bool,
+  }
+
+  enum error-code {
+    invalid-argument,
+    not-found,
+    permission-denied,
+    unsupported,
+    conflict,
+    unavailable,
+    resource-exhausted,
+    cancelled,
+    deadline-exceeded,
+    internal,
+  }
+
+  /// `retryable` is advice. The core decides retries from idempotency,
+  /// attempt count, deadline, and authority. `message` and `details` are
+  /// retained and may reach a model or operator, so they MUST NOT contain
+  /// secrets.
+  record error {
+    code: error-code,
+    message: string,
+    retryable: bool,
+    details: option<json>,
+  }
+
+  /// A committed event on the agent stream. Every field is host-assigned;
+  /// a plugin cannot forge one.
+  ///
+  /// Untrusted external timestamps belong in `payload`, not here.
+  record event {
+    event-id: string,
+    sequence: u64,
+    recorded-at-ms: s64,
+    event-type: string,
+    payload-schema: string,
+    payload: payload,
+    actor: principal,
+    authority-id: option<string>,
+    activity-id: option<string>,
+    correlation-id: option<string>,
+    causation-id: option<string>,
+  }
+
+  /// An event a plugin proposes. The host stamps identity, order, time,
+  /// actor, authority, activity, and correlation, validates `payload`
+  /// against the schema registered for `event-type`, and rejects a type
+  /// this instance is not granted to emit.
+  record proposal {
+    event-type: string,
+    payload-schema: string,
+    payload: payload,
+
+    /// Deduplication key scoped to this instance. Re-proposing a committed
+    /// key returns the existing event instead of appending a second one.
+    ///
+    /// Required by `events.append`. Optional in `lifecycle.outcome`, where
+    /// the host derives it from the delivery position and the proposal's
+    /// ordinal so that a redelivered attempt produces identical keys.
+    idempotency-key: option<string>,
+
+    /// The event this proposal answers or continues. When absent the host
+    /// uses the delivered event, and returns `invalid-argument` if the
+    /// delivery carried more than one.
+    causation-id: option<string>,
+  }
+
+  /// One change to this instance's state namespace.
+  variant mutation {
+    set(state-entry),
+    delete(string),
+  }
+
+  record state-entry {
+    key: string,
+    value: list<u8>,
+  }
+}

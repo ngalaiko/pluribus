@@ -1,0 +1,21 @@
+[package]
+name = "pluribus-host-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+pluribus-core = { path = "../pluribus-core" }
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
+nix = { workspace = true, features = ["socket", "user"] }

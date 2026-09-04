@@ -1,0 +1,37 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+
+      # Builds every plugin package and both binaries.
+      - run: nix-build -A pluribus --no-out-link
+      # Rebuilds the release assets and exercises the archive they ship.
+      - run: nix-build -A release --no-out-link
+      # Keeps the flake outputs consumers install from honest.
+      - run: nix flake check
+
+      # The workspace tests read packages from the source tree.
+      - run: nix-shell --run pluribus-sync-plugins
+
+      - run: nix-shell --run 'cargo fmt --check'
+      - run: nix-shell --run 'cargo clippy --locked --workspace --all-targets'
+
+      # The ignored tests bind loopback sockets and make no external requests.
+      - run: nix-shell --run 'cargo test --locked --workspace -- --include-ignored'

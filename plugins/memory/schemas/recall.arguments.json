@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "scope": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "kinds": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "fact",
+          "preference",
+          "belief",
+          "goal",
+          "procedure"
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItems": true
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20
+    },
+    "maxBytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16384
+    }
+  },
+  "required": [
+    "scope",
+    "query"
+  ]
+}

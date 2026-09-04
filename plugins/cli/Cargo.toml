@@ -1,0 +1,34 @@
+[package]
+name = "pluribus-plugin-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "client/src/lib.rs"
+
+[[bin]]
+name = "pluribus-cli-bridge"
+path = "bridge/src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+wit-bindgen = { workspace = true }
+
+[dependencies.protocol]
+package = "pluribus-plugin-cli-protocol"
+path = "protocol"
+
+# The bridge is native only; the component targets wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { workspace = true }
+pluribus-log = { path = "../../crates/pluribus-log" }
+pluribus-paths = { path = "../../crates/pluribus-paths" }
+rustix = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(any(target_os = "linux", target_os = "android"))))'.dependencies]
+nix = { workspace = true }

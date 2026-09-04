@@ -1,0 +1,23 @@
+[package]
+name = "pluribus-runtime-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+pluribus-core = { path = "../pluribus-core" }
+pluribus-plugin-bindings = { path = "../pluribus-plugin-bindings" }
+pluribus-plugin-package = { path = "../pluribus-plugin-package" }
+serde_json.workspace = true
+wasmtime.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+pluribus-store-sqlite = { path = "../pluribus-store-sqlite" }
+wit-component.workspace = true
+wit-parser.workspace = true
+
+[lints]
+workspace = true

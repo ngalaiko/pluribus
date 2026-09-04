@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "chat_id",
+    "items"
+  ],
+  "properties": {
+    "chat_id": {
+      "type": [
+        "integer",
+        "string"
+      ]
+    },
+    "items": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "blob"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "photo",
+              "video",
+              "audio",
+              "document"
+            ]
+          },
+          "blob": {
+            "type": "object"
+          },
+          "file_name": {
+            "type": "string"
+          },
+          "caption": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "message_thread_id": {
+      "type": "integer"
+    },
+    "reply_to_message_id": {
+      "type": "integer"
+    }
+  },
+  "additionalProperties": false
+}
