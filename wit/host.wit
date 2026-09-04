@@ -1,0 +1,188 @@
+package pluribus:plugin@1.0.0;
+
+/// The coordination contract. Every decision, request, and result is an
+/// event. Plugins do not call each other; they answer request events and
+/// propose result events.
+interface events {
+  use types.{error, event, proposal};
+
+  /// Filter over the current agent stream. An empty or absent field does
+  /// not constrain.
+  record filter {
+    after-sequence: option<u64>,
+    event-types: list<string>,
+    correlation-id: option<string>,
+    activity-id: option<string>,
+    recorded-from-ms: option<s64>,
+    recorded-to-ms: option<s64>,
+  }
+
+  record page {
+    events: list<event>,
+    /// Sequence to resume from. Absent when the page reached the end of
+    /// the stream at read time. Presence is not proof that more events
+    /// exist.
+    next-sequence: option<u64>,
+  }
+
+  /// Appends outside the delivery transaction, returning the assigned
+  /// sequence. The event commits before the handling returns and is
+  /// therefore visible even if the handling later fails.
+  ///
+  /// Use it only for non-terminal progress that must be observable while
+  /// work continues: model deltas and capability output. Terminal results
+  /// belong in `lifecycle.outcome`, which commits atomically with state
+  /// and delivery progress.
+  ///
+  /// `idempotency-key` is required. A redelivered attempt MUST reuse the
+  /// same keys so that repetition deduplicates instead of duplicating.
+  append: func(proposal: proposal) -> result<u64, error>;
+
+  get: func(event-id: string) -> result<event, error>;
+
+  /// Returns matching events in ascending sequence order. Visibility and
+  /// grants may withhold events or their payloads.
+  query: func(filter: filter, limit: u32) -> result<page, error>;
+}
+
+/// Opaque checkpoint storage, namespaced by plugin instance.
+///
+/// State is a rebuildable projection of the event stream, not an audit
+/// record. The host MAY discard a namespace at any time — after a state
+/// schema change it does — and the plugin MUST rebuild it by replaying
+/// events. Do not keep here anything the event stream cannot reproduce.
+///
+/// Writes are not in this interface. They travel in `lifecycle.outcome`
+/// so that state, emitted events, and delivery progress commit together.
+interface state {
+  use types.{error, state-entry};
+
+  record page {
+    entries: list<state-entry>,
+    next-key: option<string>,
+  }
+
+  get: func(key: string) -> result<option<list<u8>>, error>;
+
+  /// Lexicographic scan over UTF-8 keys from one consistent revision.
+  scan: func(prefix: string, after-key: option<string>, limit: u32)
+    -> result<page, error>;
+}
+
+/// Content-addressed storage for payloads too large to carry in an event.
+interface blobs {
+  use types.{blob-ref, chunk, error};
+
+  /// Whole-blob write for content that fits one message.
+  put: func(media-type: string, bytes: list<u8>) -> result<blob-ref, error>;
+
+  /// Chunked write for larger content. The handle is valid until the
+  /// current delivery ends.
+  open-write: func(media-type: string, expected-size: option<u64>)
+    -> result<string, error>;
+
+  /// Accepts only the next contiguous offset, or a byte-identical repeat
+  /// of the previous chunk. Returns the next expected offset.
+  write: func(handle: string, offset: u64, bytes: list<u8>)
+    -> result<u64, error>;
+
+  /// Verifies size, computes the digest, and commits. Equal bytes
+  /// deduplicate.
+  finish: func(handle: string) -> result<blob-ref, error>;
+
+  /// Returns at most `max-bytes`. The plugin MUST verify that the
+  /// cumulative length equals `blob-ref.size`.
+  read: func(blob: blob-ref, offset: u64, max-bytes: u32)
+    -> result<chunk, error>;
+}
+
+/// Read half of a byte channel. The interface that opens a channel
+/// authorizes it; this one only moves bytes.
+///
+/// Dropping the reader ends the transfer.
+interface reader {
+  use types.{chunk, error};
+
+  resource reader {
+    /// Returns at most `max-bytes`, waiting up to `timeout-ms`. A timeout
+    /// returns an empty chunk with `closed = false`. EOF returns
+    /// `closed = true`, possibly with final bytes.
+    receive: func(max-bytes: u32, timeout-ms: u32) -> result<chunk, error>;
+  }
+}
+
+/// Write half of a byte channel.
+///
+/// Dropping the writer half-closes the channel: the peer reads EOF while
+/// the read half stays open. An endpoint MAY treat that as cancellation,
+/// as the shell executor does, so hold the writer until the exchange is
+/// done. There is no host-side write buffer; each `send` is one write, so
+/// the plugin decides framing by choosing when to call it.
+interface writer {
+  use types.{error};
+
+  resource writer {
+    /// Writes the whole buffer or fails.
+    send: func(bytes: list<u8>) -> result<_, error>;
+  }
+}
+
+/// Policy-controlled outbound HTTP to external services.
+///
+/// The host enforces allowed schemes, origins, ports and methods, DNS and
+/// resolved-address policy on every connection, redirect policy on every
+/// hop, size limits, deadlines, and credential destination constraints.
+/// It injects credentials from a granted handle after those checks;
+/// credential bytes never enter plugin memory and are never forwarded
+/// across an origin change.
+interface http {
+  use reader.{reader};
+  use types.{blob-ref, error};
+
+  record header {
+    name: string,
+    value: list<u8>,
+  }
+
+  /// A plugin MUST NOT set `authorization`, `cookie`, or any other header
+  /// the granted credential injects. Some credentials instead carry a
+  /// secret URL path segment the host substitutes after authorizing the
+  /// origin; the plugin never sees the resulting URL.
+  record request {
+    method: string,
+    url: string,
+    headers: list<header>,
+    body: option<blob-ref>,
+    credential: option<string>,
+    timeout-ms: u32,
+  }
+
+  record response {
+    status: u16,
+    headers: list<header>,
+    body: blob-ref,
+  }
+
+  send: func(request: request) -> result<response, error>;
+
+  /// Opens the response body as server-sent events. The plugin owns
+  /// record framing; the host moves bytes. Read-only by construction.
+  sse: func(request: request) -> result<reader, error>;
+}
+
+/// Byte channel to the one Unix socket endpoint granted to this instance.
+///
+/// The host owns transport, peer-credential verification, and byte and
+/// time budgets. The plugin owns framing and protocol. No credential is
+/// injected; an endpoint grant conveys whatever authority that endpoint
+/// exposes.
+interface socket {
+  use reader.{reader};
+  use writer.{writer};
+  use types.{error};
+
+  /// Connects the granted endpoint, returning both halves. They share one
+  /// transport and one byte budget; it closes when both are dropped.
+  /// Denied outside a request delivery.
+  connect: func() -> result<tuple<reader, writer>, error>;
+}

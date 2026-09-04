@@ -1,0 +1,33 @@
+abi = "pluribus:plugin@1.0.0"
+manifest_version = 1
+id = "dev.pluribus.shell"
+name = "Shell"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+
+[components.main]
+config_pointer = ""
+config_schema = "config.schema.json"
+world = "pluribus:plugin/plugin@1.0.0"
+component = "plugin.wasm"
+digest = "sha256:dev"
+imports = [
+  "pluribus:plugin/reader@1.0.0",
+  "pluribus:plugin/socket@1.0.0",
+  "pluribus:plugin/writer@1.0.0",
+]
+emits = ["capability.completed", "capability.failed"]
+[[components.main.provides]]
+capability = "shell.execute"
+description = "Runs /bin/sh in the workspace account. Returns stdout, stderr, exit code, and truncation. Commands may have irreversible effects; do not retry automatically."
+arguments_schema = "schemas/execute.arguments.json"
+result_schema = "schemas/execute.result.json"
+constraints_schema = "schemas/execute.constraints.json"
+idempotency = "non-idempotent"
+
+[[components.main.requested_capabilities]]
+name = "host.stream"
+required = true
+reason = "The granted endpoint runs unrestricted shell commands with the workspace account's full authority."
+constraints = { unrestricted = true }

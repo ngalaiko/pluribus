@@ -1,0 +1,16 @@
+[package]
+name = "pluribus-store-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+pluribus-core = { path = "../pluribus-core" }
+rusqlite.workspace = true
+async-sqlite.workspace = true
+
+[lints]
+workspace = true

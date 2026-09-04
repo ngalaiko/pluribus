@@ -1,0 +1,39 @@
+abi = "pluribus:plugin@1.0.0"
+manifest_version = 1
+id = "dev.pluribus.openai-codex"
+name = "OpenAI Codex subscription"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+
+[components.main]
+config_pointer = ""
+config_schema = "config.schema.json"
+world = "pluribus:plugin/plugin@1.0.0"
+component = "plugin.wasm"
+digest = "sha256:dev"
+imports = [
+  "pluribus:plugin/blobs@1.0.0",
+  "pluribus:plugin/events@1.0.0",
+  "pluribus:plugin/http@1.0.0",
+  "pluribus:plugin/reader@1.0.0",
+]
+emits = ["model.stream", "model.completed", "model.failed"]
+[components.main.model_provider]
+models_pointer = "/models"
+
+[[credentials]]
+components = ["main"]
+id = "subscription"
+display_name = "Codex subscription"
+description = "Authorize a ChatGPT Codex subscription with device login."
+config_pointer = "/credential"
+input_schema = "schemas/credential.input.json"
+flow_schema = "pluribus:credential/oauth-device@1"
+flow = "flows/subscription.json"
+
+[[components.main.requested_capabilities]]
+name = "host.http"
+required = true
+reason = "Authorize Codex and call the ChatGPT Codex Responses endpoint."
+constraints = { origins = ["https://auth.openai.com", "https://chatgpt.com"], methods = ["POST"] }

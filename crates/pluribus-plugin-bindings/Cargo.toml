@@ -1,0 +1,16 @@
+[package]
+name = "pluribus-plugin-bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wasmtime.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

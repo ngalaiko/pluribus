@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "chat_id",
+    "message_id"
+  ],
+  "properties": {
+    "chat_id": {
+      "type": [
+        "integer",
+        "string"
+      ]
+    },
+    "message_id": {
+      "type": "integer"
+    }
+  },
+  "additionalProperties": false
+}

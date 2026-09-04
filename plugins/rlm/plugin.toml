@@ -1,0 +1,29 @@
+abi = "pluribus:plugin@1.0.0"
+manifest_version = 1
+id = "dev.pluribus.rlm"
+name = "RLM cognition"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+[components.cognition]
+config_pointer = ""
+requires = ["js"]
+world = "pluribus:plugin/plugin@1.0.0"
+component = "components/cognition.wasm"
+digest = "sha256:dev"
+imports = ["pluribus:plugin/events@1.0.0", "pluribus:plugin/state@1.0.0"]
+config_schema = "config.schema.json"
+subscribes = ["*", "cognition.checkpoint"]
+rebuilds = ["cognition.checkpoint"]
+emits = ["cognition.job-updated", "cognition.observation-associated", "timer.set", "timer.cancel", "cognition.checkpoint", "cognition.cancel-requested", "code.close-requested", "model.requested", "code.evaluate-requested", "code.resumed", "capability.requested", "cognition.completed", "cognition.failed"]
+
+[components.js]
+world = "pluribus:plugin/plugin@1.0.0"
+component = "components/js.wasm"
+digest = "sha256:dev"
+imports = []
+config_schema = "schemas/js-config.schema.json"
+config_pointer = "/js"
+subscribes = ["code.close-requested", "code.evaluate-requested", "code.resumed"]
+emits = ["code.closed", "code.yielded", "code.completed", "code.failed"]
+pinned_session = true

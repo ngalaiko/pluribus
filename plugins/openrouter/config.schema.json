@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["credential", "models"],
+  "properties": {
+    "credential": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Host-owned API-key credential handle."
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "OpenRouter model slugs this instance serves, such as anthropic/claude-sonnet-4.5.",
+      "items": {
+        "oneOf": [
+          { "type": "string", "minLength": 1 },
+          {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "features": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "vision",
+                    "audio-input",
+                    "audio-output",
+                    "reasoning",
+                    "prompt-caching",
+                    "structured-output",
+                    "parallel-tools",
+                    "continuation"
+                  ]
+                }
+              },
+              "context_tokens": { "type": "integer", "minimum": 1 },
+              "max_output_tokens": { "type": "integer", "minimum": 1 }
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 300000
+    }
+  },
+  "additionalProperties": false
+}

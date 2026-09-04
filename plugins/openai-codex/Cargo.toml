@@ -1,0 +1,15 @@
+[package]
+name = "pluribus-plugin-openai-codex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pluribus-model = { path = "../../crates/pluribus-model" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+wit-bindgen = { workspace = true }

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["stdout", "stderr", "exit_code", "truncated"],
+  "additionalProperties": false,
+  "properties": {
+    "stdout": { "type": "string" },
+    "stderr": { "type": "string" },
+    "exit_code": { "type": ["integer", "null"] },
+    "truncated": { "type": "boolean" }
+  }
+}

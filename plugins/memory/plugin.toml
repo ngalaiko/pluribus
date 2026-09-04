@@ -1,0 +1,57 @@
+abi = "pluribus:plugin@1.0.0"
+manifest_version = 1
+id = "dev.pluribus.memory"
+name = "Memory"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+
+[components.main]
+config_pointer = ""
+config_schema = "config.schema.json"
+world = "pluribus:plugin/plugin@1.0.0"
+component = "plugin.wasm"
+digest = "sha256:dev"
+imports = ["pluribus:plugin/events@1.0.0", "pluribus:plugin/state@1.0.0"]
+subscribes = ["memory.remembered", "memory.superseded", "memory.forgotten"]
+rebuilds = ["memory.remembered", "memory.superseded", "memory.forgotten"]
+emits = ["memory.remembered", "memory.superseded", "memory.forgotten", "capability.completed", "capability.failed"]
+[[components.main.provides]]
+capability = "memory.remember"
+description = "Retain a sourced fact, preference, belief, goal, or procedure."
+arguments_schema = "schemas/remember.arguments.json"
+result_schema = "schemas/remember.result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "keyed"
+
+[[components.main.provides]]
+capability = "memory.supersede"
+description = "Correct the current memory version."
+arguments_schema = "schemas/supersede.arguments.json"
+result_schema = "schemas/supersede.result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "keyed"
+
+[[components.main.provides]]
+capability = "memory.forget"
+description = "Exclude a memory and its predecessors from retrieval."
+arguments_schema = "schemas/forget.arguments.json"
+result_schema = "schemas/forget.result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "keyed"
+
+[[components.main.provides]]
+capability = "memory.get"
+description = "Read active memories by ID and exact scope."
+arguments_schema = "schemas/get.arguments.json"
+result_schema = "schemas/get.result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "inherent"
+
+[[components.main.provides]]
+capability = "memory.recall"
+description = "Find active memories by words and exact scope."
+arguments_schema = "schemas/recall.arguments.json"
+result_schema = "schemas/recall.result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "inherent"

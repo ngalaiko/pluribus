@@ -1,0 +1,22 @@
+[package]
+name = "pluribus-cognition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+pluribus-core = { path = "../pluribus-core" }
+pluribus-plugin-package = { path = "../pluribus-plugin-package" }
+pluribus-runtime-wasm = { path = "../pluribus-runtime-wasm" }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pluribus-model = { path = "../pluribus-model" }
+pluribus-store-sqlite = { path = "../pluribus-store-sqlite" }
+
+[lints]
+workspace = true

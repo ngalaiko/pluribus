@@ -1,0 +1,11 @@
+{
+  "http": {
+    "origins": ["https://openrouter.ai"],
+    "headers": [
+      {
+        "name": "authorization",
+        "value": { "parts": [{ "literal": "Bearer " }, { "input": "api_key" }] }
+      }
+    ]
+  }
+}

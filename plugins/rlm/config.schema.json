@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "properties": {
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identity": {
+      "type": "string"
+    },
+    "trusted_users": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "background_model_calls_per_hour": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000,
+      "default": 64
+    },
+    "js": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "connectors": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "required": [
+    "model",
+    "identity",
+    "connectors",
+    "js"
+  ],
+  "additionalProperties": false
+}

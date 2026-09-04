@@ -1,0 +1,12 @@
+[package]
+name = "pluribus-plugin-rlm-cognition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+wit-bindgen = { workspace = true }

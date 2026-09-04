@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "scope": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "kind": {
+            "enum": [
+              "fact",
+              "preference",
+              "belief",
+              "goal",
+              "procedure"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "minItems": 1,
+            "maxItems": 16,
+            "uniqueItems": true
+          },
+          "basis": {
+            "enum": [
+              "explicit",
+              "inferred"
+            ]
+          },
+          "expiresAtMs": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "createdAtMs": {
+            "type": "integer"
+          },
+          "supersedes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "kind",
+          "content",
+          "sources",
+          "basis",
+          "expiresAtMs",
+          "createdAtMs",
+          "supersedes"
+        ]
+      }
+    },
+    "unavailableIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      }
+    }
+  },
+  "required": [
+    "records",
+    "unavailableIds"
+  ]
+}

@@ -1,0 +1,11 @@
+[package]
+name = "pluribus-plugin-telegram-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+wit-bindgen = { workspace = true }

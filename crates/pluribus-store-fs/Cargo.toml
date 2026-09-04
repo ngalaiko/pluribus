@@ -1,0 +1,16 @@
+[package]
+name = "pluribus-store-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+pluribus-core = { path = "../pluribus-core" }
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

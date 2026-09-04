@@ -1,0 +1,333 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pluribus.dev/schemas/plugin-manifest-1.json",
+  "title": "Pluribus plugin manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "abi",
+    "id",
+    "name",
+    "config_schema",
+    "components"
+  ],
+  "properties": {
+    "abi": {
+      "const": "pluribus:plugin@1.0.0"
+    },
+    "manifest_version": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "maxLength": 255
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "config_schema": {
+      "$ref": "#/$defs/path"
+    },
+    "credentials": {
+      "description": "Host-executed credential enrollment owned by this plugin. Replaces credential-provider.describe. Contains no secret values.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/credential"
+      }
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "components": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 64,
+      "propertyNames": {
+        "$ref": "#/$defs/component_name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/component"
+      }
+    }
+  },
+  "$defs": {
+    "path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)[A-Za-z0-9._/-]+$",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "dotted_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "maxLength": 255
+    },
+    "event_pattern": {
+      "type": "string",
+      "pattern": "^(\\*|[a-z0-9]+([.-][a-z0-9]+)*(\\.\\*)?)$",
+      "maxLength": 255
+    },
+    "provided_capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "description",
+        "arguments_schema",
+        "result_schema",
+        "idempotency"
+      ],
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/dotted_name"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "arguments_schema": {
+          "$ref": "#/$defs/path"
+        },
+        "result_schema": {
+          "$ref": "#/$defs/path"
+        },
+        "constraints_schema": {
+          "$ref": "#/$defs/path"
+        },
+        "idempotency": {
+          "enum": [
+            "inherent",
+            "keyed",
+            "non-idempotent"
+          ]
+        }
+      }
+    },
+    "model_provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "models_pointer"
+      ],
+      "properties": {
+        "models_pointer": {
+          "description": "JSON Pointer into validated instance configuration, resolving to an array. Each item is either a model id string or an object {id, features?, context_tokens?, max_output_tokens?}. Core reads this array to build the model routing table at activation; this reading is part of the ABI.",
+          "type": "string",
+          "pattern": "^(/[^/~]*(~[01][^/~]*)*)+$",
+          "maxLength": 255
+        }
+      }
+    },
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "display_name",
+        "description",
+        "config_pointer",
+        "input_schema",
+        "flow_schema",
+        "flow",
+        "components"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/dotted_name"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "config_pointer": {
+          "type": "string",
+          "pattern": "^(/[^/~]*(~[01][^/~]*)*)*$",
+          "maxLength": 255
+        },
+        "input_schema": {
+          "$ref": "#/$defs/path"
+        },
+        "flow_schema": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*:[a-z][a-z0-9]*(-[a-z0-9]+)*/[a-z][a-z0-9]*(-[a-z0-9]+)*@[0-9]+$",
+          "maxLength": 255
+        },
+        "flow": {
+          "$ref": "#/$defs/path"
+        },
+        "components": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/component_name"
+          }
+        }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "required",
+        "reason",
+        "constraints"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/dotted_name"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "constraints": {
+          "type": "object"
+        }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "world",
+        "component",
+        "digest",
+        "imports",
+        "config_schema",
+        "config_pointer"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "provides"
+          ]
+        },
+        {
+          "required": [
+            "model_provider"
+          ]
+        },
+        {
+          "required": [
+            "subscribes"
+          ]
+        }
+      ],
+      "properties": {
+        "world": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*:[a-z][a-z0-9]*(-[a-z0-9]+)*/[a-z][a-z0-9]*(-[a-z0-9]+)*@[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "maxLength": 255
+        },
+        "component": {
+          "$ref": "#/$defs/path"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^(sha256:[0-9a-f]{64}|sha256:dev)$"
+        },
+        "imports": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "pluribus:plugin/events@1.0.0",
+              "pluribus:plugin/state@1.0.0",
+              "pluribus:plugin/blobs@1.0.0",
+              "pluribus:plugin/reader@1.0.0",
+              "pluribus:plugin/writer@1.0.0",
+              "pluribus:plugin/http@1.0.0",
+              "pluribus:plugin/socket@1.0.0"
+            ]
+          }
+        },
+        "rebuilds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "provides": {
+          "description": "Capabilities this plugin answers. Replaces capability-provider.describe. The host routes capability.requested by the payload's capability name.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/provided_capability"
+          }
+        },
+        "model_provider": {
+          "description": "Declares that this plugin answers model.requested. Replaces model-provider.describe. Model identifiers are a deployment fact, so they live in instance configuration and this names where.",
+          "$ref": "#/$defs/model_provider"
+        },
+        "subscribes": {
+          "description": "Event types delivered to handle beyond those implied by provides and models. \"*\" subscribes to the whole agent stream and is reserved for cognition.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/event_pattern"
+          }
+        },
+        "emits": {
+          "description": "Event types this plugin may propose. The host rejects any other type. Types outside the core vocabulary must be prefixed plugin.<id>.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/event_pattern"
+          }
+        },
+        "pinned_session": {
+          "description": "The instance keeps linear memory for the duration of one activity because its continuation is a suspended call stack. Such a session is not durable: losing the instance fails the activity.",
+          "type": "boolean",
+          "default": false
+        },
+        "requested_capabilities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/capability"
+          }
+        },
+        "config_schema": {
+          "$ref": "#/$defs/path"
+        },
+        "config_pointer": {
+          "type": "string",
+          "pattern": "^(/[^/~]*(~[01][^/~]*)*)*$"
+        },
+        "requires": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/component_name"
+          }
+        }
+      }
+    },
+    "component_name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "maxLength": 80
+    }
+  }
+}

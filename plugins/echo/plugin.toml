@@ -1,0 +1,23 @@
+abi = "pluribus:plugin@1.0.0"
+manifest_version = 1
+id = "dev.pluribus.echo"
+name = "Echo"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+[components.main]
+config_pointer = ""
+config_schema = "config.schema.json"
+world = "pluribus:plugin/plugin@1.0.0"
+component = "plugin.wasm"
+digest = "sha256:dev"
+imports = ["pluribus:plugin/events@1.0.0", "pluribus:plugin/state@1.0.0"]
+emits = ["capability.output", "capability.completed", "capability.failed"]
+
+[[components.main.provides]]
+capability = "system.echo"
+description = "Returns the supplied JSON object."
+arguments_schema = "schemas/echo.arguments.json"
+result_schema = "schemas/echo.result.json"
+constraints_schema = "schemas/echo.constraints.json"
+idempotency = "inherent"
