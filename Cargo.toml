@@ -71,7 +71,7 @@ toml = { version = "1.1", default-features = false, features = ["parse", "serde"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt"] }
 url = "2.5"
-wasmtime = { version = "34.0", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "36.0", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "std"] }
 wit-bindgen = { version = "0.46", default-features = false, features = ["macros", "realloc"] }
 wit-component = { version = "0.258", features = ["dummy-module"] }
 wit-parser = { version = "0.258", default-features = false, features = ["decoding", "std"] }
