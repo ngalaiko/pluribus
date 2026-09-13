@@ -34,6 +34,18 @@ impl Guest for Echo {
 
         for event in &events {
             checkpoint = Some(event.sequence);
+            if event.event_type == "http.request.received" {
+                let request = json_payload(event)?;
+                if request["consumer"].as_str() == Some(context.instance_id.as_str()) {
+                    proposals.push(proposal(
+                        "http.response.requested", "pluribus.http.response.requested/1",
+                        &serde_json::json!({"requestEventId":event.event_id,"status":200,
+                            "headers":[["content-type","application/octet-stream"]],"body":request["body"]}),
+                        Some(format!("http-echo:{}",event.event_id)), Some(event.event_id.clone()),
+                    )?);
+                }
+                continue;
+            }
             if event.event_type != "capability.requested" {
                 continue;
             }

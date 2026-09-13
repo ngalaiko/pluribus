@@ -11,7 +11,6 @@ models = ["gpt-5.6-luna"]
 timeout_ms = 300000
 
 [components.main]
-config_pointer = ""
 config_schema = "config.schema.json"
 world = "pluribus:plugin/plugin@1.0.0"
 component = "plugin.wasm"
@@ -32,7 +31,6 @@ components = ["main"]
 id = "subscription"
 display_name = "Codex subscription"
 description = "Authorize a ChatGPT Codex subscription with device login."
-config_pointer = "/credential"
 input_schema = "schemas/credential.input.json"
 flow_schema = "pluribus:credential/oauth-device@1"
 flow = "flows/subscription.json"

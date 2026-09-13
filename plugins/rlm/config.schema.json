@@ -10,6 +10,12 @@
     "js": {
       "type": "object",
       "additionalProperties": false
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
     }
   },
   "additionalProperties": false

@@ -56,7 +56,7 @@ impl AuthorityResolver for TestAuthority {
                 trusted: true,
             },
             delegation_chain: Vec::new(),
-            grants: ["system.echo", "telegram.reply"]
+            grants: ["system.echo", "telegram.reply", "shell.execute"]
                 .into_iter()
                 .map(|name| {
                     let capability = CapabilityName::new(name);
@@ -372,7 +372,7 @@ async fn blocked_provider(stopping: bool) {
         (
             "provider",
             "openrouter",
-            json!({"credential":"test","models":["test"]}),
+            json!({"credentials": {"api-key": "test"},"models":["test"]}),
             PluginServices {
                 http: Some(http),
                 http_grant: Some(pluribus_core::HttpGrant {
@@ -1014,6 +1014,55 @@ async fn packaged_duplicate_history_yield_emits_one_resume() {
             .filter(|e| e.request.event_type == "code.resumed")
             .count(),
         1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packaged_history_filters_events() {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(
+            AtomicU64::new(1),
+            Arc::new(AtomicI64::new(1_700_000_000_000)),
+        ))
+        .await
+        .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    let origin = observation(&store, json!({"message":{"text":"history"}})).await;
+    drive(&mut agent, 1).await;
+    scripted(&store, &model_requests(&store).await[0], json!([{"kind":"tool-call","name":"js","call_id":"history","arguments":{"code":"const observations=await history.read({after:0,limit:100,eventTypes:['observation.received']}); const internal=await history.read({after:0,limit:100,eventTypes:['cognition.checkpoint']}); return {observations,internal};"}}])).await;
+    drive(&mut agent, 1).await;
+    let rows = store
+        .read(&StreamId::new("personal"), 0, 1000)
+        .await
+        .unwrap();
+    let resumed = rows
+        .iter()
+        .find(|e| e.request.event_type == "code.resumed")
+        .unwrap();
+    let result = payload(resumed);
+    let events = result["response"]["value"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["eventId"], origin.event_id.as_str());
+    assert_eq!(events[0]["actorId"], origin.request.actor.id.as_str());
+    let internal = rows
+        .iter()
+        .filter(|e| e.request.event_type == "code.resumed")
+        .nth(1)
+        .unwrap();
+    let value = payload(internal);
+    let checkpoints = value["response"]["value"]["events"].as_array().unwrap();
+    assert!(!checkpoints.is_empty());
+    assert!(
+        checkpoints
+            .iter()
+            .all(|e| e["type"] == "cognition.checkpoint")
+    );
+    assert!(
+        serde_json::to_vec(&value["response"]["value"])
+            .unwrap()
+            .len()
+            <= 64 * 1024
     );
 }
 
@@ -1842,4 +1891,165 @@ async fn packaged_operator_controls_preserve_waits_and_require_identity() {
         projection(&store).await["jobs"][origin.event_id.as_str()]["status"],
         "cancelled"
     );
+}
+
+#[derive(Default)]
+struct CancellableExecutor {
+    opens: AtomicU64,
+    entered: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl pluribus_core::StreamService for CancellableExecutor {
+    async fn open(
+        &self,
+        _: &pluribus_core::StreamGrant,
+    ) -> Result<String, pluribus_core::StreamError> {
+        Ok(self.opens.fetch_add(1, Ordering::SeqCst).to_string())
+    }
+    async fn send(&self, _: &str, _: &[u8]) -> Result<(), pluribus_core::StreamError> {
+        Ok(())
+    }
+    async fn receive(
+        &self,
+        id: &str,
+        _: u32,
+        _: u32,
+        _: &std::sync::atomic::AtomicBool,
+    ) -> Result<pluribus_core::StreamPage, pluribus_core::StreamError> {
+        if id == "0" {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(pluribus_core::StreamPage {bytes:b"{\"status\":\"completed\",\"stdout\":\"ok\",\"stderr\":\"\",\"exit_code\":0,\"truncated\":false}\n".to_vec(),closed:false})
+    }
+    fn shutdown_write(&self, _: &str) {}
+    fn close(&self, _: &str) {}
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_shell_call_preserves_the_provider() {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(
+            AtomicU64::new(1),
+            Arc::new(AtomicI64::new(1_700_000_000_000)),
+        ))
+        .await
+        .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    let executor = Arc::new(CancellableExecutor::default());
+    install_cancellable_shell(&mut agent, &executor).await;
+    let request = append(
+        &store,
+        "capability.requested",
+        &json!({"capability":"shell.execute","arguments":{"command":"blocked"}}),
+    )
+    .await;
+    agent.tick(1).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        executor.entered.notified(),
+    )
+    .await
+    .unwrap();
+    append(
+        &store,
+        "cognition.cancel-requested",
+        &json!({"requestEventId":request.event_id.as_str()}),
+    )
+    .await;
+    for _ in 0..3 {
+        agent.tick_wait(2).await.unwrap();
+    }
+    let rows = store
+        .read(&StreamId::new("personal"), 0, 1000)
+        .await
+        .unwrap();
+    assert!(
+        rows.iter()
+            .any(|e| e.request.event_type == "capability.cancelled")
+    );
+    assert!(!agent.failed().contains_key("shell"));
+    append(
+        &store,
+        "capability.requested",
+        &json!({"capability":"shell.execute","arguments":{"command":"next"}}),
+    )
+    .await;
+    for _ in 0..3 {
+        agent.tick_wait(3).await.unwrap();
+    }
+    let rows = store
+        .read(&StreamId::new("personal"), 0, 1000)
+        .await
+        .unwrap();
+    assert!(rows.iter().any(|e| e.request.actor.id.as_str() == "shell"
+        && e.request.event_type == "capability.completed"));
+    assert_eq!(
+        executor.opens.load(Ordering::SeqCst),
+        2,
+        "cancelled commands must not replay"
+    );
+    let mut failed = event_request(
+        "component.failed",
+        &json!({"instanceId":"shell","reason":"call cancelled","deliveredThrough":request.sequence}),
+    );
+    failed.actor = PrincipalRef::new(PrincipalKind::Node, "personal");
+    failed.causation_id = Some(request.event_id);
+    store.append(failed).await.unwrap();
+    drop(agent);
+    let mut agent = persistent_agent(&store).await;
+    install_cancellable_shell(&mut agent, &executor).await;
+    agent.tick_wait(4).await.unwrap();
+    assert!(
+        !agent.failed().contains_key("shell"),
+        "restart must recover a cancellation recorded as a crash"
+    );
+}
+
+async fn install_cancellable_shell(
+    agent: &mut Agent<AllowAll, TestAuthority>,
+    executor: &Arc<CancellableExecutor>,
+) {
+    let package = PluginPackage::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/shell"),
+    )
+    .unwrap();
+    agent
+        .install_component(
+            package.component("main").unwrap(),
+            &json!({}),
+            Delivery {
+                instance_id: "shell".into(),
+                agent: Principal {
+                    kind: RuntimePrincipalKind::Agent,
+                    id: "personal".into(),
+                },
+                actor: Principal {
+                    kind: RuntimePrincipalKind::Agent,
+                    id: "personal".into(),
+                },
+                authority_id: "a".into(),
+                activity_id: "a".into(),
+                correlation_id: "a".into(),
+                origin_event_id: "shell-init".into(),
+                depth: 0,
+                deadline_at_ms: None,
+                visible_blobs: vec![],
+            },
+            PluginServices {
+                stream: Some(executor.clone()),
+                stream_grant: Some(pluribus_core::StreamGrant {
+                    endpoint: pluribus_core::StreamEndpoint::Unix {
+                        path: "/tmp/executor.sock".into(),
+                        peer_uids: vec![0],
+                    },
+                    max_bytes: 65536,
+                    max_timeout_ms: 30000,
+                }),
+                ..Default::default()
+            },
+            &[],
+        )
+        .await
+        .unwrap();
 }

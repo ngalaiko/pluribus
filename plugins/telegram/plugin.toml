@@ -10,21 +10,19 @@ components = ["receive", "send"]
 id = "bot-token"
 display_name = "Telegram bot token"
 description = "Authenticate one Telegram bot."
-config_pointer = "/credential_handle"
 input_schema = "schemas/credential.input.json"
 flow_schema = "pluribus:credential/static-http@1"
 flow = "flows/bot-token.json"
 
 
 [components.receive]
-world = "pluribus:plugin/plugin@1.0.0"
+world = "pluribus:plugin/source@1.0.0"
 component = "components/receive.wasm"
 digest = "sha256:dev"
 config_schema = "config.schema.json"
-config_pointer = ""
-imports = ["pluribus:plugin/blobs@1.0.0", "pluribus:plugin/events@1.0.0", "pluribus:plugin/http@1.0.0", "pluribus:plugin/state@1.0.0"]
-subscribes = ["timer.fired"]
-emits = ["observation.received", "timer.set", "telegram.media-ready", "telegram.media-failed"]
+imports = ["pluribus:plugin/blobs@1.0.0", "pluribus:plugin/http@1.0.0", "pluribus:plugin/state@1.0.0"]
+subscribes = []
+emits = ["observation.received", "telegram.media-ready", "telegram.media-failed"]
 
 [[components.receive.requested_capabilities]]
 name = "net.http"
@@ -33,11 +31,10 @@ reason = "Poll Telegram updates and download received media"
 constraints = { origins = ["https://api.telegram.org"], methods = ["GET", "POST"] }
 
 [components.send]
-world = "pluribus:plugin/plugin@1.0.0"
+world = "pluribus:plugin/source@1.0.0"
 component = "components/send.wasm"
 digest = "sha256:dev"
 config_schema = "config.schema.json"
-config_pointer = ""
 imports = ["pluribus:plugin/blobs@1.0.0", "pluribus:plugin/http@1.0.0"]
 subscribes = []
 emits = ["capability.completed", "capability.failed"]

@@ -4,9 +4,13 @@
 
 Provider-specific enrollment belongs to the plugin. Secret custody belongs to the host.
 
-A plugin declares credentials in its manifest `[[credentials]]` entries. They are declarative flows; the plugin never performs enrollment. The management plane validates and executes a selected flow, stores the result, and writes only its opaque handle into instance configuration.
+A plugin declares credentials in its manifest `[[credentials]]` entries. The management plane validates input and executes declarative flows or delegates `plugin@1` enrollment to Wasm. It stores secrets and uses the opaque handle from `config.credentials[credential.id]`. Missing bindings default to `<instance>:<credential-id>`.
 
-This split is mandatory. A component MUST NOT prompt for credentials, receive enrollment responses, exchange tokens itself, or place plaintext secrets in configuration. There is no secret-read import.
+Static HTTP and OAuth device flows execute in the host. A `plugin@1` flow
+executes in its declared Wasm component. An `access = true` credential declaration
+grants that component the `credentials` host interface for its bound handle.
+Records are isolated by package ID and handle; other components have no access.
+Plaintext secrets MUST NOT appear in ordinary configuration, events, or state.
 
 ## Descriptor
 
@@ -22,15 +26,16 @@ Each descriptor contains:
 | `flow-schema` | Exact supported flow identifier. |
 | `flow` | One JSON value satisfying that flow schema. |
 
-`describe` MUST be deterministic and side-effect free. Descriptors are untrusted until validated. IDs and configuration pointers MUST be unique. Unknown flow schemas are rejected.
+`describe` MUST be deterministic and side-effect free. Descriptors are untrusted until validated. Credential IDs MUST be unique. Unknown flow schemas are rejected.
 
-Discovery reads `plugin.toml` and the schema and flow files it names. No guest code runs: enrollment is static data, so there is no restricted world and no discovery-time host surface to reason about. `input_schema` and `flow` are package-relative paths to JSON files.
+Discovery reads `plugin.toml` and the schema and flow files it names. No guest code runs during discovery. `input_schema` and `flow` are package-relative paths to JSON files.
 
 Operators register packages, instance configurations, and grants in the [plugin-instance registry](../plugin-instances.md). `pluribus auth <instance>` accepts any instance whose manifest declares credentials, independent of its package ID or what else it does.
 
 The host supports these MVP flows:
 
 - `pluribus:credential/static-http@1`, defined by [`credential-static-http-1.schema.json`](../../schemas/credential-static-http-1.schema.json);
+- `pluribus:credential/plugin@1`: the CLI stages input in the provider-scoped credential record and emits `credential.enrollment.requested` with an enrollment reference; the declared component replies with `credential.enrollment.started` and an approval URL. The core must be running.
 - `pluribus:credential/oauth-device@1`, defined by [`credential-oauth-device-1.schema.json`](../../schemas/credential-oauth-device-1.schema.json).
 
 Adding a flow is an ABI-adjacent host feature. Plugins MUST NOT encode provider logic in an undocumented JSON shape.
@@ -38,6 +43,8 @@ Adding a flow is an ABI-adjacent host feature. Plugins MUST NOT encode provider 
 ## Input schema
 
 The root MUST be an object with `additionalProperties: false`. MVP fields are required or optional strings. `title` is the prompt label. `description` is help text. `default`, `minLength`, `maxLength`, `pattern`, and `enum` have their JSON Schema meanings.
+
+`x-input-file: true` prompts for a file path and reads its contents. Noninteractive multi-field input is JSON on stdin.
 
 Secret fields MUST set `writeOnly: true`. The host hides their terminal input and redacts it from errors and audit events. Refreshable credentials retain only inputs referenced by refresh or injection templates, inside credential storage.
 
@@ -141,3 +148,28 @@ The host stores:
 Refresh audit payloads contain handles, generations, fixed outcome codes, and timestamps. They never contain input values, rendered templates, authorization codes, device codes, token responses, secret headers, or secret path bytes.
 
 Enrollment replacement is atomic. A refresh with an uncertain remote outcome makes the credential unavailable until reauthorization; the host cannot assume its rotating token remains usable. Revocation removes local material even when provider-side revocation is unavailable. Uninstalling a plugin does not silently delete its credentials.
+
+## Wasm exports
+
+An instance's operator-owned `config.credential_exports` maps binding names to
+`{provider, credential, export}` references. These grant the instance's components
+read-only access to those exports through `credentials.resolve-export(binding)`.
+A binding grants no access to the underlying record or other exports.
+
+Providers publish `exports[name] = {value, expires_at_ms}` in their private record.
+The host rejects missing values and values expiring within 30 seconds. Plugins
+assign meaning to binding names: shell uses them as environment variable names
+and sends values directly over its executor socket, outside the event log.
+
+The `credentials` interface offers scoped get/compare-and-swap, secure random
+bytes, and the current time. Credential writes are atomic but independent of
+event commits; plugins must make enrollment and token exchanges replay-safe.
+`http.exchange` provides bounded inline HTTP without persistent blobs, subject
+to the same destination and method grants as ordinary HTTP.
+
+For `plugin@1`, the private record's `enrollment` field contains
+`{id, input, expires_at_ms}`. The request event carries `{component, credential,
+enrollment}`; it never carries input values. The plugin checks the reference and
+expiry before consuming input, preserves unrelated credential fields, and removes
+the input after validation. Successful results must remain replayable after an
+event-commit failure. The CLI stages records with compare-and-swap.

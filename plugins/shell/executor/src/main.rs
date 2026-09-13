@@ -5,6 +5,7 @@
 #[allow(dead_code)]
 mod protocol;
 
+mod config;
 mod executor;
 
 use clap::Parser;
@@ -22,6 +23,8 @@ const ENDPOINT: &str = "shell-main.sock";
 #[derive(Parser)]
 #[command(about = "Execute shell activities for a Pluribus agent")]
 struct Args {
+    #[arg(long, default_value = "/usr/local/bin:/usr/bin:/bin")]
+    path: String,
     /// Directory holding the endpoint. Defaults to the agent's runtime
     /// directory, which the platform decides.
     #[arg(long, short = 'd')]
@@ -71,8 +74,16 @@ fn main() {
                 Some(workspace) => workspace,
                 None => directory(Path::new("."), "workspace")?,
             };
-            executor::serve(&socket, runtime_uid, &workspace, runtime_uid == own_uid)
-                .map_err(|error| error.to_string())
+            let config =
+                config::Config::from_flags(args.path.clone()).map_err(|error| error.to_string())?;
+            executor::serve(
+                &socket,
+                runtime_uid,
+                &workspace,
+                runtime_uid == own_uid,
+                &config,
+            )
+            .map_err(|error| error.to_string())
         });
     if let Err(error) = result {
         eprintln!("error: {error}");

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 pluribus-core = { path = "../pluribus-core" }

@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_COMMAND: usize = 65_536;
 pub const MAX_TIMEOUT_MS: u32 = 300_000;
 pub const MAX_OUTPUT: usize = 1024 * 1024;
@@ -16,6 +16,7 @@ pub const MAX_RESPONSE: usize = 12 * MAX_OUTPUT + 1024;
 pub struct Request {
     pub version: u32,
     pub command: String,
+    pub env: std::collections::BTreeMap<String, String>,
     pub timeout_ms: u32,
     pub invocation_id: String,
     pub authority_id: String,
@@ -52,6 +53,19 @@ impl Request {
         {
             return Err("invalid provenance");
         }
+        if self.env.len() > 64
+            || self.env.iter().any(|(name, value)| {
+                !valid_env_name(name) || value.contains('\0') || value.len() > 16 * 1024
+            })
+            || self
+                .env
+                .iter()
+                .map(|(n, v)| n.len() + v.len())
+                .sum::<usize>()
+                > 64 * 1024
+        {
+            return Err("invalid environment");
+        }
         Ok(())
     }
 }
@@ -70,4 +84,12 @@ pub enum Response {
     Unavailable {
         message: String,
     },
+}
+
+pub fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && !["HOME", "PATH", "LANG"].contains(&name)
 }

@@ -10,7 +10,7 @@ use std::cell::RefCell;
 
 wit_bindgen::generate!({
     path: "../../../wit",
-    world: "plugin",
+    world: "source",
     pub_export_macro: true,
     // Component crates take this crate as `telegram`.
     default_bindings_module: "telegram",

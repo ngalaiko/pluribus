@@ -1,5 +1,5 @@
-//! Packaged Telegram polling survives an empty first response.
-use pluribus_cognition::{Agent, AuthorityResolver, OriginConstraints, Router, pending_timers};
+//! Telegram subscriptions discard empty responses and preserve intake state.
+use pluribus_cognition::{Agent, AuthorityResolver, OriginConstraints, Router};
 use pluribus_core::*;
 use pluribus_plugin_package::PluginPackage;
 use pluribus_runtime_wasm::{
@@ -34,6 +34,7 @@ impl AuthorityResolver for Deny {
 }
 struct TelegramFixture {
     calls: AtomicU64,
+    polls: tokio::sync::Semaphore,
     files: AtomicU64,
     with_media: bool,
     recover: bool,
@@ -86,6 +87,7 @@ impl HttpService for TelegramFixture {
             });
         }
         assert!(request.url.ends_with("/getUpdates"));
+        self.polls.acquire().await.unwrap().forget();
         let number = self.calls.fetch_add(1, Ordering::SeqCst);
         let mut result = match number {
             1 => {
@@ -145,7 +147,7 @@ fn payload(event: &CommittedEvent) -> Value {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
-async fn fresh_telegram_rearms_empty_poll_and_receives_next_message() {
+async fn telegram_subscription_discards_empty_responses_and_receives_next_message() {
     run_polling(false, false).await;
 }
 
@@ -170,6 +172,7 @@ async fn run_polling(with_media: bool, recover: bool) {
     let blobs = Arc::new(InMemoryBlobStore::default());
     let http = Arc::new(TelegramFixture {
         calls: AtomicU64::new(0),
+        polls: tokio::sync::Semaphore::new(0),
         files: AtomicU64::new(0),
         with_media,
         recover,
@@ -207,7 +210,7 @@ async fn run_polling(with_media: bool, recover: bool) {
             .unwrap()
             .component("receive")
             .unwrap(),
-            &json!({"credential_handle":"fabricated","trusted_senders":["7"],"poll_timeout_seconds":1}),
+            &json!({"credentials": {"bot-token": "fabricated"},"trusted_senders":["7"],"poll_timeout_seconds":1}),
             Delivery {
                 instance_id: "telegram-1".into(),
                 agent: Principal {
@@ -245,31 +248,14 @@ async fn run_polling(with_media: bool, recover: bool) {
         )
         .await
         .unwrap();
-    agent.tick_wait(1_800_000_000_000).await.unwrap();
+    settle_poll(&mut agent, &http, clock.load(Ordering::SeqCst)).await;
     assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        pending_timers(store.as_ref(), &stream, 100)
-            .await
-            .unwrap()
-            .len(),
-        1,
-        "empty first poll must rearm its timer"
-    );
-    let timers: Vec<_> = store
-        .read(&stream, 0, 100)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|event| event.request.event_type == "timer.set")
-        .collect();
-    assert_eq!(timers.len(), 2);
-    assert_eq!(payload(&timers[1])["dueAtMs"], 1_800_000_000_000_i64);
-    assert_ne!(
-        timers[0].request.deduplication_key,
-        timers[1].request.deduplication_key
+    assert!(
+        store.read(&stream, 0, 100).await.unwrap().is_empty(),
+        "empty long polls must not append events"
     );
     clock.store(1_800_000_001_000, Ordering::SeqCst);
-    agent.tick_wait(1_800_000_001_000).await.unwrap();
+    settle_poll(&mut agent, &http, clock.load(Ordering::SeqCst)).await;
     let observations: Vec<_> = store
         .read(&stream, 0, 100)
         .await
@@ -294,9 +280,7 @@ async fn run_polling(with_media: bool, recover: bool) {
             "intake commits before downloading attachments"
         );
         clock.store(1_800_000_002_000, Ordering::SeqCst);
-        for _ in 0..4 {
-            agent.tick_wait(1_800_000_002_000).await.unwrap();
-        }
+        settle_poll(&mut agent, &http, clock.load(Ordering::SeqCst)).await;
         assert_eq!(payload(&observations[0])["media"][0]["status"], "pending");
         assert!(http.files.load(Ordering::SeqCst) > 0);
         assert!(http.calls.load(Ordering::SeqCst) > 2);
@@ -315,9 +299,7 @@ async fn run_polling(with_media: bool, recover: bool) {
         for attempt in 1..=10 {
             let now = 1_800_000_002_000 + attempt * 31_000;
             clock.store(now, Ordering::SeqCst);
-            for _ in 0..4 {
-                agent.tick_wait(now).await.unwrap();
-            }
+            settle_poll(&mut agent, &http, now).await;
         }
         assert_eq!(
             http.files.load(Ordering::SeqCst),
@@ -365,4 +347,20 @@ async fn run_polling(with_media: bool, recover: bool) {
             1
         );
     }
+}
+
+async fn settle_poll(agent: &mut Agent<OriginConstraints, Deny>, http: &TelegramFixture, now: i64) {
+    let before = http.calls.load(Ordering::SeqCst);
+    http.polls.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while http.calls.load(Ordering::SeqCst) == before {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            agent.tick_wait(now).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

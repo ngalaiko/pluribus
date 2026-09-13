@@ -1700,3 +1700,120 @@ mod tests {
         assert!(reader.await.unwrap().unwrap().closed);
     }
 }
+
+/// Exchanges sensitive payloads without putting them in durable blob storage.
+pub async fn exchange_inline(
+    grant: &HttpGrant,
+    method: &str,
+    url: &str,
+    headers: Vec<HttpHeader>,
+    bytes: Vec<u8>,
+    timeout_ms: u32,
+) -> Result<(u16, Vec<u8>), HttpError> {
+    if bytes.len() as u64 > grant.max_request_bytes {
+        return Err(HttpError::Invalid("request too large".into()));
+    }
+    let blobs = Arc::new(pluribus_core::InMemoryBlobStore::default());
+    let body = if bytes.is_empty() {
+        None
+    } else {
+        let upload = blobs
+            .begin_put("application/json", Some(bytes.len() as u64))
+            .await
+            .map_err(|e| blob_error(&e))?;
+        blobs
+            .write(&upload, 0, &bytes)
+            .await
+            .map_err(|e| blob_error(&e))?;
+        Some(
+            blobs
+                .finish_put(&upload)
+                .await
+                .map_err(|e| blob_error(&e))?,
+        )
+    };
+    let service = PolicyHttpService::new(
+        blobs.clone(),
+        Arc::new(pluribus_core::InMemoryCredentialStore::default()),
+    );
+    let response = service
+        .execute(
+            grant,
+            &HttpRequest {
+                method: method.into(),
+                url: url.into(),
+                headers,
+                body,
+                credential_handle: None,
+                timeout_ms,
+            },
+        )
+        .await?;
+    let mut bytes = Vec::new();
+    while (bytes.len() as u64) < response.body.size {
+        let chunk = blobs
+            .read(&response.body, bytes.len() as u64, 64 * 1024)
+            .await
+            .map_err(|e| blob_error(&e))?;
+        bytes.extend(chunk.bytes);
+    }
+    Ok((response.status, bytes))
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+    #[tokio::test]
+    async fn inline_exchange_applies_policy_and_returns_sensitive_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut grant = HttpGrant {
+            component: PrincipalRef::new(pluribus_core::PrincipalKind::Component, "test"),
+            origins: vec![origin.clone()],
+            methods: vec!["POST".into()],
+            allow_http: true,
+            allow_private_network: false,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            max_redirects: 0,
+            max_timeout_ms: 2000,
+        };
+        assert!(matches!(
+            exchange_inline(
+                &grant,
+                "POST",
+                &origin,
+                vec![],
+                b"private-request".to_vec(),
+                2000
+            )
+            .await,
+            Err(HttpError::PermissionDenied(_))
+        ));
+        grant.allow_private_network = true;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![];
+            while !bytes.ends_with(b"\r\n\r\n") {
+                bytes.push(socket.read_u8().await.unwrap());
+            }
+            let mut body = vec![0; 15];
+            socket.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, b"private-request");
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nprivate-response").await.unwrap();
+        });
+        let result = exchange_inline(
+            &grant,
+            "POST",
+            &origin,
+            vec![],
+            b"private-request".to_vec(),
+            2000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, (200, b"private-response".to_vec()));
+        server.await.unwrap();
+    }
+}

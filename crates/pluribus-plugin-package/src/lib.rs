@@ -41,7 +41,6 @@ pub struct PluginComponent {
     manifest: ComponentManifest,
     component: Vec<u8>,
     config_validator: Validator,
-    defaults: Option<Value>,
 }
 
 impl PluginPackage {
@@ -91,10 +90,6 @@ impl PluginPackage {
                     manifest: declaration.clone(),
                     component,
                     config_validator,
-                    defaults: manifest
-                        .defaults
-                        .pointer(&declaration.config_pointer)
-                        .cloned(),
                 },
             );
         }
@@ -151,7 +146,7 @@ impl PluginPackage {
             .validate(config)
             .map_err(|error| PackageError::new(format!("invalid plugin configuration: {error}")))?;
         for component in self.components.values() {
-            component.validate_config(component.project_config(config)?)?;
+            component.validate_config(config)?;
         }
         Ok(())
     }
@@ -174,16 +169,7 @@ impl PluginComponent {
     pub fn component(&self) -> &[u8] {
         &self.component
     }
-    /// Projects configuration from the package configuration.
-    /// # Errors
-    /// Fails when the declared JSON pointer is absent.
-    pub fn project_config<'a>(&'a self, config: &'a Value) -> Result<&'a Value, PackageError> {
-        config
-            .pointer(&self.manifest.config_pointer)
-            .or(self.defaults.as_ref())
-            .ok_or_else(|| PackageError::new("missing component configuration"))
-    }
-    /// Validates projected component configuration.
+    /// Validates component configuration.
     /// # Errors
     /// Returns a schema violation.
     pub fn validate_config(&self, config: &Value) -> Result<(), PackageError> {

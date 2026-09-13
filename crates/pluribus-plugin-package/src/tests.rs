@@ -51,6 +51,7 @@ const IMPORTS: &[&str] = &[
     "pluribus:plugin/writer@1.0.0",
     "pluribus:plugin/http@1.0.0",
     "pluribus:plugin/socket@1.0.0",
+    "pluribus:plugin/credentials@1.0.0",
 ];
 
 struct TestPackage {
@@ -252,7 +253,6 @@ name = "Fixture"
 config_schema = "config.schema.json"
 
 [components.main]
-config_pointer = ""
 world = "pluribus:plugin/plugin@1.0.0"
 component = "plugin.wasm"
 digest = "{}"
@@ -311,12 +311,10 @@ fn add_second_component(package: &TestPackage) {
 }
 
 #[test]
-fn bundle_loads_all_components_and_projects_configuration() {
+fn bundle_validates_full_configuration_for_all_components() {
     let package = TestPackage::create();
     add_second_component(&package);
-    let manifest = package
-        .manifest()
-        .replace("config_pointer = \"\"", "config_pointer = \"/settings\"");
+    let manifest = package.manifest();
     package.set_manifest(&manifest.replacen(
         "config_schema = \"config.schema.json\"",
         "config_schema = \"package.schema.json\"",
@@ -330,17 +328,9 @@ fn bundle_loads_all_components_and_projects_configuration() {
     let loaded = PluginPackage::load(&package.path).unwrap();
     assert_eq!(loaded.components().len(), 2);
     assert!(loaded.component("unknown").is_none());
-    assert!(
-        loaded
-            .validate_config(&json!({"settings":{"label":"ok"}}))
-            .is_ok()
-    );
-    assert!(
-        loaded
-            .validate_config(&json!({"settings":{"label":7}}))
-            .is_err()
-    );
-    assert!(loaded.validate_config(&json!({})).is_err());
+    assert!(loaded.validate_config(&json!({"label":"ok"})).is_ok());
+    assert!(loaded.validate_config(&json!({"label":7})).is_err());
+    assert!(loaded.validate_config(&json!({})).is_ok());
 }
 
 #[test]
@@ -393,7 +383,7 @@ fn bundle_rejects_unsafe_later_schema_and_credential_reference() {
         "arguments_schema = \"../escape.json\"",
     ));
     assert!(PluginPackage::load(&package.path).is_err());
-    package.set_manifest(&format!("{manifest}\n[[credentials]]\ncomponents = [\"missing\"]\nid=\"token\"\ndisplay_name=\"Token\"\ndescription=\"Token\"\nconfig_pointer=\"/token\"\ninput_schema=\"config.schema.json\"\nflow_schema=\"pluribus:credential/api-key@1\"\nflow=\"config.schema.json\"\n"));
+    package.set_manifest(&format!("{manifest}\n[[credentials]]\ncomponents = [\"missing\"]\nid=\"token\"\ndisplay_name=\"Token\"\ndescription=\"Token\"\ninput_schema=\"config.schema.json\"\nflow_schema=\"pluribus:credential/api-key@1\"\nflow=\"config.schema.json\"\n"));
     assert!(
         PluginPackage::load(&package.path)
             .err()
@@ -553,4 +543,47 @@ fn builder_supports_an_unnamed_component() {
     )
     .unwrap();
     assert!(PluginPackage::load(output).unwrap().component("").is_some());
+}
+
+#[test]
+fn manifest_rejects_configuration_projection() {
+    let package = TestPackage::create();
+    package.set_manifest(&package.manifest().replace(
+        "[components.main]",
+        "[components.main]\nconfig_pointer = \"/settings\"",
+    ));
+    assert!(PluginPackage::load(&package.path).is_err());
+}
+
+#[test]
+fn source_world_requires_the_ingress_export() {
+    let fixture = TestPackage::create();
+    let package = PluginPackage::load(&fixture.path).unwrap();
+    let mut manifest = package.component("main").unwrap().manifest().clone();
+    let mut resolve = Resolve::default();
+    let (package_id, _) = resolve
+        .push_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../wit"))
+        .unwrap();
+    let world = resolve.select_world(&[package_id], Some("source")).unwrap();
+    let mut module = dummy_module(&resolve, world, ManglingAndAbi::Standard32);
+    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8).unwrap();
+    let source = ComponentEncoder::default()
+        .module(&module)
+        .unwrap()
+        .validate(true)
+        .encode()
+        .unwrap();
+    assert!(
+        crate::component::validate_component("pluribus:plugin@1.0.0", &manifest, &source).is_err()
+    );
+    manifest.world = "pluribus:plugin/source@1.0.0".into();
+    crate::component::validate_component("pluribus:plugin@1.0.0", &manifest, &source).unwrap();
+    assert!(
+        crate::component::validate_component(
+            "pluribus:plugin@1.0.0",
+            &manifest,
+            &fixture_component()
+        )
+        .is_err()
+    );
 }

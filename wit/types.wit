@@ -116,4 +116,9 @@ interface types {
     key: string,
     value: list<u8>,
   }
+  /// Effects of transient source input, without an event-log checkpoint.
+  record ingress-outcome {
+    events: list<proposal>,
+    mutations: list<mutation>,
+  }
 }

@@ -138,7 +138,6 @@
         "id",
         "display_name",
         "description",
-        "config_pointer",
         "input_schema",
         "flow_schema",
         "flow"
@@ -156,11 +155,6 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 500
-        },
-        "config_pointer": {
-          "type": "string",
-          "pattern": "^(/[^/~]*(~[01][^/~]*)*)*$",
-          "maxLength": 255
         },
         "input_schema": {
           "$ref": "#/$defs/path"
@@ -188,6 +182,10 @@
             "type": "string",
             "format": "uri"
           }
+        },
+        "access": {
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -225,8 +223,7 @@
         "component",
         "digest",
         "imports",
-        "config_schema",
-        "config_pointer"
+        "config_schema"
       ],
       "anyOf": [
         {
@@ -269,7 +266,8 @@
               "pluribus:plugin/reader@1.0.0",
               "pluribus:plugin/writer@1.0.0",
               "pluribus:plugin/http@1.0.0",
-              "pluribus:plugin/socket@1.0.0"
+              "pluribus:plugin/socket@1.0.0",
+              "pluribus:plugin/credentials@1.0.0"
             ]
           }
         },
@@ -322,10 +320,6 @@
         },
         "config_schema": {
           "$ref": "#/$defs/path"
-        },
-        "config_pointer": {
-          "type": "string",
-          "pattern": "^(/[^/~]*(~[01][^/~]*)*)*$"
         },
         "requires": {
           "type": "array",

@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "plugins/http",
+    "plugins/github",
     "crates/pluribus-core",
     "crates/pluribus-log",
     "crates/pluribus-model",

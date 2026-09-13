@@ -153,7 +153,7 @@ impl Harness {
         self.runtime
             .instantiate(
                 package().component("receive").unwrap(),
-                &json!({"credential_handle":"fixture","trusted_senders":senders,"poll_timeout_seconds":30}),
+                &json!({"credentials": {"bot-token": "fixture"},"trusted_senders":senders,"poll_timeout_seconds":30}),
                 delivery(),
                 PluginServices {
                     http: Some(self.http.clone()),

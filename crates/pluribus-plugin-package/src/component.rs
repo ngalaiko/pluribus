@@ -30,7 +30,10 @@ pub(crate) fn validate_component(
     }
 
     let actual_exports = interface_ids(&resolve, world.exports.values(), "export", false)?;
-    let expected_exports = BTreeSet::from([String::from(LIFECYCLE_EXPORT)]);
+    let mut expected_exports = BTreeSet::from([String::from(LIFECYCLE_EXPORT)]);
+    if manifest.world == "pluribus:plugin/source@1.0.0" {
+        expected_exports.insert("pluribus:plugin/ingress@1.0.0".into());
+    }
     if actual_exports != expected_exports {
         return Err(set_mismatch("exports", &expected_exports, &actual_exports));
     }

@@ -72,3 +72,26 @@ fn requests_carry_their_version() {
     };
     assert_eq!(stale.validate(), Err("unsupported protocol version"));
 }
+
+#[test]
+fn waiting_input_does_not_block_another_connection() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicUsize;
+    let shared = shared(&[]);
+    let active = Arc::new(AtomicUsize::new(0));
+    let (mut blocked, server) = UnixStream::pair().unwrap();
+    super::spawn_connection(server, shared.clone(), active.clone());
+    blocked
+        .write_all(b"{\"kind\":\"poll\",\"version\":1,\"after\":0,\"timeout_ms\":1000}\n")
+        .unwrap();
+    let (mut fast, server) = UnixStream::pair().unwrap();
+    super::spawn_connection(server, shared, active);
+    fast.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    fast.write_all(b"{\"kind\":\"poll\",\"version\":1,\"after\":0,\"timeout_ms\":1}\n")
+        .unwrap();
+    let mut result = String::new();
+    fast.read_to_string(&mut result).unwrap();
+    assert!(result.contains("messages"));
+}

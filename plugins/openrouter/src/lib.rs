@@ -55,8 +55,15 @@ const PASSTHROUGH: &[&str] = &[
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Credentials {
+    #[serde(rename = "api-key")]
+    api_key: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
-    credential: String,
+    credentials: Credentials,
     models: Vec<ModelEntry>,
     #[serde(default = "default_timeout")]
     timeout_ms: u32,
@@ -68,7 +75,7 @@ impl Guest for OpenRouter {
     fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
         let parsed: Config = serde_json::from_slice(&config)
             .map_err(|error| invalid(format!("invalid configuration: {error}")))?;
-        if parsed.credential.is_empty() {
+        if parsed.credentials.api_key.is_empty() {
             return Err(invalid("credential handle is empty"));
         }
         if parsed.models.is_empty() {
@@ -144,7 +151,7 @@ fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error
             header("content-type", "application/json"),
         ],
         body: Some(body),
-        credential: Some(config.credential.clone()),
+        credential: Some(config.credentials.api_key.clone()),
         timeout_ms: config.timeout_ms,
     })?;
     // The reader closes when it drops, ending the transfer.

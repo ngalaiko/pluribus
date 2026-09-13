@@ -393,3 +393,43 @@ async fn requests_wait_until_the_gate_reaches_them() {
     agent.tick_wait(1).await.unwrap();
     assert!(agent.result_for(&second.event_id).await.unwrap().is_some());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn historical_checkpoints_do_not_delay_capability_admission() {
+    let (mut agent, store) = build(&["system.echo"]).await;
+    for _ in 0..300 {
+        store
+            .append(AppendRequest {
+                stream_id: StreamId::new("personal"),
+                stream_kind: StreamKind::Agent,
+                observed_at_ms: None,
+                event_type: "cognition.checkpoint".into(),
+                payload_schema: "pluribus.cognition-checkpoint/1".into(),
+                payload: EventPayload::CanonicalJson(b"{}".to_vec()),
+                actor: PrincipalRef::new(PrincipalKind::Component, "rlm-1"),
+                authority_id: None,
+                activity_id: None,
+                correlation_id: None,
+                causation_id: None,
+                deduplication_key: None,
+            })
+            .await
+            .unwrap();
+    }
+    let event = request(&store, "reply after restart").await;
+    let progress = agent.tick_wait(1).await.unwrap();
+    assert_eq!(
+        progress.requests_gated, 1,
+        "unrelated history must not consume the gate batch"
+    );
+    assert_eq!(
+        agent
+            .result_for(&event.event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request
+            .event_type,
+        "capability.completed"
+    );
+}

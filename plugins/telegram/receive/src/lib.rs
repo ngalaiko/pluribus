@@ -6,8 +6,8 @@ mod normalize;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use telegram::exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
-use telegram::pluribus::plugin::types::{Error, Event, Mutation, Payload, Proposal, StateEntry};
-use telegram::pluribus::plugin::{events, state};
+use telegram::pluribus::plugin::types::{Error, Event, Mutation, Proposal, StateEntry};
+use telegram::pluribus::plugin::{http, state};
 use telegram::{Slot, parse_config, proposal};
 
 /// Key holding the `getUpdates` offset. State is a rebuildable projection: an
@@ -15,8 +15,15 @@ use telegram::{Slot, parse_config, proposal};
 const OFFSET_KEY: &str = "updates/offset";
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Credentials {
+    #[serde(rename = "bot-token")]
+    bot_token: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct Config {
-    credential_handle: String,
+    credentials: Credentials,
     #[serde(default)]
     trusted_senders: Vec<String>,
     #[serde(default = "default_poll_timeout")]
@@ -24,67 +31,23 @@ struct Config {
 }
 
 thread_local! {
-    static CONFIG: Slot<(Config, u64)> = const { Slot::empty() };
+    static CONFIG: Slot<Config> = const { Slot::empty() };
 }
 
 struct Telegram;
 
 impl Guest for Telegram {
-    fn init(context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        initialize(
-            &context.instance_id,
-            config,
-            next_generation(&context.instance_id)?,
-        )
+    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+        let outcome = initialize(config)?;
+        subscribe(&CONFIG.with(Slot::load)?, stored_offset()?)?;
+        Ok(outcome)
     }
 
     fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
-        let (config, generation) = CONFIG.with(Slot::load)?;
-        let mut proposals = Vec::new();
-        let mut mutations = Vec::new();
-        let mut checkpoint = None;
-
-        for event in &events {
-            checkpoint = Some(event.sequence);
-            if event.event_type != "timer.fired" {
-                continue;
-            }
-            let fired = json_payload(event)?;
-            let request_id = fired["requestEventId"]
-                .as_str()
-                .ok_or_else(|| telegram::api::invalid("missing timer request"))?;
-            let request = events::get(request_id)?;
-            if json_payload(&request)?["generation"].as_u64() != Some(generation) {
-                continue;
-            }
-            let Poll {
-                observations,
-                offset,
-                pending,
-            } = poll(&config)?;
-            fetch_pending(
-                &config,
-                event.recorded_at_ms,
-                &mut proposals,
-                &mut mutations,
-            )?;
-            mutations.extend(pending);
-            proposals.extend(observations);
-            if let Some(offset) = offset {
-                mutations.push(Mutation::Set(StateEntry {
-                    key: OFFSET_KEY.to_owned(),
-                    value: offset.to_string().into_bytes(),
-                }));
-            }
-            let mut next = timer_request(generation, event.recorded_at_ms)?;
-            next.causation_id = Some(event.event_id.clone());
-            proposals.push(next);
-        }
-
         Ok(Outcome {
-            events: proposals,
-            mutations,
-            checkpoint,
+            events: vec![],
+            mutations: vec![],
+            checkpoint: events.last().map(|e| e.sequence),
         })
     }
 
@@ -103,34 +66,74 @@ struct Poll {
     pending: Vec<Mutation>,
 }
 
-/// Observations and offsets commit atomically, deduplicated by update ID.
-fn poll(config: &Config) -> Result<Poll, Error> {
-    let offset = stored_offset()?;
-    let timeout_ms = config
-        .poll_timeout_seconds
-        .saturating_add(10)
-        .saturating_mul(1_000);
-    let response = telegram::api::call_json(
+fn subscribe(config: &Config, offset: Option<i64>) -> Result<(), Error> {
+    http::subscribe(&telegram::api::request(
         "getUpdates",
-        &json!({
-            "offset": offset,
-            "limit": 100,
-            "timeout": config.poll_timeout_seconds,
-            "allowed_updates": [
-                "message",
-                "edited_message",
-                "channel_post",
-                "edited_channel_post",
-                "message_reaction",
-                "callback_query"
-            ]
-        }),
-        &config.credential_handle,
-        timeout_ms,
-    )?;
-    let observations = normalize::updates(&response.value, &config.trusted_senders, 100)?;
+        &json!({"offset":offset,"limit":100,"timeout":config.poll_timeout_seconds,
+            "allowed_updates":["message","edited_message","channel_post","edited_channel_post","message_reaction","callback_query"]}),
+        &config.credentials.bot_token,
+        config
+            .poll_timeout_seconds
+            .saturating_add(10)
+            .saturating_mul(1000),
+    )?)
+}
+
+impl telegram::exports::pluribus::plugin::ingress::Guest for Telegram {
+    fn receive(input: Vec<u8>) -> Result<telegram::pluribus::plugin::types::IngressOutcome, Error> {
+        let input: Value = serde_json::from_slice(&input).map_err(telegram::api::internal)?;
+        let mut out = telegram::pluribus::plugin::types::IngressOutcome {
+            events: vec![],
+            mutations: vec![],
+        };
+        if input["kind"] != "http" {
+            return Ok(out);
+        }
+        let config = CONFIG.with(Slot::load)?;
+        let response = telegram::api::decode_response(
+            input["status"].as_u64().unwrap_or(0) as u16,
+            telegram::pluribus::plugin::types::BlobRef {
+                algorithm: "sha256".into(),
+                digest: input["body"]["digest"]
+                    .as_str()
+                    .ok_or_else(|| telegram::api::invalid("missing body digest"))?
+                    .into(),
+                size: input["body"]["size"]
+                    .as_u64()
+                    .ok_or_else(|| telegram::api::invalid("missing body size"))?,
+                media_type: input["body"]["mediaType"]
+                    .as_str()
+                    .unwrap_or("application/json")
+                    .into(),
+            },
+        )?;
+        let previous = stored_offset()?;
+        let result = poll_response(&config, response.value, previous)?;
+        fetch_pending(
+            &config,
+            input["receivedAtMs"].as_i64().unwrap_or(0),
+            &mut out.events,
+            &mut out.mutations,
+        )?;
+        out.events.extend(result.observations);
+        out.mutations.extend(result.pending);
+        if result.offset != previous
+            && let Some(offset) = result.offset
+        {
+            out.mutations.push(Mutation::Set(StateEntry {
+                key: OFFSET_KEY.into(),
+                value: offset.to_string().into_bytes(),
+            }));
+        }
+        subscribe(&config, result.offset)?;
+        Ok(out)
+    }
+}
+
+/// Observations and offsets commit atomically, deduplicated by update ID.
+fn poll_response(config: &Config, response: Value, offset: Option<i64>) -> Result<Poll, Error> {
+    let observations = normalize::updates(&response, &config.trusted_senders, 100)?;
     let next = response
-        .value
         .as_array()
         .and_then(|updates| updates.last())
         .and_then(|update| update.get("update_id"))
@@ -212,7 +215,7 @@ fn fetch_pending(
         let file_id = item["metadata"]["file_id"]
             .as_str()
             .ok_or_else(|| telegram::api::internal("missing pending file ID"))?;
-        match files::download(file_id, &config.credential_handle) {
+        match files::download(file_id, &config.credentials.bot_token) {
             Ok((blob, name)) => {
                 item["blob"] = normalize::blob_json(&blob);
                 item["status"] = json!("ready");
@@ -259,63 +262,14 @@ fn fetch_pending(
     Ok(())
 }
 
-fn initialize(instance_id: &str, config: Vec<u8>, generation: u64) -> Result<Outcome, Error> {
-    let parsed = parse_config(&config)?;
-    CONFIG.with(|slot| slot.store((parsed, generation)));
-    let mut start = timer_request(generation, 0)?;
-    start.idempotency_key = Some(format!("{instance_id}:start:{generation}"));
+fn initialize(config: Vec<u8>) -> Result<Outcome, Error> {
+    let config = parse_config(&config)?;
+    CONFIG.with(|slot| slot.store(config));
     Ok(Outcome {
-        events: vec![start],
-        mutations: Vec::new(),
+        events: vec![],
+        mutations: vec![],
         checkpoint: None,
     })
-}
-
-/// Committed timer sequences distinguish receive lifetimes without volatile state.
-fn next_generation(instance_id: &str) -> Result<u64, Error> {
-    let mut after = None;
-    let mut generation = 1;
-    loop {
-        let page = events::query(
-            &events::Filter {
-                after_sequence: after,
-                event_types: vec!["timer.set".into()],
-                correlation_id: None,
-                activity_id: None,
-                recorded_from_ms: None,
-                recorded_to_ms: None,
-            },
-            256,
-        )?;
-        for event in &page.events {
-            if event.actor.id == instance_id {
-                generation = event.sequence.saturating_add(1);
-            }
-        }
-        let Some(next) = page.next_sequence else {
-            return Ok(generation);
-        };
-        after = Some(next);
-    }
-}
-
-fn timer_request(generation: u64, due_at_ms: i64) -> Result<Proposal, Error> {
-    proposal(
-        "timer.set",
-        "pluribus.timer-set/1",
-        &json!({"dueAtMs": due_at_ms, "generation": generation}),
-        None,
-        None,
-    )
-}
-
-fn json_payload(event: &Event) -> Result<Value, Error> {
-    match &event.payload {
-        Payload::Json(bytes) => {
-            serde_json::from_slice(bytes).map_err(|error| telegram::api::invalid(error.to_string()))
-        }
-        Payload::Blob(_) => Err(telegram::api::invalid("timer requires inline JSON")),
-    }
 }
 
 fn stored_offset() -> Result<Option<i64>, Error> {
@@ -355,10 +309,8 @@ mod role_tests {
 
     #[test]
     fn role_initialization_and_irrelevant_deliveries() {
-        let init =
-            initialize("fixture", br#"{"credential_handle":"fixture"}"#.to_vec(), 1).unwrap();
-        assert_eq!(init.events.len(), 1);
-        assert_eq!(init.events[0].event_type, "timer.set");
+        let init = initialize(br#"{"credentials":{"bot-token":"fixture"}}"#.to_vec()).unwrap();
+        assert!(init.events.is_empty());
         let event = Event {
             event_id: "event".into(),
             sequence: 1,

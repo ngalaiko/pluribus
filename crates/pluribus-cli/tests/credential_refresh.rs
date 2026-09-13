@@ -269,7 +269,7 @@ async fn packaged_codex_refreshes_future_expiry_after_401() {
     let mut instance = runtime
         .instantiate(
             package.component("main").unwrap(),
-            &json!({"credential":"codex:fixture","models":["fixture-model"],"timeout_ms":10000}),
+            &json!({"credentials": {"subscription": "codex:fixture"},"models":["fixture-model"],"timeout_ms":10000}),
             Delivery {
                 instance_id: "codex-1/main".into(),
                 agent: Principal {

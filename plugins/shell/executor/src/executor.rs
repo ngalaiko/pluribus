@@ -23,6 +23,7 @@ pub fn serve(
     runtime_uid: u32,
     workspace: &Path,
     same_account: bool,
+    config: &crate::config::Config,
 ) -> io::Result<()> {
     validate_separation(runtime_uid, same_account)?;
     if !socket.is_absolute() || !workspace.is_absolute() || !workspace.is_dir() {
@@ -49,7 +50,7 @@ pub fn serve(
             );
             continue;
         }
-        let result = handle(&mut stream, workspace);
+        let result = handle_configured(&mut stream, workspace, config);
         let response = result.unwrap_or_else(|error| Response::Unavailable {
             message: error.to_string(),
         });
@@ -63,7 +64,16 @@ pub fn serve(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn handle(stream: &mut UnixStream, workspace: &Path) -> io::Result<Response> {
+    handle_configured(stream, workspace, &crate::config::Config::default())
+}
+
+fn handle_configured(
+    stream: &mut UnixStream,
+    workspace: &Path,
+    config: &crate::config::Config,
+) -> io::Result<Response> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut bytes = Vec::new();
     BufReader::new((&mut *stream).take(MAX_REQUEST as u64 + 1)).read_until(b'\n', &mut bytes)?;
@@ -73,10 +83,11 @@ pub(super) fn handle(stream: &mut UnixStream, workspace: &Path) -> io::Result<Re
             "invalid process frame",
         ));
     }
-    let request: Request = serde_json::from_slice(&bytes)?;
+    let request: Request =
+        serde_json::from_slice(&bytes).map_err(|_| io::Error::other("invalid process request"))?;
     request.validate().map_err(io::Error::other)?;
     stream.set_nonblocking(true)?;
-    execute(&request, workspace, || disconnected(stream))
+    execute_configured(&request, workspace, config, || disconnected(stream))
 }
 
 fn disconnected(stream: &mut UnixStream) -> bool {
@@ -95,9 +106,24 @@ impl Drop for Activity {
     }
 }
 
+#[cfg(test)]
 pub(super) fn execute(
     request: &Request,
     workspace: &Path,
+    cancelled: impl FnMut() -> bool,
+) -> io::Result<Response> {
+    execute_configured(
+        request,
+        workspace,
+        &crate::config::Config::default(),
+        cancelled,
+    )
+}
+
+pub(super) fn execute_configured(
+    request: &Request,
+    workspace: &Path,
+    config: &crate::config::Config,
     mut cancelled: impl FnMut() -> bool,
 ) -> io::Result<Response> {
     request.validate().map_err(io::Error::other)?;
@@ -105,6 +131,13 @@ pub(super) fn execute(
         return Ok(Response::Cancelled);
     }
     let deadline = Instant::now() + Duration::from_millis(u64::from(request.timeout_ms));
+    config.validate()?;
+    if cancelled() {
+        return Ok(Response::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Ok(Response::DeadlineExceeded);
+    }
     let mut activity = Activity(
         Command::new("/bin/sh")
             .arg("-c")
@@ -112,8 +145,9 @@ pub(super) fn execute(
             .current_dir(workspace)
             .env_clear()
             .env("HOME", workspace)
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("PATH", &config.path)
             .env("LANG", "C.UTF-8")
+            .envs(&request.env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

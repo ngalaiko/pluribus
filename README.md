@@ -148,6 +148,8 @@ pluribus run
 Observations, raw payloads, media descriptors, model deltas, capability calls,
 and delivery outcomes persist under the data directory.
 
+Receive [HTTP requests](plugins/http/README.md) and [GitHub observations](plugins/github/README.md), with App tokens available to the shell executor.
+
 Add [durable memory](plugins/memory/README.md), [configured tools](docs/plugin-instances.md) and [isolated shell execution](plugins/shell/README.md).
 
 Stop cognition and cancel active shell commands with `pluribus stop`. Restart after stopping with `pluribus run --resume`. Use the same `--data-dir` for both commands.

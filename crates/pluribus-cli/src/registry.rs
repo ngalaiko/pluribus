@@ -102,11 +102,11 @@ pub struct InstanceLimits {
 }
 
 fn default_memory_bytes() -> usize {
-    128 * 1024 * 1024
+    RuntimeLimits::default().memory_bytes
 }
 
 fn default_call_timeout_ms() -> u64 {
-    180_000
+    RuntimeLimits::default().call_timeout.as_millis() as u64
 }
 
 impl InstanceLimits {

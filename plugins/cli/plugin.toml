@@ -6,19 +6,18 @@ config_schema = "config.schema.json"
 license = "MIT OR Apache-2.0"
 
 [components.main]
-world = "pluribus:plugin/plugin@1.0.0"
+world = "pluribus:plugin/source@1.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
 config_schema = "config.schema.json"
-config_pointer = ""
 imports = [
   "pluribus:plugin/reader@1.0.0",
   "pluribus:plugin/socket@1.0.0",
   "pluribus:plugin/state@1.0.0",
   "pluribus:plugin/writer@1.0.0",
 ]
-subscribes = ["timer.fired"]
-emits = ["observation.received", "timer.set", "capability.completed", "capability.failed"]
+subscribes = []
+emits = ["observation.received", "capability.completed", "capability.failed"]
 
 [[components.main.requested_capabilities]]
 name = "host.stream"

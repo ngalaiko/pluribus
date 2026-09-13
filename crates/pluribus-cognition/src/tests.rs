@@ -988,3 +988,28 @@ async fn timer_projection_only_reads_new_events() {
     assert!(router.timers(1).await.unwrap().is_empty());
     assert_eq!(counted.returned.load(Ordering::Relaxed), 1);
 }
+
+#[tokio::test]
+async fn untrusted_observations_do_not_inherit_standing_or_reply_grants() {
+    use crate::{AuthorityResolver, Connector, OriginAuthority};
+    let store = store().await;
+    let resolver = OriginAuthority {
+        agent: agent(),
+        events: Arc::clone(&store) as _,
+        connectors: vec![Connector {
+            provider: "github".into(),
+            ingress: "github/receive".into(),
+            reply: "github/send".into(),
+            reply_capabilities: vec![CapabilityName::new("github.reply")],
+        }],
+        grants: authority(&["shell.execute"]).grants,
+        max_depth: 4,
+    };
+    let mut request = append(&store,"observation.received",&json!({"provider":"github","trusted":false,"externalSenderId":"7","conversationId":"github:me/repo"})).await.request;
+    request.actor = PrincipalRef::new(PrincipalKind::Component, "github/receive");
+    let origin = store.append(request).await.unwrap();
+    let issued = resolver.resolve(&origin).await.unwrap();
+    assert!(!issued.origin.trusted);
+    assert!(issued.grants.is_empty());
+    assert!(issued.audiences.is_empty());
+}

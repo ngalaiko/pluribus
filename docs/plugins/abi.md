@@ -8,13 +8,14 @@ The ABI package is `pluribus:plugin@1.0.0` in [`wit/`](../../wit):
 - [`host.wit`](../../wit/host.wit): host imports;
 - [`plugin.wit`](../../wit/plugin.wit): the `lifecycle` export and the world.
 
-There is one world, `plugin`, holding all five imports. Grants are enforced per
+The `plugin` world exposes the host interfaces. The `source` world additionally
+exports `ingress` for transient subscription callbacks. Grants are enforced per
 call, so an import present in the world may still return `permission-denied`.
 A plugin MAY declare a narrower custom world for defense in depth; its manifest
 records which world the component encodes.
 
-The component MUST encode exactly one export, `lifecycle`, and its imports MUST
-equal those the manifest declares. The host rejects unresolved imports,
+The component MUST export `lifecycle`, plus `ingress` for the `source` world.
+Its imports MUST equal those the manifest declares. The host rejects unresolved imports,
 unexpected exports, type mismatches, and ABI version mismatches before
 instantiation.
 
@@ -184,6 +185,25 @@ the resulting URL.
 `sse` opens the response body as server-sent events and returns a `reader`. The
 plugin owns record framing.
 
+`exchange` uses inline request and response bytes, bounded to 1 MiB and the
+HTTP grant's limits. It applies the same network policy without persistent
+blobs. Plugins handling credentials use it for sensitive API exchanges.
+
+### `credentials`
+
+`get(handle)` and `compare-and-swap(handle, expected, value)` access only
+credential handles explicitly granted to this component. Records are scoped by
+package ID and limited to 1 MiB. Compare-and-swap requires the exact previous
+bytes, or absence when `expected` is omitted. These writes are independent of
+event commits; plugins must make external exchanges replay-safe.
+
+`resolve-export(binding)` returns only the export selected by the operator's
+`config.credential_exports` binding. It grants no raw-record access. Missing
+exports and exports expiring within 30 seconds fail.
+
+`random-bytes` returns up to 1024 cryptographically random bytes.
+`now-ms` returns the current Unix time in milliseconds.
+
 ### `reader` and `writer`
 
 The two halves of a byte channel. `reader.receive` returns at most `max-bytes`
@@ -230,7 +250,8 @@ These are ABI `1.0.0` hard maxima. A deployment may configure lower limits.
 | --- | ---: |
 | Component binary | 64 MiB |
 | Linear memory per instance | 512 MiB |
-| Default linear memory | 128 MiB |
+| Default linear memory | 32 MiB |
+| Default lifecycle-call timeout | 60 seconds |
 | One WIT string or byte list | 8 MiB |
 | One JSON value | 1 MiB |
 | State key | 512 UTF-8 bytes |

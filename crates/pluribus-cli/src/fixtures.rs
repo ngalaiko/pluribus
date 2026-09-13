@@ -23,7 +23,7 @@ pub fn config() -> Config {
             "telegram-1": {
                 "package": package("telegram"),
                 "aliases": ["telegram", "dev.pluribus.telegram"],
-                "config": {"credential_handle": "telegram:primary", "poll_timeout_seconds": 30},
+                "config": {"credentials": {"bot-token": "telegram:primary"}, "poll_timeout_seconds": 30},
                 "components": {
                     "receive": {"http": {"origins": ["https://api.telegram.org"], "methods": ["GET", "POST"]}},
                     "send": {"http": {"origins": ["https://api.telegram.org"], "methods": ["GET", "POST"]}}
@@ -32,7 +32,7 @@ pub fn config() -> Config {
             "codex-1": {
                 "package": package("openai-codex"),
                 "aliases": ["codex", "openai-codex", "dev.pluribus.openai-codex"],
-                "config": {"credential": "codex:primary", "models": ["gpt-5.6-luna"], "timeout_ms": 300_000},
+                "config": {"credentials": {"subscription": "codex:primary"}, "models": ["gpt-5.6-luna"], "timeout_ms": 300_000},
                 "components": {
                     "main": {"http": {"origins": ["https://chatgpt.com"], "methods": ["POST"]}}
                 },

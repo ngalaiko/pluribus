@@ -18,8 +18,10 @@ RLM consumes observations from the agent stream. Replies use the observation's
 
 JS operations:
 
-- `history.read({after, limit})`: admitted root history or a delegated child range;
-  at most 100 events / 256 KiB.
+- `history.read({after, limit, eventTypes})`: admitted root history or a delegated child range;
+  at most 100 events / 64 KiB. All event types remain accessible, including
+  internal checkpoints. Filter aggressively to the evidence needed. Oversized
+  payloads return `payloadOmitted` metadata; the cursor still advances.
 - `rlm.query({question, context})`: read-only child; at most 64 KiB of context.
 - `memory.recall/get/remember/supersede/forget(...)`: root-only
   [memory capabilities](../memory/README.md), subject to scoped grants.
@@ -84,3 +86,18 @@ Operator commands require node actor `operator:<agent-id>`:
 
 Deferred Telegram media events enrich their original observation and task context;
 only the configured connector can supply them.
+
+A trapped session component fails suspended calls with an unknown outcome and
+restarts with fresh memory. Failed cells are not replayed; cognition can replan
+or report failure. Cancellation records an uncertain terminal result and recreates
+the provider without replaying the interrupted request. Startup also recovers a
+recorded crash when the request's actor cancelled it before the failure. Other
+components remain quarantined after a trap.
+
+Amendments close outstanding model tool calls with interrupted results. Late
+results remain activity evidence without resuming an obsolete revision. Malformed
+tool histories fail locally instead of entering provider retries.
+
+The CLI derives `context.components` from installed manifests: instance IDs,
+plugin IDs, capabilities, subscriptions, and emissions. This interface map helps
+select history filters; it does not assert component health or permissions.

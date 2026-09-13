@@ -10,7 +10,7 @@ Telegram contains `receive` and `send`. RLM contains `cognition` and `js`. Each 
     "telegram-1": {
       "package": "file:///opt/plugins/telegram",
       "aliases": ["telegram"],
-      "config": {"credential_handle": "telegram:personal", "poll_timeout_seconds": 30},
+      "config": {"credentials": {"bot-token": "telegram:personal"}, "poll_timeout_seconds": 30},
       "components": {
         "receive": {"http": {"origins": ["https://api.telegram.org"], "methods": ["GET", "POST"]}},
         "send": {"http": {"origins": ["https://api.telegram.org"], "methods": ["POST"]}}
@@ -20,7 +20,7 @@ Telegram contains `receive` and `send`. RLM contains `cognition` and `js`. Each 
 }
 ```
 
-This fragment needs a model package and `model_instance` to run. Packages use absolute `file://` directory URLs or pinned `file://` or `https://` archive references. Package configuration must satisfy its outer schema and each component's projected schema. The manifest's required `config_pointer` selects the component configuration; an empty pointer selects the full object. `components` contains optional access overrides. Omitted components use manifest requests and runtime defaults; unknown component names are rejected. Single-component plugins can use `access` directly instead of a `components` map. An unnamed single-component plugin uses its instance ID directly. A bare instance selector also resolves a sole named component.
+This fragment needs a model package and `model_instance` to run. Packages use absolute `file://` directory URLs or pinned `file://` or `https://` archive references. Package configuration must satisfy its outer schema and every component's schema. Each component receives the full instance configuration. `components` contains optional access overrides. Omitted components use manifest requests and runtime defaults; unknown component names are rejected. Single-component plugins can use `access` directly instead of a `components` map. An unnamed single-component plugin uses its instance ID directly. A bare instance selector also resolves a sole named component.
 
 ## Configuration and authority
 
@@ -31,7 +31,7 @@ This fragment needs a model package and `model_instance` to run. Packages use ab
 | `aliases` | Enrollment command aliases for the package instance. |
 | `components.<name>.http` | Component HTTP origins, methods, request/response limits, and timeout. |
 | `components.<name>.stream` | Component Unix socket endpoint and transfer limits. |
-| `components.<name>.limits` | Component memory and lifecycle-call timeout. |
+| `components.<name>.limits` | Optional memory and lifecycle-call timeout overrides; defaults: 32 MiB and 60 seconds. |
 | `enrollment_origins` | Package OAuth enrollment and refresh origins. |
 
 HTTP requires HTTPS, excludes private networks and redirects, and must match that component's declared requests. Runtime access does not follow from a manifest declaration alone. HTTP grant principals must match their component instance. Stream access additionally requires the endpoint's account to be listed in `peer_uids`; see [stream transport](plugins/stream.md).
@@ -51,7 +51,7 @@ Inbound Telegram observations must originate from the selected receiver. Their o
 
 ## Installation boundary
 
-The agent validates the entire package, all projected configurations, component names, subscription conflicts, and host grants, then compiles and instantiates every component before calling any `init`. A failed preflight starts nothing and registers nothing.
+The agent validates the entire package, configuration against every component schema, component names, subscription conflicts, and host grants, then compiles and instantiates every component before calling any `init`. A failed preflight starts nothing and registers nothing.
 
 After preflight, each component initializes and rebuilds its projections. Components become active only after every lifecycle call succeeds. An initialization failure leaves no active registrations from that package; initialization events and state already committed by earlier components are not rolled back.
 

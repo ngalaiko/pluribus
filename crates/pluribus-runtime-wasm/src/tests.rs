@@ -511,7 +511,7 @@ async fn provider_http_timeout_cannot_exceed_the_lifecycle_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn packaged_telegram_init_emits_a_timer_with_origin_causation() {
+async fn packaged_telegram_subscription_requires_http_access() {
     let (runtime, _) = runtime().await;
     let package = PluginPackage::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/telegram"),
@@ -520,24 +520,14 @@ async fn packaged_telegram_init_emits_a_timer_with_origin_causation() {
     let mut instance = runtime
         .instantiate(
             package.component("receive").unwrap(),
-            &serde_json::json!({"credential_handle":"telegram:test","poll_timeout_seconds":30}),
+            &serde_json::json!({"credentials": {"bot-token": "telegram:test"},"poll_timeout_seconds":30}),
             delivery(),
             PluginServices::default(),
         )
         .await
         .unwrap();
-    let outcome = instance.init().await.unwrap();
-    assert_eq!(outcome.events.len(), 1);
-    assert_eq!(outcome.events[0].request.event_type, "timer.set");
-    assert_eq!(
-        outcome.events[0]
-            .request
-            .causation_id
-            .as_ref()
-            .unwrap()
-            .as_str(),
-        "origin-1"
-    );
+    let error = instance.init().await.unwrap_err();
+    assert!(error.to_string().contains("HTTP service is unavailable"));
 }
 
 #[tokio::test]
@@ -576,14 +566,34 @@ async fn lifecycle_outcomes_have_distinct_deduplication_domains() {
     let mut instance = runtime
         .instantiate(
             package.component("receive").unwrap(),
-            &serde_json::json!({"credential_handle":"telegram:test","poll_timeout_seconds":30}),
+            &serde_json::json!({"credentials": {"bot-token": "telegram:test"},"poll_timeout_seconds":30}),
             delivery(),
             PluginServices::default(),
         )
         .await
         .unwrap();
-    let initialized = instance.init().await.unwrap();
-    let repeated = instance.init().await.unwrap();
+    instance.store.data_mut().emits.push("timer.set".into());
+    let initialization = guest::Outcome {
+        events: vec![proposal("timer.set")],
+        mutations: vec![],
+        checkpoint: None,
+    };
+    let initialized = instance
+        .commit(
+            &initialization,
+            Some(&EventId::new("origin-1")),
+            CommitPhase::Init,
+        )
+        .await
+        .unwrap();
+    let repeated = instance
+        .commit(
+            &initialization,
+            Some(&EventId::new("origin-1")),
+            CommitPhase::Init,
+        )
+        .await
+        .unwrap();
     assert_eq!(initialized.events[0].event_id, repeated.events[0].event_id);
     let origin = EventId::new("origin-1");
     let handled = instance
@@ -739,7 +749,7 @@ async fn interrupted_lifecycle_requires_reinstantiation() {
     let mut instance = runtime
         .instantiate(
             package.component("receive").unwrap(),
-            &serde_json::json!({"credential_handle":"test","poll_timeout_seconds":30}),
+            &serde_json::json!({"credentials": {"bot-token": "test"},"poll_timeout_seconds":30}),
             delivery(),
             PluginServices::default(),
         )
@@ -810,4 +820,346 @@ async fn model_requests_receive_core_identity() {
         payload["messages"][0]["content"][1]["text"],
         "Plugin instructions"
     );
+}
+
+#[tokio::test]
+async fn http_request_reads_are_confined_to_consumer_and_listener() {
+    let mut host = host(vec!["http.request.received".into()]).await;
+    let mut request = proposal("http.request.received");
+    request.payload =
+        types::Payload::Json(br#"{"consumer":"github/receive","body":"private"}"#.to_vec());
+    request.idempotency_key = Some("request".into());
+    events::Host::append(&mut host, request).await.unwrap();
+    let stream = StreamId::new(host.delivery.agent.id.clone());
+    let event = host
+        .event_store
+        .query(&stream, &EventQuery::default(), 10)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(http_request_visible(&event, &host.delivery.instance_id));
+    host.delivery.instance_id = "unrelated".into();
+    assert!(
+        events::Host::get(&mut host, event.event_id.as_str().into())
+            .await
+            .is_err()
+    );
+    host.delivery.instance_id = "github/receive".into();
+    assert!(
+        events::Host::get(&mut host, event.event_id.as_str().into())
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn credential_exports_are_scoped_without_raw_record_access() {
+    use pluribus_core::{InMemoryCredentialStore, PluginCredentialStore};
+    let store = Arc::new(InMemoryCredentialStore::default());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let doc = serde_json::json!({
+        "private-key": "never-export",
+        "exports": {
+            "token": {"value": "allowed", "expires_at_ms": now + 120_000},
+            "expired": {"value": "expired", "expires_at_ms": now - 1},
+            "expiring": {"value": "expiring", "expires_at_ms": now + 20_000}
+        }
+    });
+    store
+        .replace_plugin_credential(
+            &SecretHandle::new("test"),
+            "provider",
+            None,
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut host = host(vec![]).await;
+    host.credentials = Some(CredentialAccess {
+        store,
+        provider: "consumer".into(),
+        handles: Default::default(),
+        exports: [
+            ("TOKEN", "provider", "test", "token"),
+            ("EXPIRED", "provider", "test", "expired"),
+            ("EXPIRING", "provider", "test", "expiring"),
+            ("PRIVATE", "provider", "test", "private-key"),
+            ("WRONG_PROVIDER", "other", "test", "token"),
+            ("WRONG_HANDLE", "provider", "other", "token"),
+        ]
+        .into_iter()
+        .map(|(name, provider, credential, export)| {
+            (
+                name.into(),
+                CredentialExport {
+                    provider: provider.into(),
+                    credential: credential.into(),
+                    export: export.into(),
+                },
+            )
+        })
+        .collect(),
+    });
+    assert_eq!(
+        credentials::Host::resolve_export(&mut host, "TOKEN".into())
+            .await
+            .unwrap(),
+        "allowed"
+    );
+    for binding in [
+        "UNGRANTED",
+        "EXPIRED",
+        "EXPIRING",
+        "PRIVATE",
+        "WRONG_PROVIDER",
+        "WRONG_HANDLE",
+    ] {
+        assert!(
+            credentials::Host::resolve_export(&mut host, binding.into())
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        credentials::Host::get(&mut host, "test".into())
+            .await
+            .is_err()
+    );
+    assert!(
+        credentials::Host::compare_and_swap(&mut host, "test".into(), None, vec![])
+            .await
+            .is_err()
+    );
+}
+
+#[derive(Default)]
+struct SubscriptionFixture {
+    opens: AtomicU64,
+    reads: AtomicU64,
+    closed: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl StreamService for SubscriptionFixture {
+    async fn open(&self, _: &StreamGrant) -> Result<String, StreamError> {
+        unreachable!()
+    }
+    async fn subscribe(&self, _: &StreamGrant) -> Result<String, StreamError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        Ok("input".into())
+    }
+    async fn next(&self, _: &str, _: u32) -> Result<pluribus_core::StreamPage, StreamError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(pluribus_core::StreamPage {
+            bytes: vec![1],
+            closed: false,
+        })
+    }
+    async fn receive(
+        &self,
+        _: &str,
+        _: u32,
+        _: u32,
+        _: &AtomicBool,
+    ) -> Result<pluribus_core::StreamPage, StreamError> {
+        unreachable!()
+    }
+    async fn send(&self, _: &str, _: &[u8]) -> Result<(), StreamError> {
+        Ok(())
+    }
+    fn shutdown_write(&self, _: &str) {}
+    fn close(&self, _: &str) {
+        self.closed.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_require_grants_and_wait_for_callback_commit() {
+    let mut host = host(vec![]).await;
+    assert!(socket::Host::subscribe(&mut host, vec![]).await.is_err());
+    let service = Arc::new(SubscriptionFixture::default());
+    host.stream = Some(service.clone());
+    host.stream_grant = Some(StreamGrant {
+        endpoint: pluribus_core::StreamEndpoint::Unix {
+            path: "/unused".into(),
+            peer_uids: vec![1],
+        },
+        max_bytes: 1024,
+        max_timeout_ms: 1000,
+    });
+    assert!(socket::Host::subscribe(&mut host, vec![]).await.is_err());
+    host.ingress_supported = true;
+    host.replaying = true;
+    assert!(socket::Host::subscribe(&mut host, vec![]).await.is_err());
+    host.replaying = false;
+    socket::Host::subscribe(&mut host, b"subscribe".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        service.opens.load(Ordering::SeqCst),
+        0,
+        "subscription is staged until commit"
+    );
+    let request = host.pending_subscription.take().unwrap();
+    let mut subscription = subscription::Subscription::start(&host, request);
+    let first = subscription.inbox.recv().await.unwrap();
+    assert_eq!(first.payload["bytes"], serde_json::json!([1]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), subscription.inbox.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(service.reads.load(Ordering::SeqCst), 1);
+    first.committed.send(()).unwrap();
+    let _second = subscription.inbox.recv().await.unwrap();
+    assert_eq!(service.reads.load(Ordering::SeqCst), 2);
+    assert!(
+        host.event_store
+            .read(&StreamId::new("personal"), 0, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(subscription);
+    tokio::time::timeout(Duration::from_secs(1), service.closed.notified())
+        .await
+        .unwrap();
+}
+
+#[derive(Default)]
+struct CliSubscriptionFixture {
+    sequence: AtomicU64,
+    frames: std::sync::Mutex<HashMap<String, VecDeque<Vec<u8>>>>,
+    offsets: std::sync::Mutex<Vec<u64>>,
+}
+#[async_trait::async_trait]
+impl StreamService for CliSubscriptionFixture {
+    async fn open(&self, _: &StreamGrant) -> Result<String, StreamError> {
+        Ok("reply".into())
+    }
+    async fn subscribe(&self, _: &StreamGrant) -> Result<String, StreamError> {
+        Ok(format!(
+            "input-{}",
+            self.sequence.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+    async fn send(&self, id: &str, bytes: &[u8]) -> Result<(), StreamError> {
+        if id == "reply" {
+            return Ok(());
+        }
+        let request: Value = serde_json::from_slice(bytes).unwrap();
+        let after = request["after"].as_u64().unwrap();
+        self.offsets.lock().unwrap().push(after);
+        let frame = if after == 0 {
+            b"{\"status\":\"messages\",\"messages\":[{\"sequence\":1,\"at_ms\":1,\"text\":\"hello\"}]}\n".to_vec()
+        } else {
+            b"{\"status\":\"messages\",\"messages\":[]}\n".to_vec()
+        };
+        let middle = frame.len() / 2;
+        self.frames.lock().unwrap().insert(
+            id.into(),
+            VecDeque::from([frame[..middle].to_vec(), frame[middle..].to_vec()]),
+        );
+        Ok(())
+    }
+    async fn next(&self, id: &str, _: u32) -> Result<pluribus_core::StreamPage, StreamError> {
+        let bytes = self
+            .frames
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .and_then(VecDeque::pop_front);
+        if let Some(bytes) = bytes {
+            return Ok(pluribus_core::StreamPage {
+                bytes,
+                closed: false,
+            });
+        }
+        std::future::pending().await
+    }
+    async fn receive(
+        &self,
+        _: &str,
+        _: u32,
+        _: u32,
+        _: &AtomicBool,
+    ) -> Result<pluribus_core::StreamPage, StreamError> {
+        Ok(pluribus_core::StreamPage {
+            bytes: b"{\"status\":\"delivered\"}\n".to_vec(),
+            closed: false,
+        })
+    }
+    fn shutdown_write(&self, _: &str) {}
+    fn close(&self, id: &str) {
+        self.frames.lock().unwrap().remove(id);
+    }
+}
+
+#[tokio::test]
+async fn packaged_cli_subscription_frames_input_and_commits_offsets() {
+    let (runtime, store) = runtime().await;
+    let package = PluginPackage::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/cli"),
+    )
+    .unwrap();
+    let stream = Arc::new(CliSubscriptionFixture::default());
+    let mut instance = runtime
+        .instantiate(
+            package.component("main").unwrap(),
+            &serde_json::json!({}),
+            delivery(),
+            PluginServices {
+                stream: Some(stream.clone()),
+                stream_grant: Some(StreamGrant {
+                    endpoint: pluribus_core::StreamEndpoint::Unix {
+                        path: "/unused".into(),
+                        peer_uids: vec![1],
+                    },
+                    max_bytes: 1024,
+                    max_timeout_ms: 1000,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(instance.init().await.unwrap().events.is_empty());
+    for _ in 0..4 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !instance.has_stream_input() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        instance.receive_input(1000).await.unwrap();
+    }
+    let events = store
+        .read(&StreamId::new("personal"), 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "fragmented input and empty responses must not create extra events"
+    );
+    assert_eq!(events[0].request.event_type, "observation.received");
+    assert_eq!(&stream.offsets.lock().unwrap()[..2], &[0, 1]);
+    assert_eq!(
+        StateStore::get(
+            store.as_ref(),
+            &StateNamespace::new("shell-1"),
+            "input/cursor"
+        )
+        .await
+        .unwrap()
+        .value
+        .unwrap(),
+        b"1"
+    );
+    instance.stop(1000).await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(stream.frames.lock().unwrap().is_empty());
 }

@@ -155,17 +155,19 @@ pub(crate) fn resolve_instance(
     }
     instance.components = serde_json::from_value(access)?;
     instance.config = package.resolve_config(&instance.config);
-    for credential in &package.manifest().credentials {
-        if instance
+    if !package.manifest().credentials.is_empty() {
+        let credentials = instance
             .config
-            .pointer(&credential.config_pointer)
-            .is_none()
-        {
-            set_pointer(
-                &mut instance.config,
-                &credential.config_pointer,
-                json!(format!("{id}:{}", credential.id)),
-            )?;
+            .as_object_mut()
+            .ok_or("plugin config must be an object")?
+            .entry("credentials")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or("credentials must be an object")?;
+        for credential in &package.manifest().credentials {
+            credentials
+                .entry(credential.id.clone())
+                .or_insert_with(|| json!(format!("{id}:{}", credential.id)));
         }
     }
     if instance.enrollment_overrides.is_none() {
@@ -178,28 +180,6 @@ pub(crate) fn resolve_instance(
             .into_iter()
             .collect();
     }
-    Ok(())
-}
-
-fn set_pointer(config: &mut Value, pointer: &str, value: Value) -> Result<()> {
-    let parts: Vec<_> = pointer
-        .strip_prefix('/')
-        .ok_or("credential pointer must name a field")?
-        .split('/')
-        .map(|part| part.replace("~1", "/").replace("~0", "~"))
-        .collect();
-    let mut parent = config;
-    for part in &parts[..parts.len() - 1] {
-        parent = parent
-            .as_object_mut()
-            .ok_or("credential pointer requires objects")?
-            .entry(part.clone())
-            .or_insert_with(|| json!({}));
-    }
-    parent
-        .as_object_mut()
-        .ok_or("credential pointer requires an object")?
-        .insert(parts.last().unwrap().clone(), value);
     Ok(())
 }
 
@@ -296,6 +276,34 @@ async fn reference_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_slots_preserve_bindings_and_default_missing_handles() {
+        let package = PluginPackage::load(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/telegram"),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        for (config, expected) in [
+            (json!({}), "personal:bot-token"),
+            (
+                json!({"credentials":{"bot-token":"shared:telegram"}}),
+                "shared:telegram",
+            ),
+        ] {
+            let mut instance = serde_json::from_value(json!({
+                "package":"bundled:telegram", "config":config
+            }))
+            .unwrap();
+            resolve_instance(&package, "personal", root.path(), &mut instance).unwrap();
+            assert_eq!(instance.config["credentials"]["bot-token"], expected);
+        }
+        let mut instance = serde_json::from_value(json!({
+            "package":"bundled:telegram", "config":{"credentials":"invalid"}
+        }))
+        .unwrap();
+        assert!(resolve_instance(&package, "personal", root.path(), &mut instance).is_err());
+    }
+
     #[test]
     fn explicit_override_never_falls_back() {
         assert!(

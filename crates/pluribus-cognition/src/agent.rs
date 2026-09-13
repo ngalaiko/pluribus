@@ -177,13 +177,10 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             let mut component_delivery = delivery.clone();
             component_delivery.instance_id =
                 pluribus_plugin_package::component_id(&delivery.instance_id, name);
-            let projected = component
-                .project_config(config)
-                .map_err(|e| AgentError::Storage(e.to_string()))?;
             let prepared = self
                 .stage_component(
                     component,
-                    projected,
+                    config,
                     component_delivery,
                     setup.services,
                     &setup.models,
@@ -209,7 +206,9 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             .iter()
             .map(|s| s.registration.instance_id.clone())
             .collect();
-        for prepared in staged {
+        for mut prepared in staged {
+            self.recover_installed_session(&mut prepared.instance)
+                .await?;
             self.activate_component(prepared);
         }
         Ok(ids)
@@ -243,8 +242,139 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             .rebuild(&staged.rebuilds)
             .await
             .map_err(AgentError::Runtime)?;
+        self.recover_installed_session(&mut staged.instance).await?;
         self.activate_component(staged);
         Ok(())
+    }
+
+    async fn recover_installed_session(
+        &self,
+        instance: &mut PluginInstance,
+    ) -> Result<(), AgentError> {
+        let mut after = 0;
+        let mut failure = None;
+        loop {
+            let page = self
+                .events
+                .query(
+                    &self.stream_id,
+                    &pluribus_core::EventQuery {
+                        after_sequence: Some(after),
+                        event_types: vec!["component.failed".into(), "component.recovered".into()],
+                        ..Default::default()
+                    },
+                    100,
+                )
+                .await
+                .map_err(|e| AgentError::Storage(e.to_string()))?;
+            if page.is_empty() {
+                break;
+            }
+            for event in page {
+                after = event.sequence;
+                if event.request.actor.kind != pluribus_core::PrincipalKind::Node
+                    || ![
+                        self.principal.id.as_str(),
+                        &format!("operator:{}", self.principal.id.as_str()),
+                    ]
+                    .contains(&event.request.actor.id.as_str())
+                {
+                    continue;
+                }
+                if crate::payload_field(&event, "instanceId").as_deref()
+                    != Some(instance.instance_id())
+                {
+                    continue;
+                }
+                failure = if event.request.event_type == "component.failed" {
+                    Some(event)
+                } else {
+                    None
+                };
+            }
+        }
+        if let Some(failure) = failure {
+            let mut batch = Vec::new();
+            if let Some(id) = &failure.request.causation_id
+                && let Some(event) = self
+                    .events
+                    .get(id)
+                    .await
+                    .map_err(|e| AgentError::Storage(e.to_string()))?
+            {
+                batch.push(event);
+            }
+            if instance.pinned_session() {
+                self.router
+                    .fail_sessions(instance.instance_id(), &batch)
+                    .await
+                    .map_err(AgentError::Router)?;
+            } else {
+                let Some(request) = batch.first() else {
+                    return Ok(());
+                };
+                if !self.cancelled_before(request, failure.sequence).await? {
+                    return Ok(());
+                }
+                self.router
+                    .cancel_attempt(request)
+                    .await
+                    .map_err(AgentError::Router)?;
+            }
+            let checkpoint = batch.last().map_or(instance.checkpoint(), |e| {
+                e.sequence.max(instance.checkpoint())
+            });
+            instance
+                .skip(checkpoint)
+                .await
+                .map_err(AgentError::Runtime)?;
+            self.router
+                .append_health(
+                    "component.recovered",
+                    serde_json::json!({"instanceId":instance.instance_id()}),
+                )
+                .await
+                .map_err(AgentError::Router)?;
+        }
+        Ok(())
+    }
+
+    async fn cancelled_before(
+        &self,
+        request: &CommittedEvent,
+        before: u64,
+    ) -> Result<bool, AgentError> {
+        let mut after = request.sequence;
+        loop {
+            let page = self
+                .events
+                .query(
+                    &self.stream_id,
+                    &pluribus_core::EventQuery {
+                        after_sequence: Some(after),
+                        event_types: vec!["cognition.cancel-requested".into()],
+                        ..Default::default()
+                    },
+                    100,
+                )
+                .await
+                .map_err(|e| AgentError::Storage(e.to_string()))?;
+            if page.is_empty() {
+                return Ok(false);
+            }
+            for event in page {
+                if event.sequence >= before {
+                    return Ok(false);
+                }
+                after = event.sequence;
+                if event.request.actor == request.request.actor
+                    && crate::payload_field(&event, "requestEventId").as_deref()
+                        == Some(request.event_id.as_str())
+                {
+                    return Ok(true);
+                }
+            }
+        }
     }
 
     async fn stage_component(
@@ -491,10 +621,21 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                     self.recovered(&id).await?;
                     progress.events_committed += outcome.events.len();
                 }
+                Err(_)
+                    if self
+                        .cancellations
+                        .get(&id)
+                        .is_some_and(CancellationHandle::is_cancelled) =>
+                {
+                    self.cancel_worker(&id, &worker.batch).await?;
+                }
                 Err(error) if error.trapped() => {
                     self.quarantine(
                         &id,
-                        worker.batch.last().unwrap().sequence,
+                        worker
+                            .batch
+                            .last()
+                            .map_or(self.instances[&id].checkpoint(), |event| event.sequence),
                         &worker.batch,
                         &error,
                     )
@@ -503,6 +644,43 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                 Err(error) => self.defer(&id, &error).await?,
             }
         }
+        Ok(())
+    }
+
+    async fn cancel_worker(
+        &mut self,
+        id: &str,
+        batch: &[CommittedEvent],
+    ) -> Result<(), AgentError> {
+        for request in batch {
+            self.router
+                .cancel_attempt(request)
+                .await
+                .map_err(AgentError::Router)?;
+        }
+        let old = self
+            .instances
+            .remove(id)
+            .ok_or_else(|| AgentError::UnknownInstance(id.into()))?;
+        if old.pinned_session() {
+            self.router
+                .fail_sessions(id, &[])
+                .await
+                .map_err(AgentError::Router)?;
+        }
+        let mut fresh = old.restart().await.map_err(AgentError::Runtime)?;
+        fresh.init().await.map_err(AgentError::Runtime)?;
+        fresh
+            .skip(
+                batch
+                    .last()
+                    .map_or(old.checkpoint(), |event| event.sequence),
+            )
+            .await
+            .map_err(AgentError::Runtime)?;
+        self.cancellations.insert(id.into(), fresh.cancellation());
+        self.instances.insert(id.into(), fresh);
+        self.recovered(id).await?;
         Ok(())
     }
 
@@ -652,7 +830,18 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
     async fn gate_new_requests(&mut self, now_ms: i64) -> Result<(usize, usize), AgentError> {
         let requests = self
             .events
-            .read(&self.stream_id, self.gated_through, self.batch)
+            .query(
+                &self.stream_id,
+                &pluribus_core::EventQuery {
+                    after_sequence: Some(self.gated_through),
+                    event_types: vec![
+                        "capability.requested".into(),
+                        "cognition.cancel-requested".into(),
+                    ],
+                    ..Default::default()
+                },
+                self.batch,
+            )
             .await
             .map_err(|error| AgentError::Storage(error.to_string()))?;
         let mut gated = 0;
@@ -765,6 +954,29 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                 .await
                 .map_err(AgentError::Router)?;
             if pending.is_empty() {
+                if self
+                    .instances
+                    .get_mut(instance_id)
+                    .unwrap()
+                    .has_stream_input()
+                {
+                    let mut instance = self.instances.remove(instance_id).unwrap();
+                    let progress = self.runtime.progress_notification();
+                    let now_ms = self.admission_now_ms;
+                    let handle = tokio::spawn(async move {
+                        let result = instance.receive_input(now_ms).await;
+                        progress.notify_one();
+                        (instance, result)
+                    });
+                    self.workers.insert(
+                        instance_id.into(),
+                        Worker {
+                            batch: Vec::new(),
+                            handle,
+                        },
+                    );
+                    return Ok(Some(0));
+                }
                 self.recovered(instance_id).await?;
                 return Ok(None);
             }
@@ -954,12 +1166,8 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         }
     }
 
-    /// Withdraws a component that died mid-delivery and records why.
-    ///
-    /// The component cannot report this itself: a trap leaves no outcome to
-    /// return, and `component.failed` is core-owned. Nothing committed, so the
-    /// cursor still points at the batch that killed it; redelivering would
-    /// trap again, which is why the instance goes before the cursor moves.
+    /// Fails lost sessions and replaces their component without replaying the
+    /// poisoned batch. Components without pinned sessions stay quarantined.
     async fn quarantine(
         &mut self,
         instance_id: &str,
@@ -974,30 +1182,69 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             reason,
             "component quarantined"
         );
-        for request in batch {
-            if matches!(
-                request.request.event_type.as_str(),
-                "capability.requested" | "model.requested" | "code.evaluate-requested"
-            ) && self
-                .router
-                .result_for(&request.event_id)
-                .await
-                .map_err(AgentError::Router)?
-                .is_none()
-            {
-                self.router
-                    .admit_attempt(request, instance_id)
+        if !self
+            .instances
+            .get(instance_id)
+            .is_some_and(PluginInstance::pinned_session)
+        {
+            for request in batch {
+                if matches!(
+                    request.request.event_type.as_str(),
+                    "capability.requested" | "model.requested" | "code.evaluate-requested"
+                ) && self
+                    .router
+                    .result_for(&request.event_id)
                     .await
-                    .map_err(AgentError::Router)?;
+                    .map_err(AgentError::Router)?
+                    .is_none()
+                {
+                    self.router
+                        .admit_attempt(request, instance_id)
+                        .await
+                        .map_err(AgentError::Router)?;
+                }
             }
         }
         let mut instance = self.instances.remove(instance_id);
-        self.router.unregister(instance_id);
-        self.failed.insert(instance_id.to_owned(), reason.clone());
         self.router
             .append_component_failure(instance_id, batch, &reason)
             .await
             .map_err(AgentError::Router)?;
+        if let Some(old) = instance.as_ref().filter(|i| i.pinned_session()) {
+            self.router
+                .fail_sessions(instance_id, batch)
+                .await
+                .map_err(AgentError::Router)?;
+            let restarted = async {
+                let mut fresh = old.restart().await?;
+                fresh.init().await?;
+                fresh.skip(checkpoint).await?;
+                Ok::<_, RuntimeError>(fresh)
+            }
+            .await;
+            match restarted {
+                Ok(fresh) => {
+                    self.cancellations
+                        .insert(instance_id.into(), fresh.cancellation());
+                    self.instances.insert(instance_id.into(), fresh);
+                    self.router
+                        .append_health(
+                            "component.recovered",
+                            serde_json::json!({"instanceId":instance_id}),
+                        )
+                        .await
+                        .map_err(AgentError::Router)?;
+                    self.failed.remove(instance_id);
+                    self.backoff.remove(instance_id);
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(instance = instance_id, %error, "component restart failed");
+                }
+            }
+        }
+        self.router.unregister(instance_id);
+        self.failed.insert(instance_id.to_owned(), reason.clone());
         if let Some(instance) = instance.as_mut()
             && !instance.requires_reinstantiation()
         {

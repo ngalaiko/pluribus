@@ -18,7 +18,7 @@ Configuration:
 
 ```json
 {
-  "credential": "openai-codex:personal",
+  "credentials": {"subscription": "openai-codex:personal"},
   "models": ["gpt-5.6-luna"],
   "timeout_ms": 300000
 }

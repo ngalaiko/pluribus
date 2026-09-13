@@ -101,6 +101,7 @@ rustPlatform.buildRustPackage {
     done | jq -s '{version: 1, plugins: add}' > assets/plugins.json
 
     export PLURIBUS_RELEASE_CATALOG=$PWD/assets/plugins.json
+    cargo build --locked --release -p pluribus-plugin-http --bin pluribus-http-listener
     cargo build --locked --release -p pluribus-cli
     cargo build --locked --release -p pluribus-plugin-shell --bin pluribus-shell-executor
     cargo build --locked --release -p pluribus-plugin-cli --bin pluribus-cli-bridge
@@ -115,7 +116,8 @@ rustPlatform.buildRustPackage {
     # A cross build, the static Linux release included, names its target directory.
     built=target/''${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release
     install -m755 "$built/pluribus" "$built/pluribus-shell-executor" \
-      "$built/pluribus-cli-bridge" tree/bin/
+      "$built/pluribus-cli-bridge" "$built/pluribus-http-listener" \
+      tree/bin/
     ${portable}
     tarball tree "$out/pluribus-${version}-${target}.tar.gz" u=rwx,go=rx
 

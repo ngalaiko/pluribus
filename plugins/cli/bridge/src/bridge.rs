@@ -5,6 +5,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,8 +48,9 @@ pub fn serve(socket: &Path, runtime_uid: u32) -> io::Result<()> {
         "bridge listening"
     );
     println!("Connected to {}. Type a message.", socket.display());
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let mut stream = stream?;
+        let stream = stream?;
         if verify_peer(&stream, runtime_uid).is_err() {
             warn!(
                 expected_uid = runtime_uid,
@@ -57,6 +59,28 @@ pub fn serve(socket: &Path, runtime_uid: u32) -> io::Result<()> {
             );
             continue;
         }
+        spawn_connection(stream, shared.clone(), active.clone());
+    }
+    Ok(())
+}
+
+struct Active(Arc<AtomicUsize>);
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+fn spawn_connection(mut stream: UnixStream, shared: Shared, active: Arc<AtomicUsize>) {
+    if active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < 16).then_some(count + 1)
+        })
+        .is_err()
+    {
+        return;
+    }
+    thread::spawn(move || {
+        let _active = Active(active);
         let response = handle(&mut stream, &shared).unwrap_or_else(|error| Response::Unavailable {
             message: error.to_string(),
         });
@@ -65,8 +89,7 @@ pub fn serve(socket: &Path, runtime_uid: u32) -> io::Result<()> {
             bytes.push(b'\n');
             let _ = stream.write_all(&bytes);
         }
-    }
-    Ok(())
+    });
 }
 
 fn handle(stream: &mut UnixStream, shared: &Shared) -> io::Result<Response> {

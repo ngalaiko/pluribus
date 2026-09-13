@@ -1,0 +1,31 @@
+abi = "pluribus:plugin@1.0.0"
+manifest_version = 1
+id = "dev.pluribus.github"
+name = "GitHub"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+[components.receive]
+world = "pluribus:plugin/plugin@1.0.0"
+component = "plugin.wasm"
+digest = "sha256:dev"
+config_schema = "config.schema.json"
+imports = ["pluribus:plugin/events@1.0.0", "pluribus:plugin/http@1.0.0", "pluribus:plugin/credentials@1.0.0"]
+subscribes = ["http.request.received", "timer.fired", "credential.enrollment.requested"]
+emits = ["observation.received", "http.response.requested", "timer.set", "credential.enrollment.started"]
+
+[[components.receive.requested_capabilities]]
+name = "net.http"
+required = true
+reason = "Register the App and refresh installation tokens"
+constraints = { origins = ["https://api.github.com"], methods = ["GET", "POST"] }
+
+[[credentials]]
+components = ["receive"]
+id = "app"
+access = true
+display_name = "GitHub App"
+description = "Enroll a private GitHub App for personal repositories"
+input_schema = "credential.input.json"
+flow_schema = "pluribus:credential/plugin@1"
+flow = "app.flow.json"

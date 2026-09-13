@@ -88,9 +88,14 @@ impl OriginAuthority {
             format!("{}:{sender}", connector.provider),
         );
         let actor = event.request.actor.clone();
-        let mut grants = self.grants.clone();
+        let trusted = value.get("trusted").is_none_or(|value| value == true);
+        let mut grants = if trusted {
+            self.grants.clone()
+        } else {
+            BTreeMap::new()
+        };
         // Replies remain confined to the originating conversation.
-        for capability in &connector.reply_capabilities {
+        for capability in connector.reply_capabilities.iter().filter(|_| trusted) {
             let capability = capability.clone();
             grants.insert(
                 capability.clone(),
@@ -116,15 +121,19 @@ impl OriginAuthority {
                 connector: Some(actor.clone()),
                 conversation_id: Some(conversation.into()),
                 source_event_id: event.event_id.clone(),
-                trusted: true,
+                trusted,
             },
             delegation_chain: vec![],
             grants,
-            audiences: vec![Audience {
-                connector: PrincipalRef::new(PrincipalKind::Component, &connector.reply),
-                conversation_id: conversation.into(),
-                recipients: vec![principal],
-            }],
+            audiences: if trusted && !connector.reply.is_empty() {
+                vec![Audience {
+                    connector: PrincipalRef::new(PrincipalKind::Component, &connector.reply),
+                    conversation_id: conversation.into(),
+                    recipients: vec![principal],
+                }]
+            } else {
+                vec![]
+            },
             parent_authority: None,
             issued_at_ms: event.recorded_at_ms,
             expires_at_ms: None,

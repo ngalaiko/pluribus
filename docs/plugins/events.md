@@ -101,6 +101,7 @@ code.completed          code.failed
 code.close-requested    code.closed
 timer.set               timer.cancel
 telegram.media-ready    telegram.media-failed
+http.request.received    http.response.requested
 ```
 
 The list is exhaustive. A plugin needing a type outside it changes
@@ -168,3 +169,10 @@ correlation, activity, and recorded time, and is served from an index.
 
 Visibility and grants may withhold events or their payloads. A returned
 `next-sequence` is where to resume, not proof that later events exist.
+
+## Inbound HTTP
+
+The [HTTP package](../../plugins/http/README.md) imports durable native requests.
+`http.request.received` payloads are confined to the listener and assigned consumer.
+The consumer emits `http.response.requested` with the original event as causation;
+the listener checks consumer identity before sending a bounded, single response.

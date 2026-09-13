@@ -177,7 +177,37 @@ Only same-machine Unix endpoints are supported. TCP and TLS are deferred.
 `socket` performs no secret injection. Use `http` when the host must inject
 credentials into HTTP requests.
 
-There is no crypto import. Inbound webhook signature verification moved into
-the core, which owns the credential; a plugin never needs the key. A future
-signing operation could authenticate plugin messages to an endpoint, but it is
-not required for the Unix peer-credential setup.
+The GitHub plugin signs and verifies inside Wasm using libraries. Its
+`credentials` grant provides access to its own core-stored credential record.
+The HTTP plugin uses a Unix socket only to communicate with its native listener.
+
+## Subscriptions
+
+Components using `pluribus:plugin/source@1.0.0` also export
+`pluribus:plugin/ingress@1.0.0.receive`. In `init`, call `socket.subscribe(request)`
+or `http.subscribe(request)` with the existing endpoint or HTTP grant.
+
+The subscription starts after commit. Core waits outside Wasm and invokes
+`receive` with transient JSON input:
+
+- Socket: `{kind:"socket",bytes:[...],receivedAtMs:...}`; chunks are at most 32 KiB.
+- HTTP: `{kind:"http",status:200,body:{digest,size,mediaType},receivedAtMs:...}`;
+  the response blob is visible to the callback.
+- Transport failure: `{kind:"error",reason:"...",receivedAtMs:...}`.
+
+The callback returns events and mutations, without an event cursor. They commit
+atomically. Empty results create no events. Normal event deliveries retain their
+existing cursor and authority checks. Only one input can remain uncommitted;
+reads resume after commit. A failed callback retains its input for retry.
+
+A component has one subscription. Replacing it closes the previous connection.
+Stopping, removing, or dropping the instance cancels it. Init restores it after
+restart. Source protocols must tolerate redelivery; commit acknowledgements and
+observation deduplication keys together prevent lost or duplicated observations.
+
+Socket subscriptions reconnect and resend their request with bounded backoff.
+The grant's timeout bounds connection establishment; idle reads wait on socket
+readiness without timers. The byte budget still applies per connection. HTTP
+subscriptions repeat the granted request after callback commit; plugins replace
+it with an updated offset. HTTP deadlines and credential checks apply to every
+request. Subscription callbacks and retries do not generate scheduler events.

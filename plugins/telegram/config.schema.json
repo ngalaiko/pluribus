@@ -3,13 +3,9 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "credential_handle"
+    "credentials"
   ],
   "properties": {
-    "credential_handle": {
-      "type": "string",
-      "minLength": 1
-    },
     "poll_timeout_seconds": {
       "type": "integer",
       "minimum": 0,
@@ -25,6 +21,19 @@
       "uniqueItems": true,
       "default": [],
       "description": "Telegram sender IDs admitted by receive. All other senders are ignored."
+    },
+    "credentials": {
+      "type": "object",
+      "required": [
+        "bot-token"
+      ],
+      "properties": {
+        "bot-token": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

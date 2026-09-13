@@ -19,6 +19,7 @@ pub const RESERVED_EVENT_TYPES: &[&str] = &[
     // Gates
     "policy.decision",
     "credential.lifecycle",
+    "credential.enrollment.requested",
     // Capability and model dispatch. The request itself is plugin-emitted;
     // the core owns the decision and the dispatch record.
     "activity.attempted",
@@ -37,6 +38,9 @@ pub const RESERVED_EVENT_TYPES: &[&str] = &[
 /// Event types a granted plugin may propose. Each is a result or a request
 /// the core routes onward.
 pub const PLUGIN_EVENT_TYPES: &[&str] = &[
+    "credential.enrollment.started",
+    "http.request.received",
+    "http.response.requested",
     "telegram.media-ready",
     "telegram.media-failed",
     // Requests. A requester proposes; the core gates dispatch and records

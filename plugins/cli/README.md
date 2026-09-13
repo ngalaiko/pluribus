@@ -1,6 +1,6 @@
 # CLI
 
-A person at a terminal, as a connector. The component polls the bridge over its
+A person at a terminal, as a connector. The component subscribes to bridge input over its
 granted [byte stream](../../docs/plugins/stream.md) and receives no process,
 filesystem, environment, or credential access besides that one endpoint.
 
@@ -19,7 +19,8 @@ pluribus-cli-bridge
 ```
 
 The bridge owns the terminal: it numbers each line typed, hands them to the
-agent when it polls, and prints replies. It listens; the component connects.
+agent through long polling, and prints replies. Empty responses create no events;
+input waits run independently of reply connections. It listens; the component connects.
 
 Its endpoint is `cli-main.sock` in the agent's data directory,
 `$XDG_DATA_HOME/pluribus` unless `--data-dir` says otherwise; `--socket` names

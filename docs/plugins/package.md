@@ -45,7 +45,6 @@ component = "plugin.wasm"
 digest = "sha256:dev"
 imports = []
 config_schema = "config.schema.json"
-config_pointer = ""
 ```
 
 `[defaults]` contains package configuration defaults. Instance values override
@@ -68,20 +67,18 @@ id = "bot-token"
 display_name = "Telegram bot token"
 description = "Bot token issued by BotFather."
 components = ["receive", "send"]
-config_pointer = "/credential_handle"
 input_schema = "schemas/credential.input.json"
 flow_schema = "pluribus:credential/static-http@1"
 flow = "flows/bot-token.json"
 
 [components.receive]
-world = "pluribus:plugin/plugin@1.0.0"
+world = "pluribus:plugin/source@1.0.0"
 component = "components/receive.wasm"
 digest = "sha256:dev"
 imports = ["pluribus:plugin/state@1.0.0", "pluribus:plugin/blobs@1.0.0", "pluribus:plugin/http@1.0.0"]
 config_schema = "config.schema.json"
-config_pointer = ""
-subscribes = ["timer.fired"]
-emits = ["observation.received", "timer.set"]
+subscribes = []
+emits = ["observation.received"]
 
 [[components.receive.requested_capabilities]]
 name = "net.http"
@@ -95,7 +92,6 @@ component = "components/send.wasm"
 digest = "sha256:dev"
 imports = ["pluribus:plugin/blobs@1.0.0", "pluribus:plugin/http@1.0.0"]
 config_schema = "config.schema.json"
-config_pointer = ""
 emits = ["capability.completed", "capability.failed"]
 
 [[components.send.provides]]
@@ -124,7 +120,7 @@ A model provider declares its model configuration pointer on its component:
 models_pointer = "/models"
 ```
 
-The pointer resolves inside that component's projected configuration. Model
+The pointer resolves inside the full instance configuration. Model
 entries are strings or `{id, features?, context_tokens?, max_output_tokens?}`.
 
 ### Fields
@@ -138,8 +134,7 @@ One package ABI applies to every component; component overrides are rejected. Un
 | `world` | Exported lifecycle world. |
 | `component`, `digest` | Binary path and SHA-256 of its bytes. |
 | `imports` | Callable Pluribus interfaces; must exactly match the binary. |
-| `config_pointer` | Required JSON Pointer into package configuration; empty selects the root. |
-| `config_schema` | Schema for the selected configuration. |
+| `config_schema` | Schema for the full instance configuration. |
 | `requires` | Names of required sibling components. |
 | `provides`, `model_provider` | Capability or model routing declarations. |
 | `subscribes`, `emits` | Delivered and permitted proposed event types. |
@@ -180,8 +175,8 @@ core type.
 
 ## Declaring what a plugin does
 
-Each component exports exactly `pluribus:plugin/lifecycle@1.0.0`. Any other export is
-rejected. There is no role list, because there are no role interfaces: what a
+Each component exports `pluribus:plugin/lifecycle@1.0.0`. The `source` world also
+requires `pluribus:plugin/ingress@1.0.0`; other exports are rejected. There is no role list, because there are no role interfaces: what a
 component does is `provides`, `model_provider`, `subscribes` and `emits`.
 
 Each component MUST declare at least one of `provides`, `model_provider`, or
@@ -204,8 +199,8 @@ as identity.
 The component MUST import only callable interfaces listed in `imports`. The manifest MUST list every callable Pluribus import encoded in the component. Type-only WIT dependencies such as `pluribus:plugin/types` are derived from the
 component and omitted from the manifest.
 
-Only the seven host interfaces are accepted: `events`, `state`, `blobs`,
-`reader`, `writer`, `http`, `socket`. An import list is an upper bound, not a
+Only the eight host interfaces are accepted: `events`, `state`, `blobs`,
+`reader`, `writer`, `http`, `socket`, `credentials`. An import list is an upper bound, not a
 grant: the core still denies a call the instance has no grant for.
 
 Guest toolchains may remove unused world imports. List the imports present in the final component, not every import declared by its source world.
@@ -217,15 +212,14 @@ Ambient WASI imports are rejected. This includes filesystem, sockets, environmen
 ## Configuration
 
 Package configuration is validated against its outer schema, then each
-component selects its `config_pointer` and validates that value against its own schema. The schema MUST use JSON Schema Draft 2020-12 and MUST reject unknown security-sensitive fields.
+component validates the full object against its own schema. The schema MUST use JSON Schema Draft 2020-12 and MUST reject unknown security-sensitive fields.
 
-Configuration is scoped to one package instance; each component receives only
-its selected value. Updating it restarts the package components.
+Configuration is scoped to one package instance; each component receives the full object. Updating it restarts the package components.
 
-Secret references are opaque handle strings in fields identified by the credential descriptor:
+Secret references are opaque handles in `config.credentials`, keyed by the manifest credential ID:
 
 ```json
-{ "credential_handle": "telegram:primary" }
+{ "credentials": {"bot-token": "telegram:primary"} }
 ```
 
 The string is an opaque handle, not secret material. A plugin passes it to `http.send` as `credential`, and the host injects the secret after its policy checks. A plugin MUST NOT accept plaintext secrets in ordinary configuration.
@@ -271,3 +265,8 @@ registering its capabilities. Replay commits state and a separate replay cursor;
 request delivery progress stays unchanged. Handlers must consume each replay
 batch without emitting events. Replay providers may import only `events` and
 `state`. See [memory](../memory-plugin.md).
+
+Credential declarations may set `access = true` when their Wasm component must
+manage its own secrets. The host grants only that declaration's configured
+handle to its listed components, under the package ID. Other credential flows
+keep using host-side injection without exposing secret bytes.

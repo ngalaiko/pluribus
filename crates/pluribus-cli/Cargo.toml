@@ -10,6 +10,7 @@ name = "pluribus"
 path = "src/main.rs"
 
 [dependencies]
+jsonschema.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
 clap.workspace = true

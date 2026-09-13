@@ -60,7 +60,7 @@ fn external_config(data: &Path) -> Value {
     fs::write(package.join("plugin.toml"), manifest).unwrap();
     let instance = |handle: &str, aliases: &[&str]| {
         json!({
-            "package": url::Url::from_directory_path(&package).unwrap().as_str(), "config": {"credential_handle": handle},
+            "package": url::Url::from_directory_path(&package).unwrap().as_str(), "config": {"credentials": {"bot-token": handle}},
             "aliases": aliases,
             "components": {
                 "receive": {"http": {"origins": ["https://api.telegram.org"], "methods": ["GET", "POST"]}},

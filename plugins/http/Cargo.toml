@@ -1,0 +1,35 @@
+[package]
+name = "pluribus-plugin-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+wit-bindgen.workspace = true
+
+[[bin]]
+name = "pluribus-http-listener"
+path = "listener/src/main.rs"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum = "0.8"
+base64.workspace = true
+clap.workspace = true
+ring = "0.17"
+rustix.workspace = true
+tokio.workspace = true
+pluribus-host-stream = { path = "../../crates/pluribus-host-stream" }
+
+[dev-dependencies]
+tempfile.workspace = true
+pluribus-cognition = { path = "../../crates/pluribus-cognition" }
+pluribus-core = { path = "../../crates/pluribus-core" }
+pluribus-runtime-wasm = { path = "../../crates/pluribus-runtime-wasm" }
+pluribus-plugin-package = { path = "../../crates/pluribus-plugin-package" }
+pluribus-store-sqlite = { path = "../../crates/pluribus-store-sqlite" }
+reqwest.workspace = true
+async-trait.workspace = true

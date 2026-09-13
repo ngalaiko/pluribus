@@ -1,6 +1,6 @@
 package pluribus:plugin@1.0.0;
 
-/// The only plugin export. One delivery mechanism serves every role:
+/// Event-driven lifecycle. Source components additionally export ingress.
 /// sources, capability providers, model providers, event sinks, context
 /// providers, and cognition. A plugin's role is described by the request
 /// schemas it declares in its manifest, not by a distinct interface.
@@ -77,6 +77,21 @@ world plugin {
   import writer;
   import http;
   import socket;
+  import credentials;
 
   export lifecycle;
+}
+
+/// Optional ingress callback. Transport input is transient; only the returned
+/// observations and state changes are committed. Empty long-poll responses do
+/// not produce log entries. Init restores the
+/// subscription; the source protocol must tolerate redelivery after restart.
+interface ingress {
+  use types.{json, error, ingress-outcome};
+  receive: func(input: json) -> result<ingress-outcome, error>;
+}
+
+world source {
+  include plugin;
+  export ingress;
 }

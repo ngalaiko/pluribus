@@ -18,7 +18,7 @@ Configuration:
 
 ```json
 {
-  "credential": "openrouter:personal",
+  "credentials": {"api-key": "openrouter:personal"},
   "models": [
     "anthropic/claude-sonnet-4.5",
     { "id": "openai/gpt-5.1", "features": ["vision", "reasoning"] }
@@ -35,7 +35,7 @@ Register the instance in `config.json` under `--data-dir`, then enroll the key. 
     "openrouter": {
       "package": "file:///path/to/pluribus-v2/target/plugins/openrouter",
       "config": {
-        "credential": "openrouter:personal",
+        "credentials": {"api-key": "openrouter:personal"},
         "models": [
           "anthropic/claude-sonnet-4.5"
         ]

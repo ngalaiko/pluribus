@@ -78,7 +78,7 @@ async fn transfer_is_bounded_by_the_grant() {
                 socket: AsyncFd::new(client).unwrap(),
                 remaining: Mutex::new(4),
                 writes: tokio::sync::Mutex::new(()),
-                deadline: Instant::now() + Duration::from_secs(2),
+                deadline: Some(Instant::now() + Duration::from_secs(2)),
             }),
         );
         peers.push(peer);
@@ -118,7 +118,7 @@ async fn receive_reports_peer_close_and_honours_cancellation() {
             socket: AsyncFd::new(client).unwrap(),
             remaining: Mutex::new(1024),
             writes: tokio::sync::Mutex::new(()),
-            deadline: Instant::now() + Duration::from_secs(2),
+            deadline: Some(Instant::now() + Duration::from_secs(2)),
         }),
     );
     assert!(matches!(
@@ -150,7 +150,7 @@ async fn idle_stream_does_not_block_another_stream() {
                 socket: AsyncFd::new(client).unwrap(),
                 remaining: Mutex::new(1024),
                 writes: tokio::sync::Mutex::new(()),
-                deadline: Instant::now() + Duration::from_secs(2),
+                deadline: Some(Instant::now() + Duration::from_secs(2)),
             }),
         );
         peers.push(peer);
@@ -194,7 +194,7 @@ async fn many_idle_streams_leave_the_executor_responsive() {
                 socket: AsyncFd::new(socket).unwrap(),
                 remaining: Mutex::new(1024),
                 writes: tokio::sync::Mutex::new(()),
-                deadline: Instant::now() + Duration::from_secs(2),
+                deadline: Some(Instant::now() + Duration::from_secs(2)),
             }),
         );
         peers.push(peer);
@@ -219,4 +219,34 @@ async fn many_idle_streams_leave_the_executor_responsive() {
         assert!(matches!(worker.await.unwrap(), Err(StreamError::Cancelled)));
     }
     eprintln!("ready stream latency with 127 idle streams: {elapsed:?}");
+}
+
+#[tokio::test]
+async fn subscription_waits_without_idle_deadlines_and_enforces_byte_budget() {
+    let (_dir, service) = service();
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    service.streams.lock().unwrap().insert(
+        "sub".into(),
+        Arc::new(Stream {
+            socket: AsyncFd::new(client).unwrap(),
+            remaining: Mutex::new(3),
+            writes: tokio::sync::Mutex::new(()),
+            deadline: None,
+        }),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), service.next("sub", 10))
+            .await
+            .is_err()
+    );
+    peer.write_all(b"abc").unwrap();
+    assert_eq!(service.next("sub", 10).await.unwrap().bytes, b"abc");
+    peer.write_all(b"d").unwrap();
+    assert_eq!(
+        service.next("sub", 10).await,
+        Err(StreamError::LimitExceeded)
+    );
+    service.close("sub");
+    assert!(service.streams.lock().unwrap().is_empty());
 }

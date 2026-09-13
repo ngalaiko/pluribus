@@ -664,7 +664,10 @@ async fn manifest_access_and_credentials_are_defaults_not_saved_overrides() {
             .get("config")
             .is_none()
     );
-    assert_eq!(instance.config["credential"], "echo:subscription");
+    assert_eq!(
+        instance.config["credentials"]["subscription"],
+        "echo:subscription"
+    );
     assert_eq!(
         instance.config["models"],
         serde_json::json!(["gpt-5.6-luna"])
@@ -759,7 +762,7 @@ async fn assembling_an_agent_needs_only_package_sources() {
             .any(|tool| tool["name"] == "telegram.reply")
     );
     assert_eq!(
-        resolved.plugin_instances["telegram"].config["credential_handle"],
+        resolved.plugin_instances["telegram"].config["credentials"]["bot-token"],
         "telegram:bot-token"
     );
     for instance in resolved.plugin_instances.values() {

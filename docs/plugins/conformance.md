@@ -21,8 +21,8 @@ A plugin conforms only when its package, component, runtime behavior, and upgrad
 - Actual Pluribus imports exactly equal `imports`.
 - No ambient WASI or unknown imports exist.
 - `lifecycle` is exported.
-- The only export is `pluribus:plugin/lifecycle@1.0.0`.
-- At least one of `provides`, `model_provider`, or `subscribes` is declared.
+- Exports are `lifecycle`, plus `ingress` for the `source` world.
+- Event consumers declare subscriptions; ingress sources declare emitted events.
 - Every type in `emits` is plugin-emittable or carries the `plugin.<id>.` prefix.
 - No unknown Pluribus role export exists.
 - Every descriptor and schema call succeeds within limits.

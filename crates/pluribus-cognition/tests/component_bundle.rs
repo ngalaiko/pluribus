@@ -221,7 +221,7 @@ fn settings(http: &Arc<Telegram>) -> BTreeMap<String, ComponentInstall> {
         .collect()
 }
 fn config() -> serde_json::Value {
-    json!({"credential_handle":"fixture","poll_timeout_seconds":1})
+    json!({"credentials": {"bot-token": "fixture"},"poll_timeout_seconds":1})
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn later_component_preflight_failure_leaves_no_initialization_or_registration() {
@@ -347,7 +347,7 @@ async fn component_cannot_reuse_a_sibling_host_grant() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelling_a_wait_keeps_the_provider_owned_by_the_agent() {
+async fn idle_subscription_does_not_block_agent_wait() {
     let (mut agent, _store, http) = setup().await;
     let _release = Release(http.clone());
     agent
@@ -355,12 +355,15 @@ async fn cancelling_a_wait_keeps_the_provider_owned_by_the_agent() {
         .await
         .unwrap();
     let waited = tokio::time::timeout(Duration::from_millis(50), agent.tick_wait(0)).await;
-    assert!(waited.is_err(), "fixture provider must remain blocked");
+    assert!(
+        waited.is_ok(),
+        "idle subscription must not block an agent pass"
+    );
     assert!(
         agent
             .instance_ids()
             .contains(&"telegram-1/receive".to_owned()),
-        "cancelled wait lost the provider"
+        "subscription lost its provider"
     );
     http.release();
     agent.tick_wait(0).await.unwrap();

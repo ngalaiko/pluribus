@@ -239,6 +239,9 @@ impl<P: ConstraintPolicy> Router<P> {
         }
         let wildcard = registration.subscriptions.whole_stream
             || event_types.iter().any(|pattern| pattern.contains('*'));
+        if !wildcard && event_types.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut after = checkpoint;
         let mut matched = Vec::new();
         while matched.len() < limit {
@@ -558,6 +561,86 @@ impl<P: ConstraintPolicy> Router<P> {
         request: &CommittedEvent,
     ) -> Result<(), RouterError> {
         self.attempt_event(request,"code.failed",json!({"requestEventId":request.event_id.as_str(),"sessionId":payload_field(request,"sessionId"),"reason":"job revision changed before cell admission"}),&format!("stale:{}",request.event_id.as_str())).await.map(|_|())
+    }
+
+    pub(crate) async fn cancel_attempt(&self, request: &CommittedEvent) -> Result<(), RouterError> {
+        let kind = match request.request.event_type.as_str() {
+            "capability.requested" => "capability.cancelled",
+            "model.requested" => "model.failed",
+            "code.evaluate-requested" | "code.resumed" => "code.failed",
+            _ => return Ok(()),
+        };
+        if self.result_for(&request.event_id).await?.is_some() {
+            return Ok(());
+        }
+        self.attempt_event(request, kind, json!({
+            "requestEventId":request.event_id.as_str(), "call_id":payload_field(request,"call_id"),
+            "sessionId":payload_field(request,"sessionId"), "code":"cancelled", "outcome":"unknown",
+            "reason":"activity cancelled; effects may have occurred; reconcile before retrying"
+        }), &format!("cancelled:{}",request.event_id.as_str())).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn fail_sessions(
+        &self,
+        provider: &str,
+        batch: &[CommittedEvent],
+    ) -> Result<(), RouterError> {
+        let mut pending = std::collections::BTreeMap::new();
+        let mut after = 0;
+        loop {
+            let page = self
+                .events
+                .query(
+                    &self.stream_id,
+                    &EventQuery {
+                        after_sequence: Some(after),
+                        event_types: vec![
+                            "code.yielded".into(),
+                            "code.completed".into(),
+                            "code.failed".into(),
+                        ],
+                        ..Default::default()
+                    },
+                    100,
+                )
+                .await
+                .map_err(|e| RouterError::Storage(e.to_string()))?;
+            if page.is_empty() {
+                break;
+            }
+            for event in page {
+                after = event.sequence;
+                let Some(session) = payload_field(&event, "sessionId") else {
+                    continue;
+                };
+                if event.request.event_type == "code.yielded" {
+                    if event.request.actor.id.as_str() == provider {
+                        pending.insert(session, event);
+                    }
+                } else {
+                    pending.remove(&session);
+                }
+            }
+        }
+        for event in batch {
+            if matches!(
+                event.request.event_type.as_str(),
+                "code.evaluate-requested" | "code.resumed"
+            ) {
+                pending.insert(
+                    payload_field(event, "sessionId").unwrap_or_else(|| "default".into()),
+                    event.clone(),
+                );
+            }
+        }
+        for (session, source) in pending {
+            self.attempt_event(&source, "code.failed", json!({
+                "requestEventId":source.event_id.as_str(), "sessionId":session,
+                "code":"outcome-unknown", "reason":"session was lost after a component trap; reconcile effects before retrying"
+            }), &format!("session-lost:{}", source.event_id.as_str())).await?;
+        }
+        Ok(())
     }
 
     /// Records admission before a provider can cross an effect boundary.

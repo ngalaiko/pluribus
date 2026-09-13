@@ -441,3 +441,39 @@ fn legacy_retirement_bounds_each_delivery() {
         + after.keys().filter(|key| !before.contains_key(*key)).count();
     assert!(changed <= 64, "retirement changed {changed} records");
 }
+
+#[test]
+fn amendment_closes_the_interrupted_tool_call() {
+    let mut e = Engine::default(); let c = config();
+    let first = observe(&mut e, &c, "one", json!({})).remove(0);
+    e.event(&c,"model","model.completed",&completion(first.payload["call_id"].as_str().unwrap(),json!([{"kind":"tool-call","name":"js","call_id":"blocked","arguments":{"code":"await capabilities.invoke('shell.execute',{});"}}])),None);
+    e.event(&c,"old-shell","capability.requested",&json!({"jobId":"one","revision":0,"capability":"shell.execute"}),None);
+    e.event(&c,"old-code","code.evaluate-requested",&json!({"jobId":"one","revision":0,"sessionId":"one"}),None);
+    e.tasks.get_mut("one").unwrap().pending=Some(json!({"request":"old-shell","yield":1}));
+    let classify=observe(&mut e,&c,"update",json!({"message":{"text":"also inspect deployment"}})).into_iter().find(|d|d.kind=="model.requested").unwrap();
+    let out=e.event(&c,"amend","model.completed",&completion(classify.payload["call_id"].as_str().unwrap(),json!([{"kind":"tool-call","name":"associate","call_id":"associate-update","arguments":{"action":"amend","jobId":"one"}}])),None);
+    let request=out.iter().find(|d| d.kind=="model.requested").unwrap();
+    let messages=request.payload["messages"].as_array().unwrap();
+    let result=messages.iter().flat_map(|m|m["content"].as_array().unwrap()).find(|x|x["kind"]=="tool-result" && x["call_id"]=="blocked");
+    assert!(result.is_some(),"amendment must close the pending model tool call");
+    assert_eq!(result.unwrap()["output"]["outcome"],"unknown");
+    let late=e.event(&c,"late","capability.completed",&json!({"requestEventId":"old-shell","output":{"exit_code":0}}),None);
+    assert!(!late.iter().any(|d| d.kind=="code.resumed"));
+    assert_eq!(e.jobs["one"].activities["old-shell"]["result"]["output"]["exit_code"],0);
+    let count=e.tasks["one"].messages.len();
+    e.event(&c,"late-code","code.completed",&json!({"sessionId":"one","requestEventId":"old-code","value":"late"}),None);
+    assert_eq!(e.tasks["one"].messages.len(),count,"late results must not alter the amended conversation");
+
+}
+
+#[test]
+fn malformed_tool_history_fails_locally_without_model_retry() {
+    let mut e = Engine::default(); let c=config();
+    let first=observe(&mut e,&c,"one",json!({})).remove(0);
+    e.event(&c,"model","model.completed",&completion(first.payload["call_id"].as_str().unwrap(),json!([{"kind":"tool-call","name":"js","call_id":"call","arguments":{"code":"return 1;"}}])),None);
+    e.tasks.get_mut("one").unwrap().messages.push(json!({"role":"user","content":[{"kind":"text","text":"interleaved"}]}));
+    let out=e.event(&c,"result","code.completed",&json!({"sessionId":"one","requestEventId":"request","value":1}),None);
+    assert!(!out.iter().any(|d|d.kind=="model.requested"));
+    assert_eq!(e.jobs["one"].status,"failed");
+    assert!(out.iter().any(|d|d.kind=="capability.requested" && d.payload["arguments"]["text"].as_str().is_some_and(|s|s.contains("tool"))));
+}

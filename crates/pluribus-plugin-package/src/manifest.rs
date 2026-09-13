@@ -47,7 +47,6 @@ pub struct ComponentManifest {
     /// continuation is a suspended call stack.
     #[serde(default)]
     pub pinned_session: bool,
-    pub config_pointer: String,
     #[serde(default)]
     pub requires: Vec<String>,
     #[serde(default)]
@@ -93,13 +92,14 @@ pub struct ModelProvider {
 #[serde(deny_unknown_fields)]
 pub struct CredentialDeclaration {
     #[serde(default)]
+    pub access: bool,
+    #[serde(default)]
     pub enrollment_origins: Vec<String>,
     #[serde(default)]
     pub components: Vec<String>,
     pub id: String,
     pub display_name: String,
     pub description: String,
-    pub config_pointer: String,
     pub input_schema: String,
     pub flow_schema: String,
     pub flow: String,

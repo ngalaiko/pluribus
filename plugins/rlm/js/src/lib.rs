@@ -1,5 +1,5 @@
 #![cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
-use boa_engine::{Context, Source};
+use boa_engine::{Context, JsString, JsValue, Source};
 use serde_json::Value;
 
 struct Hooks;
@@ -89,7 +89,7 @@ impl Environment {
                 .ok_or("context must be an object")?
                 .insert("recovered".into(), Value::Bool(true));
         }
-        self.eval(&format!("globalThis.context = {context};"))
+        self.set_data("context", &context)
     }
 
     fn restore(&mut self, checkpoint: &Value) -> Result<(), String> {
@@ -103,10 +103,18 @@ impl Environment {
         if encoded.len() > 32 * 1024 {
             return Err("checkpoint exceeds 32 KiB".into());
         }
-        self.eval(&format!(
-            "globalThis.state = {encoded}; globalThis.context.recovered = true;"
-        ))?;
+        self.set_data("state", &checkpoint["state"])?;
+        self.eval("globalThis.context.recovered = true;")?;
         self.recovered = true;
+        Ok(())
+    }
+
+    fn set_data(&mut self, name: &str, value: &Value) -> Result<(), String> {
+        let value = JsValue::from_json(value, &mut self.context).map_err(|e| e.to_string())?;
+        self.context
+            .global_object()
+            .set(JsString::from(name), value, true, &mut self.context)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -120,13 +128,21 @@ impl Environment {
     fn step(&mut self, method: &str, input: &str) -> Result<String, String> {
         let input = if method == "__start" {
             check_source(input)?;
-            serde_json::to_string(input).map_err(|e| e.to_string())?
+            JsValue::from(JsString::from(input))
         } else {
-            serde_json::from_str::<Value>(input)
-                .map_err(|e| e.to_string())?
-                .to_string()
+            let data: Value = serde_json::from_str(input).map_err(|e| e.to_string())?;
+            JsValue::from_json(&data, &mut self.context).map_err(|e| e.to_string())?
         };
-        self.eval(&format!("{method}({input});"))?;
+        let function = self
+            .context
+            .global_object()
+            .get(JsString::from(method), &mut self.context)
+            .map_err(|e| e.to_string())?;
+        function
+            .as_callable()
+            .ok_or("invalid environment method")?
+            .call(&JsValue::undefined(), &[input], &mut self.context)
+            .map_err(|e| e.to_string())?;
         self.context.run_jobs().map_err(|e| e.to_string())?;
         let result = self
             .context
@@ -425,6 +441,29 @@ mod tests {
         );
         assert_eq!(done["checkpoint"]["version"], 1);
         assert_eq!(done["checkpoint"]["state"]["answer"], 42);
+    }
+
+    #[test]
+    fn json_objects_preserve_proto_keys_as_data() {
+        let mut env = Environment::new(r#"{"__proto__":{"injected":true}}"#).unwrap();
+        let result = value(env.step("__start", "return {own:Object.hasOwn(context,'__proto__'), inherited:context.injected === true};").unwrap());
+        assert_eq!(
+            result["value"],
+            serde_json::json!({"own":true,"inherited":false})
+        );
+        let request = value(env.step("__start", "const x=await history.read({}); return {own:Object.hasOwn(x,'__proto__'), inherited:x.injected === true};").unwrap());
+        let result = value(
+            env.step(
+                "__resume",
+                &serde_json::json!({"id":request["id"],"value":{"__proto__":{"injected":true}}})
+                    .to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            result["value"],
+            serde_json::json!({"own":true,"inherited":false})
+        );
     }
 
     #[test]

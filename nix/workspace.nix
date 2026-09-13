@@ -46,6 +46,9 @@ rustPlatform.buildRustPackage {
       component "$plugin" "$plugin/main.wasm"
     done
 
+    component http http/listen.wasm
+    component github github/receive.wasm
+
     # The telegram plugin ships one component per role.
     component telegram-receive telegram/receive.wasm
     component telegram-send telegram/send.wasm
@@ -61,6 +64,7 @@ rustPlatform.buildRustPackage {
       component rlm-js rlm/js.wasm
     )
 
+    cargo build --locked --release -p pluribus-plugin-http --bin pluribus-http-listener
     cargo build --locked --release -p pluribus-cli
     cargo build --locked --release -p pluribus-plugin-shell --bin pluribus-shell-executor
     cargo build --locked --release -p pluribus-plugin-cli --bin pluribus-cli-bridge
@@ -73,7 +77,8 @@ rustPlatform.buildRustPackage {
     runHook preInstall
     install -Dm755 target/release/pluribus $out/bin/pluribus
     install -Dm755 -t $helpers/bin \
-      target/release/pluribus-shell-executor target/release/pluribus-cli-bridge
+      target/release/pluribus-shell-executor target/release/pluribus-cli-bridge \
+      target/release/pluribus-http-listener
     install -Dm755 target/release/pluribus-package $packager/bin/pluribus-package
     mkdir -p $components
     cp -R components/. $components/

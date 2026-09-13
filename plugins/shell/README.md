@@ -1,8 +1,8 @@
 # Shell
 
-`shell.execute` runs `/bin/sh -c` through an executor process under a separate workspace account. The component reaches it over its granted [byte stream](../../docs/plugins/stream.md) and receives no process, filesystem, environment, or credential access besides that one endpoint.
+`shell.execute` runs `/bin/sh -c` through an executor process under a separate workspace account. The component reaches it over its granted [byte stream](../../docs/plugins/stream.md) and explicitly granted credential exports.
 
-The plugin package now contains both the Wasm component and the executor binary in a single `Cargo.toml`.
+The plugin package contains both the Wasm component and the executor binary in a single `Cargo.toml`.
 
 Arguments: `command` and optional `timeout_ms` (default 30000, maximum 300000). Output: `stdout`, `stderr`, `exit_code`, and `truncated`. Output is capped at 1 MiB combined before UTF-8 decoding. Commands start in the configured workspace with a cleared environment, fixed PATH, and workspace HOME. Files persist between calls; shell state does not.
 
@@ -106,3 +106,28 @@ pluribus --data-dir /var/lib/pluribus-personal run --resume
 ```
 
 `stop` persists a STOP marker, halts further cognition, and signals active components. Shell cancellation closes the socket and kills the process group. Existing model/connector requests may take their configured timeout to return. `run --resume` clears the marker; use it only after the previous runner exits.
+
+## Credential environment
+
+Set the shell instance's `config`:
+
+```json
+{
+  "credential_exports": {
+    "GH_TOKEN": {
+      "credential": "github:personal",
+      "provider": "dev.pluribus.github",
+      "export": "installation-token"
+    }
+  }
+}
+```
+
+Shell Wasm resolves each binding through the core before connecting to the
+executor. The executor receives values over the existing socket and adds them
+to the command's cleared environment. Missing or expiring exports fail the
+request before execution. `HOME`, `PATH`, and `LANG` cannot be overridden.
+
+Bindings contain references only. Resolved values stay out of events and
+transport logs; commands can read them and must avoid printing them.
+The executor's `--path` controls where tools such as `gh` are found.

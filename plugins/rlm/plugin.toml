@@ -9,7 +9,6 @@ license = "MIT OR Apache-2.0"
 js = {}
 
 [components.cognition]
-config_pointer = ""
 requires = ["js"]
 world = "pluribus:plugin/plugin@1.0.0"
 component = "components/cognition.wasm"
@@ -25,8 +24,7 @@ world = "pluribus:plugin/plugin@1.0.0"
 component = "components/js.wasm"
 digest = "sha256:dev"
 imports = []
-config_schema = "schemas/js-config.schema.json"
-config_pointer = "/js"
+config_schema = "config.schema.json"
 subscribes = ["code.close-requested", "code.evaluate-requested", "code.resumed"]
 emits = ["code.closed", "code.yielded", "code.completed", "code.failed"]
 pinned_session = true

@@ -9,9 +9,9 @@ wit_bindgen::generate!({ path: "../../wit", world: "plugin" });
 
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::reader::Reader;
-use pluribus::plugin::socket;
 use pluribus::plugin::types::{Error, ErrorCode, Event, Payload, Proposal};
 use pluribus::plugin::writer::Writer;
+use pluribus::plugin::{credentials, socket};
 use protocol::{MAX_RESPONSE, MAX_TIMEOUT_MS, Request, Response, VERSION};
 use serde::Deserialize;
 use serde_json::json;
@@ -19,6 +19,10 @@ use serde_json::json;
 /// Bytes requested per read. The executor caps its own output.
 const READ_CHUNK: u32 = 64 * 1024;
 const CAPABILITY: &str = "shell.execute";
+
+thread_local! {
+    static EXPORTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 struct Shell;
 
@@ -35,7 +39,21 @@ fn default_timeout() -> u32 {
 }
 
 impl Guest for Shell {
-    fn init(_context: Context, _config: Vec<u8>) -> Result<Outcome, Error> {
+    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+        let config: serde_json::Value = serde_json::from_slice(&config)
+            .map_err(|_| failure(ErrorCode::InvalidArgument, "invalid shell config"))?;
+        let names: Vec<String> = config
+            .get("credential_exports")
+            .and_then(serde_json::Value::as_object)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        if names.len() > 64 || names.iter().any(|n| !protocol::valid_env_name(n)) {
+            return Err(failure(
+                ErrorCode::InvalidArgument,
+                "invalid environment binding",
+            ));
+        }
+        EXPORTS.with_borrow_mut(|exports| *exports = names);
         Ok(empty_outcome())
     }
 
@@ -105,7 +123,14 @@ fn run(context: &Context, event: &Event, payload: &serde_json::Value) -> Result<
         ));
     }
 
+    let env = EXPORTS.with_borrow(|names| {
+        names
+            .iter()
+            .map(|name| credentials::resolve_export(name).map(|value| (name.clone(), value)))
+            .collect::<Result<std::collections::BTreeMap<_, _>, Error>>()
+    })?;
     let request = Request {
+        env,
         version: VERSION,
         command: arguments.command,
         timeout_ms: arguments.timeout_ms,
@@ -130,6 +155,12 @@ fn run(context: &Context, event: &Event, payload: &serde_json::Value) -> Result<
         .map_err(|message| failure(ErrorCode::InvalidArgument, message))?;
     let mut bytes = serde_json::to_vec(&request)
         .map_err(|_| failure(ErrorCode::Internal, "cannot encode shell request"))?;
+    if bytes.len() >= protocol::MAX_REQUEST {
+        return Err(failure(
+            ErrorCode::ResourceExhausted,
+            "shell request exceeds limit",
+        ));
+    }
     bytes.push(b'\n');
 
     let _ = context;

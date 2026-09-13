@@ -49,7 +49,7 @@ Prompt injection is not solved by sandboxing. A model may still choose a harmful
 
 ## Secrets
 
-There is no secret-read import. Configuration contains opaque handles. Secret bytes remain in host-owned storage and may be used only by operations such as credential injection or HMAC verification.
+Configuration contains opaque handles. The `credentials` import grants explicitly declared components access only to their bound, package-scoped records. Such plugins may process secrets in Wasm; credentials remain outside ordinary state, events, and durable blobs. Export bindings grant read-only access to selected values through `resolve-export`, without raw-record access. Other plugins use host-side credential injection.
 
 Plugins MUST NOT:
 

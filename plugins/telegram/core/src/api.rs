@@ -22,11 +22,21 @@ pub fn call_json(
     credential: &str,
     timeout_ms: u32,
 ) -> Result<TelegramResponse, Error> {
+    let response = http::send(&request(method, payload, credential, timeout_ms)?)?;
+    decode_response(response.status, response.body)
+}
+
+pub fn request(
+    method: &str,
+    payload: &Value,
+    credential: &str,
+    timeout_ms: u32,
+) -> Result<Request, Error> {
     let body = put_blob(
         "application/json",
         &serde_json::to_vec(payload).map_err(internal)?,
     )?;
-    let response = http::send(&Request {
+    Ok(Request {
         method: "POST".into(),
         url: format!("{ORIGIN}/{CREDENTIAL_MARKER}/{method}"),
         headers: vec![Header {
@@ -36,8 +46,7 @@ pub fn call_json(
         body: Some(body),
         credential: Some(credential.into()),
         timeout_ms,
-    })?;
-    decode_response(response.status, response.body)
+    })
 }
 
 pub fn read_blob(blob: &BlobRef) -> Result<Vec<u8>, Error> {

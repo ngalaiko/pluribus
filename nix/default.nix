@@ -46,6 +46,15 @@ rec {
   inherit buildPluginPackage workspace;
 
   plugins = {
+    http = package {
+      name = "http";
+      components = [ "listen" ];
+      binaries = [ "${workspace.helpers}/bin/pluribus-http-listener" ];
+    };
+    github = package {
+      name = "github";
+      components = [ "receive" ];
+    };
     cli = package {
       name = "cli";
       components = [ "main" ];

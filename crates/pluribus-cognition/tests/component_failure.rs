@@ -192,7 +192,7 @@ async fn agent_with_limits(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_trapped_component_is_quarantined_instead_of_stopping_the_loop() {
+async fn a_trapped_session_component_fails_the_call_and_recovers() {
     let store = Arc::new(
         SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1)))
             .await
@@ -207,23 +207,30 @@ async fn a_trapped_component_is_quarantined_instead_of_stopping_the_loop() {
     )
     .await;
 
-    // Source a model could plausibly emit. The trap leaves no outcome to
-    // return, so only the host can report the death.
     append(
         &store,
         "code.evaluate-requested",
         &json!({
-            "context": {},
-            "source": format!(
-                "let total = 0; for (let i = 0; i < {OUTER}; i++) {{ for (let j = 0; j < {INNER}; j++) {{ total += j; }} }} return total;"
-            ),
+            "sessionId":"waiting", "context":{}, "source":"return await history.read({});"
         }),
-    ).await;
-
+    )
+    .await;
+    agent.tick_wait(1).await.unwrap();
+    append(&store, "code.evaluate-requested", &json!({
+        "sessionId":"crashing", "context":{},
+        "source":format!("await history.read({{}}); let total=0; for(let i=0;i<{OUTER};i++) {{ for(let j=0;j<{INNER};j++) {{ total+=j; }} }} return total;")
+    })).await;
+    agent.tick_wait(1).await.unwrap();
+    append(
+        &store,
+        "code.resumed",
+        &json!({"sessionId":"crashing", "response":{"id":1,"value":[]}}),
+    )
+    .await;
     agent
         .tick_wait(1)
         .await
-        .expect("a trapped component must not fail the pass");
+        .expect("a trap must not fail the pass");
 
     let failure = events(&store)
         .await
@@ -238,21 +245,36 @@ async fn a_trapped_component_is_quarantined_instead_of_stopping_the_loop() {
     );
 
     assert!(
-        !agent.instance_ids().contains(&"code-1".to_owned()),
-        "a trapped instance receives no further deliveries"
+        agent.instance_ids().contains(&"code-1".to_owned()),
+        "a fresh component accepts subsequent work"
     );
+    assert!(!agent.failed().contains_key("code-1"));
     assert!(
-        agent.failed().contains_key("code-1"),
-        "the reason stays queryable"
+        events(&store)
+            .await
+            .iter()
+            .any(|e| e.request.event_type == "code.failed"),
+        "the waiting caller receives a terminal failure"
     );
-
-    // The poisoned batch must not come back around.
-    let before = events(&store).await.len();
-    agent.tick_wait(2).await.expect("the loop keeps running");
-    assert_eq!(
-        events(&store).await.len(),
-        before,
-        "the batch that trapped is not redelivered"
+    let failures = events(&store)
+        .await
+        .into_iter()
+        .filter(|e| e.request.event_type == "code.failed")
+        .map(|e| payload(&e)["sessionId"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(failures, vec!["crashing", "waiting"]);
+    append(
+        &store,
+        "code.evaluate-requested",
+        &json!({"sessionId":"fresh", "context":{}, "source":"return 42;"}),
+    )
+    .await;
+    agent.tick_wait(2).await.unwrap();
+    assert!(
+        events(&store)
+            .await
+            .iter()
+            .any(|e| e.request.event_type == "code.completed" && payload(e)["value"] == 42)
     );
 }
 
@@ -315,5 +337,49 @@ async fn a_reported_failure_leaves_the_instance_installed() {
             .iter()
             .any(|event| event.request.event_type == "component.failed"),
         "component.failed marks a death, not a rejected delivery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_session_component_recovers_persisted_failure() {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1)))
+            .await
+            .unwrap(),
+    );
+    let mut agent = agent_with_js(&store).await;
+    append(
+        &store,
+        "code.evaluate-requested",
+        &json!({"sessionId":"lost", "context":{}, "source":"return await history.read({});"}),
+    )
+    .await;
+    agent.tick_wait(1).await.unwrap();
+    let source = events(&store)
+        .await
+        .into_iter()
+        .find(|e| e.request.event_type == "code.evaluate-requested")
+        .unwrap();
+    store.append(AppendRequest {
+        stream_id:StreamId::new("personal"), stream_kind:StreamKind::Agent,
+        observed_at_ms:None, event_type:"component.failed".into(), payload_schema:"pluribus.component-failed/1".into(),
+        payload:EventPayload::CanonicalJson(serde_json::to_vec(&json!({"instanceId":"code-1", "reason":"trap", "deliveredThrough":source.sequence})).unwrap()),
+        actor:PrincipalRef::new(PrincipalKind::Node,"personal"), authority_id:None, activity_id:None, correlation_id:None, causation_id:Some(source.event_id), deduplication_key:None,
+    }).await.unwrap();
+    drop(agent);
+    let mut agent = agent_with_js(&store).await;
+    append(
+        &store,
+        "code.evaluate-requested",
+        &json!({"sessionId":"fresh", "context":{}, "source":"return 42;"}),
+    )
+    .await;
+    agent.tick_wait(2).await.unwrap();
+    assert!(!agent.failed().contains_key("code-1"));
+    assert!(
+        events(&store)
+            .await
+            .iter()
+            .any(|e| e.request.event_type == "code.completed" && payload(e)["value"] == 42)
     );
 }

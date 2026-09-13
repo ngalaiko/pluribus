@@ -147,3 +147,7 @@ ABI `1.0.0` requires an exact match. The host may support several ABI versions s
 Minor versions may add a standard world; patch versions may clarify behavior or fix documentation. Neither changes an existing interface type; that requires a new major ABI package version.
 
 Plugin SemVer describes plugin behavior. Changing capability semantics, schemas, provider IDs, state interpretation, or required authority is breaking even when WIT is unchanged.
+
+Source components may additionally export `ingress.receive` in the `source`
+world. Core delivers transient subscription input there; only returned events
+and mutations are durable. See [subscriptions](stream.md#subscriptions).

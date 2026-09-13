@@ -136,10 +136,26 @@ mod component {
                             .unwrap_or(100)
                             .min(100)
                             .min(remaining);
+                        let event_types: Vec<String> = match args.get("eventTypes") {
+                            Some(filter) => match serde_json::from_value(filter.clone()) {
+                                Ok(types) => types,
+                                Err(_) => {
+                                    drafts.push(resume(
+                                        session,
+                                        &value["id"],
+                                        Err("eventTypes must be an array of strings".into()),
+                                        &event.event_id,
+                                    ));
+                                    continue;
+                                }
+                            },
+                            None => vec![],
+                        };
+                        let end = window.after.saturating_add(u64::from(window.limit));
                         let page = events::query(
                             &events::Filter {
                                 after_sequence: Some(start),
-                                event_types: vec![],
+                                event_types,
                                 correlation_id: None,
                                 activity_id: None,
                                 recorded_from_ms: None,
@@ -151,17 +167,26 @@ mod component {
                         let mut size = 0;
                         let mut after = start;
                         for item in page.events {
+                            if item.sequence > end {
+                                break;
+                            }
                             let payload = match item.payload {
                                 Payload::Json(bytes) => {
                                     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
                                 }
                                 Payload::Blob(_) => Value::Null,
                             };
-                            let row = json!({"eventId":item.event_id,"sequence":item.sequence,"type":item.event_type,"payload":payload});
-                            size += row.to_string().len();
-                            if size > 256 * 1024 {
+                            let mut row = json!({"eventId":item.event_id,"sequence":item.sequence,"type":item.event_type,"actorId":item.actor.id,"recordedAtMs":item.recorded_at_ms,"causationId":item.causation_id,"payload":payload});
+                            let bytes = row.to_string().len();
+                            if bytes > 63 * 1024 {
+                                row["payload"] = Value::Null;
+                                row["payloadOmitted"] = json!({"bytes":bytes});
+                            }
+                            let bytes = row.to_string().len();
+                            if size + bytes > 63 * 1024 {
                                 break;
                             }
+                            size += bytes;
                             after = item.sequence;
                             rows.push(row);
                         }

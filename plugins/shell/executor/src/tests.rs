@@ -9,7 +9,8 @@ use tempfile::TempDir;
 
 fn request(command: &str) -> Request {
     Request {
-        version: 1,
+        version: crate::protocol::VERSION,
+        env: Default::default(),
         command: command.into(),
         timeout_ms: 2000,
         invocation_id: "invocation".into(),
@@ -128,7 +129,7 @@ fn invalid_requests_and_shared_accounts_are_rejected() {
         assert!(request(command).validate().is_err());
     }
     let mut version = request("printf hello");
-    version.version = 2;
+    version.version = crate::protocol::VERSION + 1;
     assert!(version.validate().is_err());
     let own = rustix::process::geteuid().as_raw();
     assert!(validate_separation(own, false).is_err());
@@ -143,4 +144,56 @@ fn socket_peer_credentials_reject_another_uid() {
     let uid = rustix::process::geteuid().as_raw();
     verify_peer(&client, uid).unwrap();
     assert!(verify_peer(&client, uid + 1).is_err());
+}
+
+#[test]
+fn request_environment_reaches_child() {
+    let dir = TempDir::new().unwrap();
+    let mut request = request("test \"$GH_TOKEN\" = fixture-token");
+    request
+        .env
+        .insert("GH_TOKEN".into(), "fixture-token".into());
+    let response = executor::execute(&request, dir.path(), || false).unwrap();
+    assert!(matches!(
+        response,
+        Response::Completed {
+            exit_code: Some(0),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn invalid_environment_prevents_spawn() {
+    let dir = TempDir::new().unwrap();
+    for (name, value) in [
+        ("PATH", "/tmp"),
+        ("HOME", "/tmp"),
+        ("LANG", "x"),
+        ("1TOKEN", "x"),
+        ("TOKEN=bad", "x"),
+        ("TOKEN", "bad\0token"),
+    ] {
+        let mut request = request("touch started");
+        request.env.insert(name.into(), value.into());
+        assert!(executor::execute(&request, dir.path(), || false).is_err());
+        assert!(!dir.path().join("started").exists());
+    }
+    let mut request = request("touch started");
+    request
+        .env
+        .insert("TOKEN".into(), "x".repeat(16 * 1024 + 1));
+    assert!(executor::execute(&request, dir.path(), || false).is_err());
+    assert!(!dir.path().join("started").exists());
+}
+
+#[test]
+fn malformed_frames_do_not_echo_values() {
+    let dir = TempDir::new().unwrap();
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    client
+        .write_all(b"{\"version\":\"fixture-token\"}\n")
+        .unwrap();
+    let error = executor::handle(&mut server, dir.path()).unwrap_err();
+    assert!(!error.to_string().contains("fixture-token"));
 }

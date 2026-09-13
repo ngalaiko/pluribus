@@ -4,6 +4,8 @@
 //! import. A delivery's proposed events, state mutations, and cursor advance
 //! commit in a single transaction.
 
+mod subscription;
+
 #[cfg(test)]
 mod tests;
 
@@ -29,7 +31,9 @@ use wasmtime::component::{Component, HasSelf, Linker, Resource};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use bindings::exports::pluribus::plugin::lifecycle as guest;
-use bindings::pluribus::plugin::{blobs, events, http, reader, socket, state, types, writer};
+use bindings::pluribus::plugin::{
+    blobs, credentials, events, http, reader, socket, state, types, writer,
+};
 
 const MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const EPOCH_TICK: Duration = Duration::from_millis(10);
@@ -58,8 +62,8 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            memory_bytes: 128 * 1024 * 1024,
-            call_timeout: Duration::from_mins(3),
+            memory_bytes: 32 * 1024 * 1024,
+            call_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -103,6 +107,7 @@ pub struct Delivery {
 /// the runtime's defaults are a fallback rather than a shared budget.
 #[derive(Clone, Default)]
 pub struct PluginServices {
+    pub credentials: Option<CredentialAccess>,
     /// Default model for requests that omit a selection.
     pub model: Option<String>,
     /// Agent instructions supplied to model requests.
@@ -112,6 +117,59 @@ pub struct PluginServices {
     pub stream: Option<Arc<dyn StreamService>>,
     pub stream_grant: Option<StreamGrant>,
     pub limits: Option<RuntimeLimits>,
+}
+
+#[derive(Clone)]
+pub struct CredentialAccess {
+    pub store: Arc<dyn pluribus_core::PluginCredentialStore>,
+    pub provider: String,
+    pub handles: HashSet<String>,
+    pub exports: std::collections::BTreeMap<String, CredentialExport>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialExport {
+    pub credential: String,
+    pub provider: String,
+    pub export: String,
+}
+
+impl CredentialAccess {
+    pub async fn resolve_export(&self, binding: &str) -> Result<String, types::Error> {
+        let grant = self.exports.get(binding).ok_or_else(|| {
+            host_error(
+                types::ErrorCode::PermissionDenied,
+                "credential export not granted",
+            )
+        })?;
+        let unavailable = || {
+            host_error(
+                types::ErrorCode::Unavailable,
+                "credential export unavailable",
+            )
+        };
+        let bytes = self
+            .store
+            .read_plugin_credential(&SecretHandle::new(&grant.credential), &grant.provider)
+            .await
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        let doc: Value = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+        let export = &doc["exports"][&grant.export];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        if export["expires_at_ms"].as_i64().ok_or_else(unavailable)? <= now.saturating_add(30_000) {
+            return Err(unavailable());
+        }
+        export["value"]
+            .as_str()
+            .filter(|v| !v.is_empty() && !v.contains('\0'))
+            .map(str::to_owned)
+            .ok_or_else(unavailable)
+    }
 }
 
 /// What one committed delivery produced.
@@ -278,7 +336,7 @@ impl Runtime {
             ));
         }
         let manifest = package.manifest();
-        if manifest.world != ABI_WORLD {
+        if manifest.world != ABI_WORLD && manifest.world != "pluribus:plugin/source@1.0.0" {
             return Err(RuntimeError::new(format!(
                 "unsupported runtime world: {}",
                 manifest.world
@@ -309,6 +367,26 @@ impl Runtime {
         let component = runtime_io(move || Component::new(&engine, &bytes))
             .await?
             .map_err(|error| RuntimeError::new(format!("cannot compile component: {error}")))?;
+        let recipe = Arc::new(InstanceRecipe {
+            runtime: self.clone(),
+            component,
+            delivery,
+            services,
+            emits: manifest.emits.clone(),
+            pinned_session: manifest.pinned_session,
+        });
+        self.instantiate_recipe(recipe, config_bytes, limits).await
+    }
+
+    async fn instantiate_recipe(
+        &self,
+        recipe: Arc<InstanceRecipe>,
+        config_bytes: Vec<u8>,
+        limits: RuntimeLimits,
+    ) -> Result<PluginInstance, RuntimeError> {
+        let delivery = recipe.delivery.clone();
+        let services = recipe.services.clone();
+        let component = recipe.component.clone();
         let mut linker = Linker::new(&self.ticker.engine);
         bindings::Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|error| RuntimeError::new(format!("cannot link host imports: {error}")))?;
@@ -338,38 +416,71 @@ impl Runtime {
                 progress: self.progress.clone(),
             },
             services,
-            manifest.emits.clone(),
+            recipe.emits.clone(),
         );
         let mut store = Store::new(&self.ticker.engine, host);
         store.limiter(|state| &mut state.limits);
         prepare_call(&mut store, &limits);
-        let plugin = bindings::Plugin::instantiate_async(&mut store, &component, &linker)
+        let instance = linker
+            .instantiate_async(&mut store, &component)
             .await
             .map_err(|error| RuntimeError::new(format!("cannot instantiate component: {error}")))?;
+        let plugin = bindings::Plugin::new(&mut store, &instance)
+            .map_err(|error| RuntimeError::new(format!("cannot bind component: {error}")))?;
+        let ingress = instance
+            .get_export_index(&mut store, None, "pluribus:plugin/ingress@1.0.0")
+            .and_then(|interface| {
+                instance.get_export_index(&mut store, Some(&interface), "receive")
+            })
+            .map(|function| {
+                instance
+                    .get_typed_func::<(Vec<u8>,), (Result<types::IngressOutcome, types::Error>,)>(
+                        &mut store, function,
+                    )
+            })
+            .transpose()
+            .map_err(|e| RuntimeError::new(format!("invalid ingress export: {e}")))?;
+        store.data_mut().ingress_supported = ingress.is_some();
 
         Ok(PluginInstance {
             _ticker: Arc::clone(&self.ticker),
             limits,
             store,
             plugin,
+            ingress,
             cancellation: CancellationHandle(cancellation),
             instance_id,
             cursor,
             checkpoint,
             config: config_bytes,
             delivery_store: Arc::clone(&self.delivery_store),
-            pinned_session: manifest.pinned_session,
+            pinned_session: recipe.pinned_session,
             interrupted: false,
+            recipe,
         })
     }
 }
 
+struct InstanceRecipe {
+    runtime: Runtime,
+    component: Component,
+    delivery: Delivery,
+    services: PluginServices,
+    emits: Vec<String>,
+    pinned_session: bool,
+}
+
+type IngressFunction =
+    wasmtime::component::TypedFunc<(Vec<u8>,), (Result<types::IngressOutcome, types::Error>,)>;
+
 /// One instantiated plugin. Exported calls are serialized by ownership.
 pub struct PluginInstance {
+    recipe: Arc<InstanceRecipe>,
     _ticker: Arc<EpochTicker>,
     limits: RuntimeLimits,
     store: Store<HostState>,
     plugin: bindings::Plugin,
+    ingress: Option<IngressFunction>,
     cancellation: CancellationHandle,
     instance_id: String,
     cursor: CursorKey,
@@ -385,6 +496,7 @@ enum CommitPhase {
     Init,
     Handle,
     Stop,
+    Ingress([u8; 16]),
 }
 
 impl CommitPhase {
@@ -393,11 +505,27 @@ impl CommitPhase {
             Self::Handle => format!("{instance}:{checkpoint}:{ordinal}"),
             Self::Init => format!("{instance}:{checkpoint}:{ordinal}:init"),
             Self::Stop => format!("{instance}:{checkpoint}:{ordinal}:stop"),
+            Self::Ingress(id) => format!("{instance}:ingress:{id:02x?}:{ordinal}"),
         }
     }
 }
 
 impl PluginInstance {
+    /// Creates fresh linear memory using the original grants and configuration.
+    ///
+    /// # Errors
+    /// Returns cursor, linking, or instantiation failures.
+    pub async fn restart(&self) -> Result<Self, RuntimeError> {
+        self.recipe
+            .runtime
+            .instantiate_recipe(
+                self.recipe.clone(),
+                self.config.clone(),
+                self.limits.clone(),
+            )
+            .await
+    }
+
     /// Whether a dropped lifecycle future requires a fresh instance.
     #[must_use]
     pub fn requires_reinstantiation(&self) -> bool {
@@ -425,6 +553,72 @@ impl PluginInstance {
     #[must_use]
     pub fn checkpoint(&self) -> u64 {
         self.checkpoint
+    }
+
+    /// Whether a subscription has uncommitted input ready for its callback.
+    pub fn has_stream_input(&mut self) -> bool {
+        let host = self.store.data_mut();
+        if host.stream_input.is_none() {
+            host.stream_input = host
+                .subscription
+                .as_mut()
+                .and_then(|s| s.inbox.try_recv().ok());
+        }
+        host.stream_input.is_some()
+    }
+
+    /// Processes transient transport input. Only plugin outcomes enter the log.
+    ///
+    /// # Errors
+    /// Returns callback, transport, or commit failures.
+    pub async fn receive_input(&mut self, now_ms: i64) -> Result<Outcome, RuntimeError> {
+        self.begin_lifecycle()?;
+        let result = self.receive_input_inner(now_ms).await;
+        self.interrupted = false;
+        result
+    }
+
+    async fn receive_input_inner(&mut self, now_ms: i64) -> Result<Outcome, RuntimeError> {
+        let input = self
+            .store
+            .data()
+            .stream_input
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("no subscription input"))?;
+        let id = input.id;
+        let mut payload = input.payload.clone();
+        payload["receivedAtMs"] = Value::from(now_ms);
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let blob = input.blob.clone();
+        prepare_call(&mut self.store, &self.limits);
+        self.store.data_mut().ingress_call = true;
+        if let Some(blob) = blob {
+            self.store.data_mut().visible_blobs.insert(blob);
+        }
+        let function = self
+            .ingress
+            .ok_or_else(|| RuntimeError::new("missing receive export"))?;
+        let (outcome,) = function
+            .call_async(&mut self.store, (bytes,))
+            .await
+            .map_err(|e| RuntimeError::trap(format!("receive trapped: {e:#}")))?;
+        function
+            .post_return_async(&mut self.store)
+            .await
+            .map_err(|e| RuntimeError::trap(format!("receive post-return trapped: {e:#}")))?;
+        let outcome = outcome.map_err(|e| plugin_failure(&e))?;
+        let outcome = guest::Outcome {
+            events: outcome.events,
+            mutations: outcome.mutations,
+            checkpoint: None,
+        };
+        let result = self
+            .commit(&outcome, None, CommitPhase::Ingress(id))
+            .await?;
+        if let Some(input) = self.store.data_mut().stream_input.take() {
+            let _ = input.committed.send(());
+        }
+        Ok(result)
     }
 
     /// Calls `init` once, before any delivery.
@@ -485,7 +679,17 @@ impl PluginInstance {
             .first()
             .map_or(self.checkpoint, |event| event.sequence);
         let causation = (events.len() == 1).then(|| events[0].event_id.clone());
-        let wit_events = events.iter().map(wit_event).collect::<Vec<_>>();
+        let instance = &self.store.data().delivery.instance_id;
+        let wit_events = events
+            .iter()
+            .map(|event| {
+                let mut value = wit_event(event);
+                if !http_request_visible(event, instance) {
+                    value.payload = types::Payload::Json(b"{}".to_vec());
+                }
+                value
+            })
+            .collect::<Vec<_>>();
         let context = self.context();
         prepare_call(&mut self.store, &self.limits);
         let result = self
@@ -657,6 +861,8 @@ impl PluginInstance {
     }
 
     async fn stop_inner(&mut self, deadline_at_ms: i64) -> Result<Outcome, RuntimeError> {
+        self.store.data_mut().subscription = None;
+        self.store.data_mut().stream_input = None;
         let context = self.context();
         prepare_call(&mut self.store, &self.limits);
         let result = self
@@ -726,7 +932,14 @@ impl PluginInstance {
             .await
             .map_err(|error| RuntimeError::new(format!("cannot commit delivery: {error}")))?;
         self.checkpoint = receipt.checkpoint;
-        self.store.data().progress.notify_one();
+        let host = self.store.data_mut();
+        if matches!(phase, CommitPhase::Stop) {
+            host.subscription = None;
+        } else if let Some(request) = host.pending_subscription.take() {
+            host.subscription = None;
+            host.subscription = Some(subscription::Subscription::start(host, request));
+        }
+        host.progress.notify_one();
         Ok(Outcome {
             events: receipt.events,
             checkpoint: receipt.checkpoint,
@@ -737,8 +950,15 @@ impl PluginInstance {
 /// Arms the wall-clock ceiling for one call. The epoch ticker interrupts the
 /// guest when it runs out.
 fn prepare_call(store: &mut Store<HostState>, limits: &RuntimeLimits) {
+    store.data_mut().pending_subscription = None;
+    store.data_mut().ingress_call = false;
     let deadline = Instant::now() + limits.call_timeout;
     store.data_mut().call_deadline = Some(deadline);
+    store.data_mut().stream_deadline = store
+        .data()
+        .stream_grant
+        .as_ref()
+        .map(|grant| Instant::now() + Duration::from_millis(u64::from(grant.max_timeout_ms)));
     let cancelled = Arc::clone(&store.data().cancelled);
     store.epoch_deadline_callback(move |_| {
         if cancelled.load(Ordering::Acquire) {
@@ -790,6 +1010,7 @@ struct HostServices {
 }
 
 struct HostState {
+    credentials: Option<CredentialAccess>,
     identity: Option<String>,
     model: Option<String>,
     executor: tokio::runtime::Handle,
@@ -817,6 +1038,11 @@ struct HostState {
     readers: HashMap<u32, u32>,
     writers: HashMap<u32, u32>,
     handle_sequence: u32,
+    pending_subscription: Option<subscription::Request>,
+    stream_input: Option<subscription::Input>,
+    ingress_supported: bool,
+    ingress_call: bool,
+    subscription: Option<subscription::Subscription>,
 }
 
 /// One connection and the halves the guest still holds. Reader and writer
@@ -867,6 +1093,7 @@ impl HostState {
             .as_ref()
             .map(|grant| Instant::now() + Duration::from_millis(u64::from(grant.max_timeout_ms)));
         Self {
+            credentials: granted.credentials,
             model: granted.model,
             identity: granted.identity,
             executor: tokio::runtime::Handle::current(),
@@ -900,6 +1127,11 @@ impl HostState {
             readers: HashMap::new(),
             writers: HashMap::new(),
             handle_sequence: 0,
+            pending_subscription: None,
+            stream_input: None,
+            ingress_supported: false,
+            ingress_call: false,
+            subscription: None,
         }
     }
 
@@ -953,12 +1185,12 @@ impl HostState {
             .causation_id
             .as_ref()
             .map(|id| EventId::new(id.clone()))
-            .or(causation)
-            .ok_or_else(|| {
-                RuntimeError::new(
-                    "proposal needs an explicit causation ID when a batch carries several events",
-                )
-            })?;
+            .or(causation);
+        if causation_id.is_none() && !self.ingress_call {
+            return Err(RuntimeError::new(
+                "proposal needs an explicit causation ID when a batch carries several events",
+            ));
+        }
         let mut payload = core_payload(&proposal.payload).map_err(|error| {
             RuntimeError::new(format!("invalid proposal payload: {}", error.message))
         })?;
@@ -1012,7 +1244,7 @@ impl HostState {
             authority_id: Some(AuthorityId::new(self.delivery.authority_id.clone())),
             activity_id: Some(self.delivery.activity_id.clone()),
             correlation_id: Some(self.delivery.correlation_id.clone()),
-            causation_id: Some(causation_id),
+            causation_id,
             deduplication_key: proposal.idempotency_key.clone().or(derived_key),
         };
         self.registry
@@ -1023,6 +1255,90 @@ impl HostState {
 }
 
 impl types::Host for HostState {}
+
+impl credentials::Host for HostState {
+    async fn resolve_export(&mut self, binding: String) -> Result<String, types::Error> {
+        self.credentials
+            .as_ref()
+            .ok_or_else(|| {
+                host_error(
+                    types::ErrorCode::PermissionDenied,
+                    "credential export not granted",
+                )
+            })?
+            .resolve_export(&binding)
+            .await
+    }
+
+    async fn now_ms(&mut self) -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+    async fn get(&mut self, handle: String) -> Result<Option<Vec<u8>>, types::Error> {
+        let access = self.credential_access(&handle)?;
+        access
+            .store
+            .read_plugin_credential(&SecretHandle::new(handle), &access.provider)
+            .await
+            .map_err(|_| {
+                host_error(
+                    types::ErrorCode::Unavailable,
+                    "credential storage unavailable",
+                )
+            })
+    }
+    async fn compare_and_swap(
+        &mut self,
+        handle: String,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<bool, types::Error> {
+        let access = self.credential_access(&handle)?;
+        if value.len() > 1024 * 1024 || expected.as_ref().is_some_and(|v| v.len() > 1024 * 1024) {
+            return Err(host_error(
+                types::ErrorCode::InvalidArgument,
+                "credential record too large",
+            ));
+        }
+        access
+            .store
+            .replace_plugin_credential(
+                &SecretHandle::new(handle),
+                &access.provider,
+                expected,
+                value,
+            )
+            .await
+            .map_err(|_| {
+                host_error(
+                    types::ErrorCode::Unavailable,
+                    "credential storage unavailable",
+                )
+            })
+    }
+    async fn random_bytes(&mut self, length: u32) -> Result<Vec<u8>, types::Error> {
+        if length > 1024 {
+            return Err(host_error(
+                types::ErrorCode::InvalidArgument,
+                "random request too large",
+            ));
+        }
+        let mut bytes = vec![0; length as usize];
+        getrandom::fill(&mut bytes)
+            .map_err(|_| host_error(types::ErrorCode::Unavailable, "randomness unavailable"))?;
+        Ok(bytes)
+    }
+}
+impl HostState {
+    fn credential_access(&self, handle: &str) -> Result<&CredentialAccess, types::Error> {
+        self.credentials
+            .as_ref()
+            .filter(|a| a.handles.contains(handle))
+            .ok_or_else(|| host_error(types::ErrorCode::PermissionDenied, "credential not granted"))
+    }
+}
 
 impl events::Host for HostState {
     async fn append(&mut self, proposal: types::Proposal) -> Result<u64, types::Error> {
@@ -1067,6 +1383,7 @@ impl events::Host for HostState {
             .as_ref()
             .filter(|event| {
                 event.request.stream_id == StreamId::new(self.delivery.agent.id.clone())
+                    && http_request_visible(event, &self.delivery.instance_id)
             })
             .map(wit_event)
             .ok_or_else(|| host_error(types::ErrorCode::NotFound, "no such event"))
@@ -1101,7 +1418,11 @@ impl events::Host for HostState {
             event.sequence
         });
         Ok(events::Page {
-            events: events.iter().map(wit_event).collect(),
+            events: events
+                .iter()
+                .filter(|event| http_request_visible(event, &self.delivery.instance_id))
+                .map(wit_event)
+                .collect(),
             next_sequence,
         })
     }
@@ -1268,6 +1589,50 @@ impl blobs::Host for HostState {
 }
 
 impl http::Host for HostState {
+    async fn exchange(
+        &mut self,
+        request: http::InlineRequest,
+    ) -> Result<http::InlineResponse, types::Error> {
+        let mut grant = self.http_grant()?.clone();
+        grant.max_request_bytes = grant.max_request_bytes.min(1024 * 1024);
+        grant.max_response_bytes = grant.max_response_bytes.min(1024 * 1024);
+        let timeout = request.timeout_ms.min(self.call_budget()?);
+        let result = self
+            .http_wait(pluribus_host_http::exchange_inline(
+                &grant,
+                &request.method,
+                &request.url,
+                request
+                    .headers
+                    .into_iter()
+                    .map(|h| HttpHeader {
+                        name: h.name,
+                        value: h.value,
+                    })
+                    .collect(),
+                request.body,
+                timeout,
+            ))
+            .await?;
+        Ok(http::InlineResponse {
+            status: result.0,
+            body: result.1,
+        })
+    }
+
+    async fn subscribe(&mut self, request: http::Request) -> Result<(), types::Error> {
+        if !self.ingress_supported || self.replaying || self.cancelled.load(Ordering::Acquire) {
+            return Err(stream_denied());
+        }
+        self.http_service()?;
+        self.http_grant()?;
+        let timeout = request.timeout_ms.min(self.http_grant()?.max_timeout_ms);
+        let mut request = self.http_request(request)?;
+        request.timeout_ms = timeout;
+        self.pending_subscription = Some(subscription::Request::Http(request));
+        Ok(())
+    }
+
     async fn send(&mut self, request: http::Request) -> Result<http::Response, types::Error> {
         let request = self.http_request(request)?;
         let service = self.http_service()?;
@@ -1309,6 +1674,21 @@ impl http::Host for HostState {
 }
 
 impl socket::Host for HostState {
+    async fn subscribe(&mut self, request: Vec<u8>) -> Result<(), types::Error> {
+        let (_, grant) = self.stream_access()?;
+        if !self.ingress_supported || self.replaying || self.cancelled.load(Ordering::Acquire) {
+            return Err(stream_denied());
+        }
+        if request.len() as u64 > grant.max_bytes || request.len() > 32 * 1024 {
+            return Err(host_error(
+                types::ErrorCode::ResourceExhausted,
+                "subscription request exceeds limit",
+            ));
+        }
+        self.pending_subscription = Some(subscription::Request::Socket(request));
+        Ok(())
+    }
+
     async fn connect(
         &mut self,
     ) -> Result<(Resource<reader::Reader>, Resource<writer::Writer>), types::Error> {
@@ -1712,6 +2092,20 @@ fn validate_state_key(key: &str) -> Result<(), types::Error> {
     } else {
         Ok(())
     }
+}
+
+fn http_request_visible(event: &CommittedEvent, instance: &str) -> bool {
+    if event.request.event_type != "http.request.received"
+        || event.request.actor.id.as_str() == instance
+    {
+        return true;
+    }
+    let EventPayload::CanonicalJson(bytes) = &event.request.payload else {
+        return false;
+    };
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .is_some_and(|v| v["consumer"].as_str() == Some(instance))
 }
 
 fn wit_event(event: &CommittedEvent) -> types::Event {

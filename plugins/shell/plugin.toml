@@ -7,12 +7,12 @@ license = "MIT OR Apache-2.0"
 
 
 [components.main]
-config_pointer = ""
 config_schema = "config.schema.json"
 world = "pluribus:plugin/plugin@1.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
 imports = [
+  "pluribus:plugin/credentials@1.0.0",
   "pluribus:plugin/reader@1.0.0",
   "pluribus:plugin/socket@1.0.0",
   "pluribus:plugin/writer@1.0.0",

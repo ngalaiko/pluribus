@@ -165,6 +165,26 @@ interface http {
 
   send: func(request: request) -> result<response, error>;
 
+  /// Installs an HTTP long-poll subscription after commit. The source-world
+  /// receive callback gets {kind:"http",status,body} with a visible blob ref.
+  /// The host repeats the request after callback commit, until replaced.
+  /// Credentials and request limits are checked on every exchange.
+  subscribe: func(request: request) -> result<_, error>;
+
+  record inline-request {
+    method: string,
+    url: string,
+    headers: list<header>,
+    body: list<u8>,
+    timeout-ms: u32,
+  }
+  record inline-response {
+    status: u16,
+    body: list<u8>,
+  }
+  /// Bounded, policy-controlled exchange without persistent request or response blobs.
+  exchange: func(request: inline-request) -> result<inline-response, error>;
+
   /// Opens the response body as server-sent events. The plugin owns
   /// record framing; the host moves bytes. Read-only by construction.
   sse: func(request: request) -> result<reader, error>;
@@ -185,4 +205,23 @@ interface socket {
   /// transport and one byte budget; it closes when both are dropped.
   /// Denied outside a request delivery.
   connect: func() -> result<tuple<reader, writer>, error>;
+
+  /// Installs one instance-scoped subscription after a successful commit.
+  /// The host reconnects the granted endpoint and sends `request` on each
+  /// connection. The source-world receive callback gets {kind:"socket",bytes}
+  /// chunks of at most 32 KiB. Framing belongs to the plugin. Callback commits
+  /// provide backpressure. Idle connections emit no events.
+  /// Replacing the subscription or stopping the instance closes the connection.
+  /// Init must restore subscriptions after restart; replay cannot subscribe.
+  subscribe: func(request: list<u8>) -> result<_, error>;
+}
+
+/// Explicitly granted access to a plugin's own credential records.
+interface credentials {
+  use types.{error};
+  resolve-export: func(binding: string) -> result<string, error>;
+  get: func(handle: string) -> result<option<list<u8>>, error>;
+  compare-and-swap: func(handle: string, expected: option<list<u8>>, value: list<u8>) -> result<bool, error>;
+  now-ms: func() -> s64;
+  random-bytes: func(length: u32) -> result<list<u8>, error>;
 }

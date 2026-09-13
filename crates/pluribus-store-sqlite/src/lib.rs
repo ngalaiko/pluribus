@@ -252,7 +252,7 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
             let version: i64 = connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(storage)?;
-            if version != 8 {
+            if version != 9 {
                 return Err(storage("unsupported snapshot schema version"));
             }
             for query in [
@@ -260,6 +260,7 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                 "SELECT event_id,payload_json FROM events LIMIT 0",
                 "SELECT namespace,key,value FROM component_state LIMIT 0",
                 "SELECT stream_id,namespace,checkpoint FROM delivery_cursors LIMIT 0",
+                "SELECT handle FROM plugin_credentials LIMIT 0",
                 "SELECT handle FROM http_credentials LIMIT 0",
                 "SELECT handle FROM oauth_credentials LIMIT 0",
                 "SELECT handle,generation FROM credential_generations LIMIT 0",
@@ -399,7 +400,7 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                     "BEGIN IMMEDIATE; {DELIVERY_SCHEMA} PRAGMA user_version=6; COMMIT;"
                 ))
                 .map_err(storage)?,
-            6..=8 => {}
+            6..=9 => {}
             version => {
                 return Err(AppendError::Storage(format!(
                     "unsupported SQLite schema version: {version}"
@@ -419,6 +420,11 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                 connection.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE credential_lifecycle (sequence INTEGER PRIMARY KEY AUTOINCREMENT, handle TEXT NOT NULL, generation INTEGER NOT NULL, outcome TEXT NOT NULL, at_ms INTEGER NOT NULL, deadline_ms INTEGER);
                 PRAGMA user_version=8; COMMIT;").map_err(storage)?;
+            }
+            if version < 9 {
+                connection.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE plugin_credentials (handle TEXT NOT NULL, provider TEXT NOT NULL, value BLOB NOT NULL, PRIMARY KEY(handle,provider));
+                PRAGMA user_version=9; COMMIT;").map_err(storage)?;
             }
             Ok(())
         };
@@ -2499,6 +2505,80 @@ mod tests {
         remove_database(&path);
     }
 
+    #[tokio::test]
+    async fn plugin_secrets_survive_reopen_and_compare_atomically() {
+        use pluribus_core::PluginCredentialStore;
+        let path = temporary_database_path("plugin-secrets");
+        let handle = SecretHandle::new("app");
+        {
+            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .replace_plugin_credential(&handle, "plugin", None, b"private".to_vec())
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .replace_plugin_credential(&handle, "plugin", None, b"overwrite".to_vec())
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .replace_plugin_credential(
+                        &handle,
+                        "plugin",
+                        Some(b"wrong".to_vec()),
+                        b"overwrite".to_vec()
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .read_plugin_credential(&handle, "other")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        {
+            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .read_plugin_credential(&handle, "plugin")
+                    .await
+                    .unwrap(),
+                Some(b"private".to_vec())
+            );
+            assert!(
+                store
+                    .replace_plugin_credential(
+                        &handle,
+                        "plugin",
+                        Some(b"private".to_vec()),
+                        b"updated".to_vec()
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .retention_payloads()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|v| v.windows(7).any(|b| b == b"updated"))
+            );
+        }
+        remove_database(&path);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn path_only_credentials_survive_reopen() {
         let path = temporary_database_path("path-credential");
@@ -3235,7 +3315,7 @@ mod tests {
                     .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)))
                 .await
                 .unwrap(),
-            8
+            9
         );
         drop(store);
         remove_database(&path);
@@ -3245,7 +3325,7 @@ mod tests {
     async fn unknown_schema_version_is_rejected() {
         let path = temporary_database_path("future-schema");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 9).unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
         drop(connection);
 
         let result = SqliteEventStore::open(&path, Metadata::new("event", 1)).await;
@@ -3253,7 +3333,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(AppendError::Storage(message))
-                if message == "unsupported SQLite schema version: 9"
+                if message == "unsupported SQLite schema version: 10"
         ));
         remove_database(&path);
     }
@@ -3403,5 +3483,51 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+    }
+}
+
+#[async_trait::async_trait]
+impl<M: EventMetadataSource + 'static> pluribus_core::PluginCredentialStore
+    for SqliteEventStore<M>
+{
+    async fn read_plugin_credential(
+        &self,
+        handle: &SecretHandle,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, SecretError> {
+        let handle = handle.as_str().to_owned();
+        let provider = provider.to_owned();
+        database_call(
+            &self.connection,
+            move |db| {
+                db.query_row(
+                    "SELECT value FROM plugin_credentials WHERE handle=?1 AND provider=?2",
+                    params![handle, provider],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(secret_storage)
+            },
+            secret_storage,
+        )
+        .await
+    }
+    async fn replace_plugin_credential(
+        &self,
+        handle: &SecretHandle,
+        provider: &str,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<bool, SecretError> {
+        let handle = handle.as_str().to_owned();
+        let provider = provider.to_owned();
+        database_call(&self.connection, move |db| {
+            let changed = if let Some(previous) = expected {
+                db.execute("UPDATE plugin_credentials SET value=?3 WHERE handle=?1 AND provider=?2 AND value=?4", params![handle,provider,value,previous])
+            } else {
+                db.execute("INSERT OR IGNORE INTO plugin_credentials(handle,provider,value) VALUES (?1,?2,?3)", params![handle,provider,value])
+            }.map_err(secret_storage)?;
+            Ok(changed == 1)
+        }, secret_storage).await
     }
 }

@@ -6,10 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+getrandom.workspace = true
+pluribus-host-http = { path = "../pluribus-host-http" }
 tokio.workspace = true
 pluribus-core = { path = "../pluribus-core" }
 pluribus-plugin-bindings = { path = "../pluribus-plugin-bindings" }
 pluribus-plugin-package = { path = "../pluribus-plugin-package" }
+serde.workspace = true
 serde_json.workspace = true
 wasmtime.workspace = true
 

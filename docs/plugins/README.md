@@ -23,8 +23,8 @@ Its role is not an interface. A plugin that answers `capability.requested` for
 model provider. What it handles and what it may emit are declared in its
 manifest and enforced by the core.
 
-Everything a plugin decides or produces is an event. Bytes move over seven host
-imports: `events`, `state`, `blobs`, `reader`, `writer`, `http`, `socket`. An
+Everything a plugin decides or produces is an event. Bytes move over eight host
+imports: `events`, `state`, `blobs`, `reader`, `writer`, `http`, `socket`, `credentials`. An
 interface is a direct import only when it moves bytes, needs a secret, or must
 be polled mid-call.
 
@@ -79,8 +79,8 @@ ABI `1.0.0` defines:
 
 - one world, `plugin`;
 - one export, `lifecycle`;
-- seven host imports: `events`, `state`, `blobs`, `reader`, `writer`, `http`,
-  `socket`;
+- eight host imports: `events`, `state`, `blobs`, `reader`, `writer`, `http`,
+  `socket`, `credentials`;
 - the event vocabulary a plugin may consume and emit;
 - the manifest fields that declare what a plugin offers.
 

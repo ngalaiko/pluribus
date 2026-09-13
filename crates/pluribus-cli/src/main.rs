@@ -292,7 +292,7 @@ async fn example_configuration(data: &Paths) -> Result<(), Box<dyn Error>> {
     set(
         &mut config,
         "openrouter",
-        json!({"credential": "openrouter:personal", "models": [MODEL]}),
+        json!({"credentials": {"api-key": "openrouter:personal"}, "models": [MODEL]}),
     )?;
     set(&mut config, "rlm", json!({}))?;
     save_config(data, &config)?;
@@ -352,12 +352,92 @@ async fn enroll(
     let package = PluginPackage::load(&target.package)?;
     let descriptors = credential_descriptors(&package, &target)?;
     let descriptor = select_credential_descriptor(&descriptors)?;
-    let handle = target
-        .config
-        .pointer(&descriptor.config_pointer)
+    let handle = target.config["credentials"]
+        .get(&descriptor.id)
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or("credential config pointer does not resolve to a handle")?;
+        .ok_or("credential slot does not resolve to a handle")?;
+    if descriptor.flow_schema == "pluribus:credential/plugin@1" {
+        if adopt_recipe {
+            return Err("plugin credential recipe adoption is unsupported".into());
+        }
+        let [component] = descriptor.components.as_slice() else {
+            return Err("plugin enrollment requires one component".into());
+        };
+        if !jsonschema::is_valid(&descriptor.input_schema, &input) {
+            return Err("invalid credential input".into());
+        }
+        let enrollment_id = SystemMetadata::default()
+            .next_event_id()
+            .as_str()
+            .to_owned();
+        stage_plugin_enrollment(
+            database.as_ref(),
+            handle,
+            &package.manifest().id,
+            &enrollment_id,
+            input,
+        )
+        .await?;
+        let request = database
+            .append(pluribus_core::AppendRequest {
+                stream_id: StreamId::new(&config.agent_id),
+                stream_kind: pluribus_core::StreamKind::Agent,
+                observed_at_ms: None,
+                event_type: "credential.enrollment.requested".into(),
+                payload_schema: "pluribus.credential.enrollment.requested/1".into(),
+                payload: pluribus_core::EventPayload::CanonicalJson(serde_json::to_vec(
+                    &json!({"component":component.id.as_str(),"credential":handle,"enrollment":enrollment_id}),
+                )?),
+                actor: PrincipalRef::new(PrincipalKind::Node, "credential-cli"),
+                authority_id: None,
+                activity_id: None,
+                correlation_id: None,
+                causation_id: None,
+                deduplication_key: None,
+            })
+            .await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut after = request.sequence;
+        loop {
+            let replies = database
+                .query(
+                    &StreamId::new(&config.agent_id),
+                    &pluribus_core::EventQuery {
+                        after_sequence: Some(after),
+                        event_types: vec!["credential.enrollment.started".into()],
+                        correlation_id: None,
+                        activity_id: None,
+                        recorded_from_ms: None,
+                        recorded_to_ms: None,
+                    },
+                    100,
+                )
+                .await?;
+            for reply in replies {
+                after = reply.sequence;
+                if reply.request.actor != *component
+                    || reply.request.causation_id.as_ref() != Some(&request.event_id)
+                {
+                    continue;
+                }
+                let pluribus_core::EventPayload::CanonicalJson(bytes) = reply.request.payload
+                else {
+                    continue;
+                };
+                let value: Value = serde_json::from_slice(&bytes)?;
+                let url = value["url"]
+                    .as_str()
+                    .ok_or("plugin enrollment unavailable")?;
+                println!("Open {url}");
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("enrollment timed out; ensure pluribus run is active".into());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
     let policy = EnrollmentPolicy {
         components: descriptor.components.clone(),
         enrollment_origins: descriptor.enrollment_origins.clone(),
@@ -482,7 +562,7 @@ struct CredentialDescriptor {
     components: Vec<PrincipalRef>,
     injection_origins: Vec<String>,
     display_name: String,
-    config_pointer: String,
+    id: String,
     input_schema: Value,
     flow_schema: String,
     flow: Value,
@@ -550,7 +630,7 @@ fn credential_descriptors(
                     .collect(),
                 injection_origins,
                 display_name: declaration.display_name.clone(),
-                config_pointer: declaration.config_pointer.clone(),
+                id: declaration.id.clone(),
                 input_schema: package_json(package, &declaration.input_schema)?,
                 flow_schema: declaration.flow_schema.clone(),
                 flow: package_json(package, &declaration.flow)?,
@@ -597,6 +677,39 @@ fn select_credential_descriptor(
     }
 }
 
+async fn stage_plugin_enrollment(
+    store: &dyn pluribus_core::PluginCredentialStore,
+    handle: &str,
+    provider: &str,
+    id: &str,
+    input: Value,
+) -> Result<(), Box<dyn Error>> {
+    let handle = SecretHandle::new(handle);
+    let previous = store.read_plugin_credential(&handle, provider).await?;
+    let mut record: Value = previous
+        .as_ref()
+        .map(|v| serde_json::from_slice(v))
+        .transpose()
+        .map_err(|_| "invalid credential record")?
+        .unwrap_or_else(|| json!({}));
+    let object = record.as_object_mut().ok_or("invalid credential record")?;
+    object.insert(
+        "enrollment".into(),
+        json!({"id":id,"input":input,"expires_at_ms":system_now_ms()+60_000}),
+    );
+    let bytes = serde_json::to_vec(&record)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("credential record too large".into());
+    }
+    if !store
+        .replace_plugin_credential(&handle, provider, previous, bytes)
+        .await?
+    {
+        return Err("credential changed during enrollment; retry".into());
+    }
+    Ok(())
+}
+
 fn prompt_credential_input(schema: &Value) -> Result<Value, Box<dyn Error>> {
     let properties = schema
         .get("properties")
@@ -608,7 +721,13 @@ fn prompt_credential_input(schema: &Value) -> Result<Value, Box<dyn Error>> {
     }
     if !io::stdin().is_terminal() {
         if properties.len() != 1 {
-            return Err("multiple credential fields require an interactive terminal".into());
+            let mut bytes = String::new();
+            io::stdin().take(64 * 1024 + 1).read_to_string(&mut bytes)?;
+            if bytes.len() > 64 * 1024 {
+                return Err("credential input too large".into());
+            }
+            return serde_json::from_str(&bytes)
+                .map_err(|_| "invalid credential input JSON".into());
         }
         let name = properties.keys().next().expect("one property").clone();
         let mut value = String::new();
@@ -633,7 +752,23 @@ fn prompt_credential_input(schema: &Value) -> Result<Value, Box<dyn Error>> {
             .get("writeOnly")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let value = if secret {
+        let from_file = field
+            .get("x-input-file")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let value = if from_file {
+            let path = prompt_line(label, default)?;
+            let mut contents = String::new();
+            fs::File::open(path.trim())
+                .map_err(|_| "cannot open credential file")?
+                .take(64 * 1024 + 1)
+                .read_to_string(&mut contents)
+                .map_err(|_| "cannot read credential file")?;
+            if contents.len() > 64 * 1024 {
+                return Err("credential file too large".into());
+            }
+            contents
+        } else if secret {
             rpassword::prompt_password(format!("{label}: "))?
         } else {
             prompt_line(label, default)?
@@ -715,6 +850,7 @@ fn validate_instance_package(
 /// Supplies core capability and trust context to RLM instances.
 async fn refresh_cognition_tools(data: &Paths, config: &mut Config) -> Result<(), Box<dyn Error>> {
     let mut rlm_instances = Vec::new();
+    let mut components = Vec::new();
     let mut tools = Vec::new();
     let grants = config.trusted_grants()?;
     for (id, instance) in &config.plugin_instances {
@@ -723,6 +859,14 @@ async fn refresh_cognition_tools(data: &Paths, config: &mut Config) -> Result<()
             rlm_instances.push(id.clone());
         }
         for (name, component) in package.components() {
+            let manifest = component.manifest();
+            components.push(json!({
+                "instanceId":pluribus_plugin_package::component_id(id, name),
+                "plugin":package.manifest().id,
+                "subscribes":manifest.subscribes,
+                "emits":manifest.emits,
+                "capabilities":manifest.provides.iter().map(|p| p.capability.clone()).collect::<Vec<_>>()
+            }));
             for capability in &component.manifest().provides {
                 let schema: Value = serde_json::from_slice(&fs::read(
                     package.root().join(&capability.arguments_schema),
@@ -748,6 +892,7 @@ async fn refresh_cognition_tools(data: &Paths, config: &mut Config) -> Result<()
             .get_mut(&id)
             .expect("resolved RLM instance");
         instance.config["tools"] = json!(tools);
+        instance.config["components"] = json!(components);
     }
     Ok(())
 }
@@ -912,9 +1057,8 @@ async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
             component.manifest().subscribes_to_stream() && instance.components.contains_key(name)
         });
         for declaration in &package.manifest().credentials {
-            if let Some(handle) = instance
-                .config
-                .pointer(&declaration.config_pointer)
+            if let Some(handle) = instance.config["credentials"]
+                .get(&declaration.id)
                 .and_then(Value::as_str)
             {
                 credential_handles.insert(SecretHandle::new(handle));
@@ -924,8 +1068,29 @@ async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
         for (name, component) in package.components() {
             let access = &instance.components[name];
             let component_id = pluribus_plugin_package::component_id(id, name);
-            let projected = component.project_config(&instance.config)?;
             let services = PluginServices {
+                credentials: Some(pluribus_runtime_wasm::CredentialAccess {
+                    exports: serde_json::from_value(
+                        instance
+                            .config
+                            .get("credential_exports")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    )?,
+                    store: database.clone(),
+                    provider: package.manifest().id.clone(),
+                    handles: package
+                        .manifest()
+                        .credentials
+                        .iter()
+                        .filter(|c| c.access && c.components.contains(name))
+                        .filter_map(|c| {
+                            instance.config["credentials"][&c.id]
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .collect(),
+                }),
                 model: Some(config.model.clone()),
                 identity: Some(config.identity.clone()),
                 http: Some(Arc::clone(&http)),
@@ -945,7 +1110,8 @@ async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
                 .model_provider
                 .as_ref()
                 .map(|provider| {
-                    projected
+                    instance
+                        .config
                         .pointer(&provider.models_pointer)
                         .and_then(Value::as_array)
                         .map(|items| {
@@ -1144,6 +1310,43 @@ fn system_now_ns() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn plugin_enrollment_stages_input_in_private_storage() {
+        use pluribus_core::{InMemoryCredentialStore, PluginCredentialStore, SecretHandle};
+        let store = InMemoryCredentialStore::default();
+        let handle = SecretHandle::new("test");
+        store
+            .replace_plugin_credential(&handle, "provider", None, br#"{"app":{"id":7}}"#.to_vec())
+            .await
+            .unwrap();
+        super::stage_plugin_enrollment(
+            &store,
+            "test",
+            "provider",
+            "enrollment-1",
+            serde_json::json!({"private_key":"fixture-key"}),
+        )
+        .await
+        .unwrap();
+        let bytes = store
+            .read_plugin_credential(&handle, "provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["app"]["id"], 7);
+        assert_eq!(record["enrollment"]["id"], "enrollment-1");
+        assert_eq!(record["enrollment"]["input"]["private_key"], "fixture-key");
+        assert!(record["enrollment"]["expires_at_ms"].as_i64().unwrap() > super::system_now_ms());
+        assert!(
+            store
+                .read_plugin_credential(&handle, "other")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     use super::*;
     use clap::error::ErrorKind;
     use pluribus_cognition::AuthorityResolver;
@@ -1246,6 +1449,30 @@ mod tests {
             json!([{"conversationId":"chat:1"}])
         );
         assert!(react["parameters"].is_object());
+        let components = config.plugin_instances["rlm"].config["components"]
+            .as_array()
+            .unwrap();
+        let receive = components
+            .iter()
+            .find(|c| c["instanceId"] == "telegram-1/receive")
+            .unwrap();
+        assert!(
+            receive["emits"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("observation.received"))
+        );
+        assert!(
+            receive["subscribes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("timer.fired"))
+        );
+        assert!(
+            serde_json::to_value(&config.plugin_instances["rlm"]).unwrap()["config"]
+                .get("components")
+                .is_none()
+        );
     }
 
     #[test]

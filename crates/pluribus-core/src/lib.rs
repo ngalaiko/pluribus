@@ -35,8 +35,8 @@ pub use registry::{
 pub use secret::{
     AuthRecovery, CredentialLifecycle, CredentialStatus, CredentialStore, HttpCredential,
     InMemoryCredentialStore, OAuthCredential, OAuthCredentialSnapshot, OAuthCredentialStore,
-    ResolvedHttpCredential, SecretError, SecretHandle, SecretHeader, SecretPathPrefix,
-    credential_time_ms, validate_http_credential, validate_oauth_credential,
+    PluginCredentialStore, ResolvedHttpCredential, SecretError, SecretHandle, SecretHeader,
+    SecretPathPrefix, credential_time_ms, validate_http_credential, validate_oauth_credential,
     validate_recipe_adoption, validate_refresh_replacement,
 };
 pub use state::{

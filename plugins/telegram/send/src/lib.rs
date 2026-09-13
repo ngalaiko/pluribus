@@ -22,8 +22,15 @@ const CAPABILITIES: &[&str] = &[
 ];
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Credentials {
+    #[serde(rename = "bot-token")]
+    bot_token: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct Config {
-    credential_handle: String,
+    credentials: Credentials,
 }
 
 thread_local! {
@@ -208,7 +215,7 @@ fn send_media(arguments: &Value, config: &Config) -> Result<Value, Error> {
         method,
         &fields,
         &[(field.into(), file_name, blob.into())],
-        &config.credential_handle,
+        &config.credentials.bot_token,
     )?;
     Ok(response.value)
 }
@@ -250,11 +257,17 @@ fn send_media_group(arguments: &Value, config: &Config) -> Result<Value, Error> 
         "media".into(),
         serde_json::to_string(&media).map_err(internal)?,
     ));
-    Ok(multipart::call("sendMediaGroup", &fields, &files, &config.credential_handle)?.value)
+    Ok(multipart::call(
+        "sendMediaGroup",
+        &fields,
+        &files,
+        &config.credentials.bot_token,
+    )?
+    .value)
 }
 
 fn simple_call(method: &str, arguments: &Value, config: &Config) -> Result<Value, Error> {
-    Ok(telegram::api::call_json(method, arguments, &config.credential_handle, 60_000)?.value)
+    Ok(telegram::api::call_json(method, arguments, &config.credentials.bot_token, 60_000)?.value)
 }
 
 fn common_fields(arguments: &Value) -> Vec<(String, String)> {
@@ -310,6 +323,12 @@ fn internal(error: impl std::fmt::Display) -> Error {
     telegram::api::internal(error)
 }
 
+impl telegram::exports::pluribus::plugin::ingress::Guest for Telegram {
+    fn receive(_: Vec<u8>) -> Result<telegram::pluribus::plugin::types::IngressOutcome, Error> {
+        Err(telegram::api::invalid("sender has no ingress subscription"))
+    }
+}
+
 telegram::export!(Telegram);
 
 #[cfg(test)]
@@ -332,8 +351,11 @@ mod role_tests {
 
     #[test]
     fn role_initialization_and_irrelevant_deliveries() {
-        let init =
-            Telegram::init(context(), br#"{"credential_handle":"fixture"}"#.to_vec()).unwrap();
+        let init = Telegram::init(
+            context(),
+            br#"{"credentials":{"bot-token":"fixture"}}"#.to_vec(),
+        )
+        .unwrap();
         assert!(init.events.is_empty());
         let event = Event {
             event_id: "event".into(),

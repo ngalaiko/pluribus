@@ -326,6 +326,7 @@ impl Error for SecretError {}
 
 #[derive(Default)]
 struct MemoryCredentials {
+    plugin: HashMap<(SecretHandle, String), Vec<u8>>,
     http: HashMap<SecretHandle, HttpCredential>,
     oauth: HashMap<SecretHandle, OAuthCredentialSnapshot>,
     generations: HashMap<SecretHandle, u64>,
@@ -876,5 +877,58 @@ mod tests {
                 .await,
             Err(SecretError::PermissionDenied)
         );
+    }
+}
+
+/// Host-only opaque credential state. Guest state and event APIs cannot read it.
+#[async_trait::async_trait]
+pub trait PluginCredentialStore: Send + Sync {
+    async fn read_plugin_credential(
+        &self,
+        handle: &SecretHandle,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, SecretError>;
+    /// Atomically replaces the exact previous value; None requires absence.
+    async fn replace_plugin_credential(
+        &self,
+        handle: &SecretHandle,
+        provider: &str,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<bool, SecretError>;
+}
+
+#[async_trait::async_trait]
+impl PluginCredentialStore for InMemoryCredentialStore {
+    async fn read_plugin_credential(
+        &self,
+        handle: &SecretHandle,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, SecretError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| SecretError::Storage("credential lock poisoned".into()))?
+            .plugin
+            .get(&(handle.clone(), provider.to_owned()))
+            .cloned())
+    }
+    async fn replace_plugin_credential(
+        &self,
+        handle: &SecretHandle,
+        provider: &str,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<bool, SecretError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecretError::Storage("credential lock poisoned".into()))?;
+        let key = (handle.clone(), provider.to_owned());
+        if state.plugin.get(&key) != expected.as_ref() {
+            return Ok(false);
+        }
+        state.plugin.insert(key, value);
+        Ok(true)
     }
 }
