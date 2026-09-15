@@ -5,6 +5,7 @@ mod storage;
 #[cfg(target_arch = "wasm32")]
 mod component {
     use super::engine::{Config, Engine, resume};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::{Value, json};
     use std::cell::RefCell;
     wit_bindgen::generate!({path:"../../../wit",world:"plugin"});
@@ -81,9 +82,7 @@ mod component {
                                 if !key.starts_with("engine/record/") {
                                     return Err(failure("invalid checkpoint key"));
                                 }
-                                let bytes: Option<Vec<u8>> =
-                                    serde_json::from_value(mutation["value"].clone())
-                                        .map_err(failure)?;
+                                let bytes: Option<Vec<u8>> = decode_record(&mutation["value"])?;
                                 replay.insert(key.to_owned(), bytes);
                             }
                         }
@@ -259,8 +258,7 @@ mod component {
                     } else {
                         Mutation::Set(StateEntry {
                             key,
-                            value: serde_json::from_value(change["value"].clone())
-                                .map_err(failure)?,
+                            value: decode_record(&change["value"])?.unwrap(),
                         })
                     });
                 }
@@ -298,13 +296,19 @@ mod component {
             })
         }
     }
+    fn decode_record(value: &Value) -> Result<Option<Vec<u8>>, Error> {
+        match value {
+            Value::String(encoded) => STANDARD.decode(encoded).map(Some).map_err(failure),
+            _ => serde_json::from_value(value.clone()).map_err(failure),
+        }
+    }
     fn record_changes(before: &Engine, after: &Engine) -> Result<Vec<Value>, Error> {
         let old = super::storage::records(before).map_err(failure)?;
         let new = super::storage::records(after).map_err(failure)?;
         let mut changes = Vec::new();
         for (key, value) in &new {
             if old.get(key) != Some(value) {
-                changes.push(json!({"key":key,"value":value}));
+                changes.push(json!({"key":key,"value":STANDARD.encode(value)}));
             }
         }
         for key in old.keys().filter(|key| !new.contains_key(*key)) {

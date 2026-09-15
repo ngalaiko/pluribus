@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use common::*;
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::{
-    credentials, events,
+    credentials, events, state,
     types::{Error, Event},
 };
 use serde::Deserialize;
@@ -42,7 +42,9 @@ impl Guest for Github {
         }
         CONFIG.with_borrow_mut(|c| *c = Some(config));
         let mut out = empty(None);
-        out.events.push(timer(0, None));
+        let due = credentials::now_ms();
+        out.events.push(timer(due, None));
+        out.mutations.push(refresh_state(due));
         Ok(out)
     }
     fn handle(context: Context, input: Vec<Event>) -> Result<Outcome, Error> {
@@ -51,10 +53,19 @@ impl Guest for Github {
             .ok_or_else(|| error("GitHub not initialized"))?;
         let mut out = empty(input.last().map(|e| e.sequence));
         let mut staged = std::collections::BTreeMap::new();
+        let mut active = state::get("refresh/due")?
+            .map(|bytes| serde_json::from_slice::<i64>(&bytes))
+            .transpose()
+            .map_err(|_| error("invalid refresh state"))?;
         for event in &input {
             let now = credentials::now_ms();
             if event.event_type == "timer.fired" {
+                if !refresh_due(active, value(event)?["dueAtMs"].as_i64()) {
+                    continue;
+                }
                 let _ = auth::refresh(&config, now);
+                active = Some(now + 60000);
+                out.mutations.push(refresh_state(now + 60000));
                 out.events
                     .push(timer(now + 60000, Some(event.event_id.clone())));
                 continue;
@@ -290,3 +301,23 @@ mod tests {
     }
 }
 export!(Github);
+
+fn refresh_due(active: Option<i64>, fired: Option<i64>) -> bool {
+    active.is_some() && active == fired
+}
+#[cfg(test)]
+mod refresh_tests {
+    #[test]
+    fn stale_refresh_timers_do_not_start_another_chain() {
+        assert!(!super::refresh_due(Some(200), Some(100)));
+        assert!(!super::refresh_due(None, Some(100)));
+        assert!(super::refresh_due(Some(200), Some(200)));
+    }
+}
+
+fn refresh_state(due: i64) -> pluribus::plugin::types::Mutation {
+    pluribus::plugin::types::Mutation::Set(pluribus::plugin::types::StateEntry {
+        key: "refresh/due".into(),
+        value: serde_json::to_vec(&due).unwrap(),
+    })
+}

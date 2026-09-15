@@ -65,7 +65,7 @@ Model inputs use a shared [turn context](../../docs/rlm-turn-context.md), also a
 Persistence stores independent records in 128 KiB fragments under
 `engine/record/<field>/<key-hash>/<fragment>`. Version 1 `cognition.checkpoint`
 events carry `sequence` and up to four `mutations`, each containing a state `key`
-and byte-array `value` (null deletes). Fragments encode `{field,key,value}` JSON;
+and base64 `value` (null deletes). Replay also accepts legacy byte arrays. Fragments encode `{field,key,value}` JSON;
 the sequence record commits last. Replay applies deltas across delivery boundaries.
 Any other checkpoint version is rejected.
 

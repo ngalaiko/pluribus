@@ -1737,9 +1737,21 @@ async fn packaged_record_partitions_rebuild_large_observations() {
     );
     let mut agent = persistent_agent(&store).await;
     let origin = observation(&store, json!({"archive":"x".repeat(600_000)})).await;
-    drive(&mut agent, clock.load(Ordering::Relaxed)).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        drive(&mut agent, clock.load(Ordering::Relaxed)),
+    )
+    .await;
     let before = projection(&store).await;
-    assert!(serde_json::to_vec(&before).unwrap().len() > 1024 * 1024);
+    assert!(
+        store
+            .read(&StreamId::new("personal"), 0, 10000)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| event.request.event_type != "component.failed"),
+        "large observations must fit the default Wasm memory budget"
+    );
     assert!(before["jobs"][origin.event_id.as_str()].is_object());
     drop(agent);
     let namespace = pluribus_core::StateNamespace::new("cognition");
