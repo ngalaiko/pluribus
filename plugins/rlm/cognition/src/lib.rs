@@ -50,7 +50,8 @@ mod component {
                 load_engine(&std::collections::BTreeMap::new(), &batch)?
             };
             let mut replay = std::collections::BTreeMap::new();
-            let before = serde_json::to_vec(&engine).map_err(failure)?;
+            let before_sequence = engine.sequence;
+            let before = super::storage::records(&engine).map_err(failure)?;
             let mut drafts = vec![];
             for event in &batch {
                 let Payload::Json(bytes) = &event.payload else {
@@ -208,24 +209,32 @@ mod component {
             let replay_only = batch
                 .iter()
                 .all(|event| event.event_type == "cognition.checkpoint");
-            if !replay_only && serde_json::to_vec(&engine).map_err(failure)? != before {
-                let previous: Value = serde_json::from_slice(&before).map_err(failure)?;
-                let current = serde_json::to_value(&engine).map_err(failure)?;
-                for (field, kind, item) in [
-                    ("jobs", "cognition.job-updated", "job"),
-                    ("inbox", "cognition.observation-associated", "observation"),
-                ] {
-                    if let Some(records) = current[field].as_object() {
-                        for (id, record) in records {
-                            if previous[field][id] != *record {
-                                drafts.push(super::engine::Draft {
-                                    kind: kind.into(),
-                                    payload: json!({"version":1,(item):record}),
-                                    cause: batch.last().unwrap().event_id.clone(),
-                                });
-                            }
-                        }
-                    }
+            if !replay_only && engine.sequence != before_sequence {
+                for (id, job) in &engine.jobs {
+                    project_change(
+                        &before,
+                        "jobs",
+                        id,
+                        job,
+                        ("cognition.job-updated", "job"),
+                        &batch,
+                        &mut drafts,
+                    )?;
+                }
+                for (id, observation) in &engine.inbox {
+                    project_change(
+                        &before,
+                        if observation.value.is_null() {
+                            "observations_seen"
+                        } else {
+                            "inbox"
+                        },
+                        id,
+                        observation,
+                        ("cognition.observation-associated", "observation"),
+                        &batch,
+                        &mut drafts,
+                    )?;
                 }
                 engine.retire();
             }
@@ -242,8 +251,7 @@ mod component {
                 }
             }
             if !replay_only {
-                let previous: Engine = serde_json::from_slice(&before).map_err(failure)?;
-                let changes = record_changes(&previous, &engine)?;
+                let changes = record_changes(&before, &engine)?;
                 for group in changes.chunks(4) {
                     drafts.push(super::engine::Draft {
                         kind: "cognition.checkpoint".into(),
@@ -302,8 +310,33 @@ mod component {
             _ => serde_json::from_value(value.clone()).map_err(failure),
         }
     }
-    fn record_changes(before: &Engine, after: &Engine) -> Result<Vec<Value>, Error> {
-        let old = super::storage::records(before).map_err(failure)?;
+    fn project_change(
+        before: &std::collections::BTreeMap<String, Vec<u8>>,
+        field: &str,
+        id: &str,
+        value: &impl serde::Serialize,
+        (kind, item): (&str, &str),
+        batch: &[Event],
+        drafts: &mut Vec<super::engine::Draft>,
+    ) -> Result<(), Error> {
+        let mut record = std::collections::BTreeMap::new();
+        super::storage::insert_record(&mut record, field, id, value).map_err(failure)?;
+        if record
+            .iter()
+            .any(|(key, bytes)| before.get(key) != Some(bytes))
+        {
+            drafts.push(super::engine::Draft {
+                kind: kind.into(),
+                payload: json!({"version":1,(item):value}),
+                cause: batch.last().unwrap().event_id.clone(),
+            });
+        }
+        Ok(())
+    }
+    fn record_changes(
+        old: &std::collections::BTreeMap<String, Vec<u8>>,
+        after: &Engine,
+    ) -> Result<Vec<Value>, Error> {
         let new = super::storage::records(after).map_err(failure)?;
         let mut changes = Vec::new();
         for (key, value) in &new {

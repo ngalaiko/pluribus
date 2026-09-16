@@ -85,42 +85,25 @@ pub fn record_prefix(field: &str, key: &str) -> String {
 pub fn records(
     engine: &Engine,
 ) -> Result<std::collections::BTreeMap<String, Vec<u8>>, serde_json::Error> {
-    let value = serde_json::to_value(engine)?;
-    let mut records = std::collections::BTreeMap::new();
-    for (field, value) in value.as_object().unwrap() {
-        let entries: Vec<(String, Value)> = if field == "seen_results" {
-            value
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|key| (key.as_str().unwrap().to_owned(), Value::Bool(true)))
-                .collect()
-        } else if let Some(values) = value.as_object() {
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        } else {
-            vec![(String::new(), value.clone())]
-        };
-        for (key, value) in entries {
-            let field = if field == "inbox" && value["value"].is_null() {
-                "observations_seen"
-            } else {
-                field.as_str()
-            };
-            let prefix = record_prefix(field, &key);
-            let record = Record {
-                field: field.into(),
-                key,
-                value,
-            };
-            for (index, part) in serde_json::to_vec(&record)?.chunks(CHUNK_BYTES).enumerate() {
-                records.insert(format!("{prefix}{index:08}"), part.to_vec());
-            }
-        }
+    engine.records()
+}
+
+pub fn insert_record(
+    records: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    field: &str,
+    key: &str,
+    value: &impl Serialize,
+) -> Result<(), serde_json::Error> {
+    let prefix = record_prefix(field, key);
+    let record = Record {
+        field: field.into(),
+        key: key.into(),
+        value: serde_json::to_value(value)?,
+    };
+    for (index, part) in serde_json::to_vec(&record)?.chunks(CHUNK_BYTES).enumerate() {
+        records.insert(format!("{prefix}{index:08}"), part.to_vec());
     }
-    Ok(records)
+    Ok(())
 }
 
 pub fn apply_record(engine: &mut Value, record: Record) {

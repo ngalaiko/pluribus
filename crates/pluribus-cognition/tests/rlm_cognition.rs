@@ -1780,6 +1780,41 @@ async fn packaged_record_partitions_rebuild_large_observations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packaged_concurrent_jobs_fit_default_memory_limit() {
+    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1), clock.clone()))
+            .await
+            .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    for chat in 0..8 {
+        let incoming = observation(
+            &store,
+            json!({"conversationId":format!("chat:{chat}"),"message":{"chat":{"id":chat},"text":"work"},"archive":(0..1500).map(|id| json!({"id":id,"status":"completed","usage":{"input_tokens":100,"output_tokens":10}})).collect::<Vec<_>>()}),
+        ).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            drive(&mut agent, clock.load(Ordering::Relaxed)),
+        )
+        .await;
+        assert!(
+            projection(&store).await["jobs"][incoming.event_id.as_str()].is_object(),
+            "job {chat} must be persisted within the default Wasm memory budget"
+        );
+        let failures: Vec<_> = store
+            .read(&StreamId::new("personal"), 0, 10000)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.request.event_type == "component.failed")
+            .map(|event| payload(&event))
+            .collect();
+        assert!(failures.is_empty(), "job {chat}: {failures:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packaged_observation_burst_stays_within_mutation_limits() {
     let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
     let store = Arc::new(

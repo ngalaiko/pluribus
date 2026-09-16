@@ -351,6 +351,37 @@ fn unresolved(activity: &Value) -> bool {
 }
 
 impl Engine {
+    pub fn records(&self) -> Result<BTreeMap<String, Vec<u8>>, serde_json::Error> {
+        use crate::storage::insert_record;
+        let mut records = BTreeMap::new();
+        macro_rules! map {
+            ($field:ident) => {
+                for (key, value) in &self.$field {
+                    insert_record(&mut records, stringify!($field), key, value)?;
+                }
+            };
+        }
+        map!(jobs);
+        map!(tasks);
+        map!(calls);
+        map!(budgets);
+        for (key, value) in &self.inbox {
+            let field = if value.value.is_null() {
+                "observations_seen"
+            } else {
+                "inbox"
+            };
+            insert_record(&mut records, field, key, value)?;
+        }
+        for key in &self.seen_results {
+            insert_record(&mut records, "seen_results", key, &true)?;
+        }
+        insert_record(&mut records, "queue", "", &self.queue)?;
+        insert_record(&mut records, "now_ms", "", &self.now_ms)?;
+        insert_record(&mut records, "sequence", "", &self.sequence)?;
+        Ok(records)
+    }
+
     pub fn retire(&mut self) {
         let mut trimmed_jobs = 0;
         let mut source_budget = 8;
