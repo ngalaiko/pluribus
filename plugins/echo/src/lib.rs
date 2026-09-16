@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-wit_bindgen::generate!({
+wit_bindgen::generate!({ generate_all,
     path: "../../wit",
     world: "plugin",
 });
@@ -17,17 +17,26 @@ struct Echo;
 const CAPABILITY: &str = "system.echo";
 const COUNT_KEY: &str = "invocations";
 
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+
+fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let config: serde_json::Value = serde_json::from_slice(&config)
+        .map_err(|error| invalid_argument(format!("invalid configuration: {error}")))?;
+    if !config.is_object() {
+        return Err(invalid_argument("configuration must be an object"));
+    }
+    Ok(empty_outcome())
+}
+
 impl Guest for Echo {
-    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let config: serde_json::Value = serde_json::from_slice(&config)
-            .map_err(|error| invalid_argument(format!("invalid configuration: {error}")))?;
-        if !config.is_object() {
-            return Err(invalid_argument("configuration must be an object"));
-        }
-        Ok(empty_outcome())
+    async fn run(context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        serve::<Self>(context).await
     }
 
-    fn handle(context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         let mut count = stored_count()?;
         let mut proposals = Vec::new();
         let mut checkpoint = None;

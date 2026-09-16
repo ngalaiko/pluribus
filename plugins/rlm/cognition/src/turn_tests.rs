@@ -255,3 +255,13 @@ fn router_never_receives_js_only_references() {
     task.context["routing"] = json!({"observation":{"text":"Which one?"},"jobs":[{"objective":"x".repeat(30000)}],"recentClarifications":[]});
     assert!(turn_context(task, 0)["jobs"].is_array());
 }
+
+#[test]
+fn history_uses_conversation_identity_without_provider_thread_fields() {
+    let c = config();
+    let mut e = Engine::default();
+    let first = observe(&mut e, &c, "one", json!({"message":{"text":"previous", "message_thread_id":1}})).remove(0);
+    answer(&mut e, &c, &first, r#"{"transition":"complete","reply":"done"}"#);
+    let next = observe(&mut e, &c, "two", json!({"message":{"text":"next", "message_thread_id":2}})).remove(0);
+    assert_eq!(turn(&next)["recentConversation"]["entries"][0]["message"], "previous");
+}

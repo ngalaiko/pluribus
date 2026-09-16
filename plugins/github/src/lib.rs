@@ -1,5 +1,5 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-wit_bindgen::generate!({path:"../../wit",world:"plugin"});
+wit_bindgen::generate!({ generate_all,path:"../../wit",world:"plugin"});
 mod auth;
 #[allow(dead_code)]
 mod common;
@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use common::*;
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::{
-    credentials, events, state,
+    events, state,
     types::{Error, Event},
 };
 use serde::Deserialize;
@@ -28,26 +28,36 @@ struct Config {
 }
 thread_local! {static CONFIG:std::cell::RefCell<Option<Config>>=const{std::cell::RefCell::new(None)};}
 struct Github;
-impl Guest for Github {
-    fn init(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let config: Config =
-            serde_json::from_slice(&config).map_err(|_| error("invalid GitHub config"))?;
-        if config.owner.is_empty()
-            || !config
-                .owner
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            return Err(error("invalid GitHub configuration"));
-        }
-        CONFIG.with_borrow_mut(|c| *c = Some(config));
-        let mut out = empty(None);
-        let due = credentials::now_ms();
-        out.events.push(timer(due, None));
-        out.mutations.push(refresh_state(due));
-        Ok(out)
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+
+fn setup(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let config: Config =
+        serde_json::from_slice(&config).map_err(|_| error("invalid GitHub config"))?;
+    if config.owner.is_empty()
+        || !config
+            .owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(error("invalid GitHub configuration"));
     }
-    fn handle(context: Context, input: Vec<Event>) -> Result<Outcome, Error> {
+    CONFIG.with_borrow_mut(|c| *c = Some(config));
+    let mut out = empty(None);
+    let due = now_ms();
+    out.events.push(timer(due, None));
+    out.mutations.push(refresh_state(due));
+    Ok(out)
+}
+
+impl Guest for Github {
+    async fn run(context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        serve::<Self>(context).await
+    }
+
+    async fn handle(context: Context, input: Vec<Event>) -> Result<Outcome, Error> {
         let config = CONFIG
             .with_borrow(|c| c.clone())
             .ok_or_else(|| error("GitHub not initialized"))?;
@@ -58,7 +68,7 @@ impl Guest for Github {
             .transpose()
             .map_err(|_| error("invalid refresh state"))?;
         for event in &input {
-            let now = credentials::now_ms();
+            let now = now_ms();
             if event.event_type == "timer.fired" {
                 if !refresh_due(active, value(event)?["dueAtMs"].as_i64()) {
                     continue;
@@ -321,3 +331,11 @@ fn refresh_state(due: i64) -> pluribus::plugin::types::Mutation {
         value: serde_json::to_vec(&due).unwrap(),
     })
 }
+
+fn now_ms() -> i64 {
+    let t = wasi::clocks::system_clock::now();
+    t.seconds * 1000 + i64::from(t.nanoseconds / 1_000_000)
+}
+
+#[path = "../../shared/http.rs"]
+pub mod http;

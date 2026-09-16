@@ -39,18 +39,28 @@ thread_local! {
 
 struct Telegram;
 
+use telegram::{exports, pluribus};
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../shared/run.rs"));
+
+fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let parsed = parse_config(&config)?;
+    CONFIG.with(|slot| slot.store(parsed));
+    Ok(Outcome {
+        events: Vec::new(),
+        mutations: Vec::new(),
+        checkpoint: None,
+    })
+}
+
 impl Guest for Telegram {
-    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let parsed = parse_config(&config)?;
-        CONFIG.with(|slot| slot.store(parsed));
-        Ok(Outcome {
-            events: Vec::new(),
-            mutations: Vec::new(),
-            checkpoint: None,
-        })
+    async fn run(context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        telegram::pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        serve::<Self>(context).await
     }
 
-    fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         let config = CONFIG.with(Slot::load)?;
         let mut proposals = Vec::new();
         let mut checkpoint = None;
@@ -323,12 +333,6 @@ fn internal(error: impl std::fmt::Display) -> Error {
     telegram::api::internal(error)
 }
 
-impl telegram::exports::pluribus::plugin::ingress::Guest for Telegram {
-    fn receive(_: Vec<u8>) -> Result<telegram::pluribus::plugin::types::IngressOutcome, Error> {
-        Err(telegram::api::invalid("sender has no ingress subscription"))
-    }
-}
-
 telegram::export!(Telegram);
 
 #[cfg(test)]
@@ -351,7 +355,7 @@ mod role_tests {
 
     #[test]
     fn role_initialization_and_irrelevant_deliveries() {
-        let init = Telegram::init(
+        let init = setup(
             context(),
             br#"{"credentials":{"bot-token":"fixture"}}"#.to_vec(),
         )
@@ -373,7 +377,10 @@ mod role_tests {
             correlation_id: None,
             causation_id: None,
         };
-        let outcome = Telegram::handle(context(), vec![event]).unwrap();
+        let outcome =
+            futures_util::FutureExt::now_or_never(Telegram::handle(context(), vec![event]))
+                .unwrap()
+                .unwrap();
         assert!(outcome.events.is_empty());
         assert!(outcome.mutations.is_empty());
         assert_eq!(outcome.checkpoint, Some(1));

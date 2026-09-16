@@ -6,7 +6,7 @@ The envelope is rebuilt from current state before admission to the model. Each J
 
 | Role | Immediate context |
 | --- | --- |
-| Root | Current message and observation, source ID, job progress, capability schemas and configured constraints, recent same-sender/chat/thread exchanges, checkpoint. |
+| Root | Current message and observation, source ID, job progress, capability schemas and configured constraints, recent same-sender/conversation exchanges, checkpoint. |
 | Router | Incoming text, eligible jobs, outstanding clarification questions. |
 | Child | Question, supplied data or delegated history range, checkpoint; no root capability catalog. |
 

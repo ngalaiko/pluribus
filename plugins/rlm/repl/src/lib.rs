@@ -163,7 +163,7 @@ impl Environment {
 mod component {
     use super::*;
     use std::cell::RefCell;
-    wit_bindgen::generate!({path: "../../../wit", world: "plugin"});
+    wit_bindgen::generate!({ generate_all,path: "../../../wit", world: "plugin"});
     use exports::pluribus::plugin::lifecycle::{Context as CallContext, Guest, Outcome};
     use pluribus::plugin::types::{Error, ErrorCode, Event, Payload, Proposal};
     use serde_json::json;
@@ -175,12 +175,24 @@ mod component {
 
     struct Code;
 
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../shared/run.rs"));
+
+    fn setup(_context: CallContext, _config: Vec<u8>) -> Result<Outcome, Error> {
+        Ok(empty())
+    }
+
     impl Guest for Code {
-        fn init(_context: CallContext, _config: Vec<u8>) -> Result<Outcome, Error> {
-            Ok(empty())
+        async fn run(
+            context: exports::pluribus::plugin::lifecycle::Context,
+            config: Vec<u8>,
+        ) -> Result<(), Error> {
+            let outcome = setup(context.clone(), config)?;
+            pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+            serve::<Self>(context).await
         }
 
-        fn handle(_context: CallContext, events: Vec<Event>) -> Result<Outcome, Error> {
+        async fn handle(_context: CallContext, events: Vec<Event>) -> Result<Outcome, Error> {
             let mut proposals = Vec::new();
             let mut checkpoint = None;
 
@@ -345,7 +357,7 @@ mod component {
     ) -> Result<Proposal, Error> {
         Ok(Proposal {
             event_type: event_type.to_owned(),
-            payload_schema: "dev.pluribus.js.cell/1".to_owned(),
+            payload_schema: "dev.pluribus.repl.cell/1".to_owned(),
             payload: Payload::Json(
                 serde_json::to_vec(value)
                     .map_err(|error| failure(format!("cannot encode payload: {error}")))?,
@@ -380,6 +392,19 @@ mod tests {
     use super::*;
     fn value(text: String) -> Value {
         serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn two_suspended_environments_resume_independently() {
+        let mut first = Environment::new("{}").unwrap();
+        let mut second = Environment::new("{}").unwrap();
+        first
+            .step("__start", "return await history.read({});")
+            .unwrap();
+        second.step("__start", "await history.read({}); let total=0; for(let i=0;i<10;i++) { for(let j=0;j<10;j++) { total+=j; } } return total;").unwrap();
+        let resumed = value(second.step("__resume", r#"{"id":1,"value":[]}"#).unwrap());
+        assert_eq!(resumed["status"], "done", "{resumed}");
+        assert_eq!(resumed["value"], 450);
     }
 
     #[test]
@@ -467,26 +492,37 @@ mod tests {
     }
 
     #[test]
-    fn memory_facade_yields_and_receives_results() {
+    fn plugin_boundary_has_no_sibling_globals() {
         let mut env = Environment::new("{}").unwrap();
-        for operation in ["recall", "get", "remember", "supersede", "forget"] {
+        let done = value(env.step("__start", "return typeof memory;").unwrap());
+        assert_eq!(done["value"], "undefined");
+    }
+
+    #[test]
+    fn capability_facade_yields_and_receives_receipts() {
+        let mut env = Environment::new("{}").unwrap();
+        for operation in ["catalog.search", "catalog.update"] {
             let call = value(
                 env.step(
                     "__start",
-                    &format!("return await memory.{operation}({{scope:'project:p'}});"),
+                    &format!(
+                        "return await capabilities.invoke('{operation}', {{scope:'project:p'}});"
+                    ),
                 )
                 .unwrap(),
             );
-            assert_eq!(call["method"], format!("memory.{operation}"));
-            assert_eq!(call["args"]["scope"], "project:p");
+            assert_eq!(call["method"], "capability.invoke");
+            assert_eq!(call["args"]["name"], operation);
+            assert_eq!(call["args"]["arguments"]["scope"], "project:p");
             let done = value(
                 env.step(
                     "__resume",
-                    &serde_json::json!({"id":call["id"],"value":{"id":"memory:1"}}).to_string(),
+                    &serde_json::json!({"id":call["id"],"value":{"output":{"id":"record:1"}}})
+                        .to_string(),
                 )
                 .unwrap(),
             );
-            assert_eq!(done["value"]["id"], "memory:1");
+            assert_eq!(done["value"]["output"]["id"], "record:1");
         }
     }
     #[test]

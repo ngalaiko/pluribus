@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 use telegram::api::{CREDENTIAL_MARKER, ORIGIN, call_json, invalid, unavailable};
-use telegram::pluribus::plugin::http::{self, Request};
+use telegram::http::{self, Request};
 use telegram::pluribus::plugin::types::{BlobRef, Error};
 
 pub fn download(file_id: &str, credential: &str) -> Result<(BlobRef, Option<String>), Error> {

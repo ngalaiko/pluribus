@@ -11,7 +11,7 @@ static NEXT_PACKAGE: AtomicU64 = AtomicU64::new(1);
 fn bundle_uses_one_package_abi_and_rejects_component_overrides() {
     let fixture = TestPackage::create();
     let mut manifest: toml::Value = toml::from_str(&fixture.manifest()).unwrap();
-    assert_eq!(manifest["abi"].as_str(), Some("pluribus:plugin@1.0.0"));
+    assert_eq!(manifest["abi"].as_str(), Some("pluribus:plugin@2.0.0"));
     let mut sibling = manifest["components"]["main"].clone();
     fs::copy(
         fixture.path.join("plugin.wasm"),
@@ -33,7 +33,7 @@ fn bundle_uses_one_package_abi_and_rejects_component_overrides() {
         2
     );
 
-    for abi in ["pluribus:plugin@1.0.0", "pluribus:plugin@0.1.0"] {
+    for abi in ["pluribus:plugin@2.0.0", "pluribus:plugin@0.1.0"] {
         manifest["components"]["sibling"]
             .as_table_mut()
             .unwrap()
@@ -44,14 +44,19 @@ fn bundle_uses_one_package_abi_and_rejects_component_overrides() {
 }
 
 const IMPORTS: &[&str] = &[
-    "pluribus:plugin/events@1.0.0",
-    "pluribus:plugin/state@1.0.0",
-    "pluribus:plugin/blobs@1.0.0",
-    "pluribus:plugin/reader@1.0.0",
-    "pluribus:plugin/writer@1.0.0",
-    "pluribus:plugin/http@1.0.0",
-    "pluribus:plugin/socket@1.0.0",
-    "pluribus:plugin/credentials@1.0.0",
+    "pluribus:plugin/runtime@2.0.0",
+    "pluribus:plugin/events@2.0.0",
+    "pluribus:plugin/state@2.0.0",
+    "pluribus:plugin/blobs@2.0.0",
+    "pluribus:plugin/reader@2.0.0",
+    "pluribus:plugin/writer@2.0.0",
+    "wasi:http/types@0.3.0",
+    "wasi:http/client@0.3.0",
+    "wasi:clocks/system-clock@0.3.0",
+    "wasi:clocks/monotonic-clock@0.3.0",
+    "wasi:random/random@0.3.0",
+    "pluribus:plugin/socket@2.0.0",
+    "pluribus:plugin/credentials@2.0.0",
 ];
 
 struct TestPackage {
@@ -157,14 +162,14 @@ fn malformed_component_is_rejected() {
 fn a_foreign_abi_is_rejected() {
     let package = TestPackage::create();
     package.set_manifest(&package.manifest().replace(
-        "abi = \"pluribus:plugin@1.0.0\"",
+        "abi = \"pluribus:plugin@2.0.0\"",
         "abi = \"pluribus:plugin@0.1.0\"",
     ));
 
     let error = PluginPackage::load(&package.path).err().unwrap();
 
     assert!(
-        error.to_string().contains("pluribus:plugin@1.0.0"),
+        error.to_string().contains("pluribus:plugin@2.0.0"),
         "{error}"
     );
 }
@@ -175,7 +180,7 @@ fn imports_must_match_component() {
     package.set_manifest(
         &package
             .manifest()
-            .replace("  \"pluribus:plugin/socket@1.0.0\",\n", ""),
+            .replace("  \"pluribus:plugin/socket@2.0.0\",\n", ""),
     );
 
     let error = PluginPackage::load(&package.path).err().unwrap();
@@ -247,13 +252,13 @@ fn fixture_manifest(component: &[u8]) -> String {
         .join("\n");
     format!(
         r#"manifest_version = 1
-abi = "pluribus:plugin@1.0.0"
+abi = "pluribus:plugin@2.0.0"
 id = "dev.example.fixture"
 name = "Fixture"
 config_schema = "config.schema.json"
 
 [components.main]
-world = "pluribus:plugin/plugin@1.0.0"
+world = "pluribus:plugin/plugin@2.0.0"
 component = "plugin.wasm"
 digest = "{}"
 imports = [
@@ -556,31 +561,24 @@ fn manifest_rejects_configuration_projection() {
 }
 
 #[test]
-fn source_world_requires_the_ingress_export() {
+fn components_use_the_plugin_world() {
     let fixture = TestPackage::create();
     let package = PluginPackage::load(&fixture.path).unwrap();
     let mut manifest = package.component("main").unwrap().manifest().clone();
-    let mut resolve = Resolve::default();
-    let (package_id, _) = resolve
-        .push_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../wit"))
+    crate::component::validate_component("pluribus:plugin@2.0.0", &manifest, &fixture_component())
         .unwrap();
-    let world = resolve.select_world(&[package_id], Some("source")).unwrap();
-    let mut module = dummy_module(&resolve, world, ManglingAndAbi::Standard32);
-    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8).unwrap();
-    let source = ComponentEncoder::default()
-        .module(&module)
-        .unwrap()
-        .validate(true)
-        .encode()
-        .unwrap();
-    assert!(
-        crate::component::validate_component("pluribus:plugin@1.0.0", &manifest, &source).is_err()
-    );
-    manifest.world = "pluribus:plugin/source@1.0.0".into();
-    crate::component::validate_component("pluribus:plugin@1.0.0", &manifest, &source).unwrap();
     assert!(
         crate::component::validate_component(
             "pluribus:plugin@1.0.0",
+            &manifest,
+            &fixture_component()
+        )
+        .is_err()
+    );
+    manifest.world = "pluribus:plugin/source@2.0.0".into();
+    assert!(
+        crate::component::validate_component(
+            "pluribus:plugin@2.0.0",
             &manifest,
             &fixture_component()
         )

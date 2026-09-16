@@ -61,6 +61,52 @@ impl PolicyHttpService {
         }
     }
 
+    fn start_stream(
+        &self,
+        grant: &HttpGrant,
+        protocol: HttpStreamProtocol,
+        response: Response,
+    ) -> Result<String, HttpError> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > grant.max_response_bytes)
+        {
+            return Err(HttpError::ResourceExhausted(
+                "stream response exceeds grant".into(),
+            ));
+        }
+        let stream_id = format!(
+            "http-stream-{}",
+            self.next_stream_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let (sender, receiver) = mpsc::channel(STREAM_QUEUE_FRAMES);
+        let maximum_bytes = grant.max_response_bytes;
+        let worker = tokio::spawn(async move {
+            if protocol == HttpStreamProtocol::Bytes {
+                if let Err(error) =
+                    read_bytes(response_reader(response), maximum_bytes, &sender).await
+                {
+                    let _ = sender.send(Err(error)).await;
+                }
+            } else {
+                read_sse(response, maximum_bytes, &sender).await;
+            }
+        });
+        self.streams
+            .lock()
+            .map_err(|_| HttpError::Internal("stream registry lock failed".into()))?
+            .insert(
+                stream_id.clone(),
+                Arc::new(ActiveStream {
+                    component: grant.component.clone(),
+                    receiver: AsyncMutex::new(receiver),
+                    closed: AtomicBool::new(false),
+                    worker: worker.abort_handle(),
+                }),
+            );
+        Ok(stream_id)
+    }
+
     async fn execute(
         &self,
         grant: &HttpGrant,
@@ -409,6 +455,39 @@ impl HttpService for PolicyHttpService {
 
 #[async_trait::async_trait]
 impl HttpStreamService for PolicyHttpService {
+    fn with_body_store(&self, store: Arc<dyn BlobStore>) -> Option<Arc<dyn HttpStreamService>> {
+        Some(Arc::new(Self::new(store, self.credentials.clone())))
+    }
+
+    async fn start_response(
+        &self,
+        grant: &HttpGrant,
+        request: &HttpRequest,
+    ) -> Result<Option<pluribus_core::HttpStreamingResponse>, HttpError> {
+        let (response, _) = self.open_response(grant, request).await?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| !is_hop_by_hop(name))
+            .map(|(name, value)| HttpHeader {
+                name: name.to_string(),
+                value: value.as_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        if header_bytes(&headers) > MAX_HEADER_BYTES {
+            return Err(HttpError::ResourceExhausted(
+                "response headers exceed 64 KiB".into(),
+            ));
+        }
+        let stream_id = self.start_stream(grant, HttpStreamProtocol::Bytes, response)?;
+        Ok(Some(pluribus_core::HttpStreamingResponse {
+            status,
+            headers,
+            stream_id,
+        }))
+    }
+
     async fn open_stream(
         &self,
         grant: &HttpGrant,
@@ -428,44 +507,7 @@ impl HttpStreamService for PolicyHttpService {
                 .unwrap_or_default();
             return Err(stream_status_error(status, &body));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > grant.max_response_bytes)
-        {
-            return Err(HttpError::ResourceExhausted(
-                "stream response exceeds grant".into(),
-            ));
-        }
-        let stream_id = format!(
-            "http-stream-{}",
-            self.next_stream_id.fetch_add(1, Ordering::Relaxed)
-        );
-        let (sender, receiver) = mpsc::channel(STREAM_QUEUE_FRAMES);
-        let maximum_bytes = grant.max_response_bytes;
-        let worker = tokio::spawn(async move {
-            if protocol == HttpStreamProtocol::Bytes {
-                if let Err(error) =
-                    read_bytes(response_reader(response), maximum_bytes, &sender).await
-                {
-                    let _ = sender.send(Err(error)).await;
-                }
-            } else {
-                read_sse(response, maximum_bytes, &sender).await;
-            }
-        });
-        self.streams
-            .lock()
-            .map_err(|_| HttpError::Internal("stream registry lock failed".into()))?
-            .insert(
-                stream_id.clone(),
-                Arc::new(ActiveStream {
-                    component: grant.component.clone(),
-                    receiver: AsyncMutex::new(receiver),
-                    closed: AtomicBool::new(false),
-                    worker: worker.abort_handle(),
-                }),
-            );
-        Ok(stream_id)
+        self.start_stream(grant, protocol, response)
     }
 
     async fn receive(

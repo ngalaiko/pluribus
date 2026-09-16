@@ -1,5 +1,5 @@
 [package]
-name = "pluribus-plugin-rlm-js"
+name = "pluribus-plugin-rlm-repl"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

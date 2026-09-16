@@ -118,19 +118,24 @@ async fn build(grants: &[&str]) -> (TestAgent, Arc<SqliteEventStore<Metadata>>) 
             .await
             .unwrap(),
     );
+    let agent = build_on(&store, grants).await;
+    (agent, store)
+}
+
+async fn build_on(store: &Arc<SqliteEventStore<Metadata>>, grants: &[&str]) -> TestAgent {
     let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::default());
     let runtime = Runtime::new(
         RuntimeLimits::default(),
-        Arc::clone(&store) as Arc<dyn StateStore>,
-        Arc::clone(&store) as Arc<dyn EventStore>,
+        Arc::clone(store) as Arc<dyn StateStore>,
+        Arc::clone(store) as Arc<dyn EventStore>,
         blobs,
-        Arc::clone(&store) as Arc<dyn DeliveryStore>,
+        Arc::clone(store) as Arc<dyn DeliveryStore>,
     )
     .unwrap();
     let router = Router::new(
         StreamId::new("personal"),
         agent_principal(),
-        Arc::clone(&store) as Arc<dyn EventStore>,
+        Arc::clone(store) as Arc<dyn EventStore>,
         Arc::new(EventTypeRegistry::core()),
         AllowAll,
     );
@@ -138,7 +143,7 @@ async fn build(grants: &[&str]) -> (TestAgent, Arc<SqliteEventStore<Metadata>>) 
         router,
         Standing(grants.iter().map(|name| (*name).to_owned()).collect()),
         runtime,
-        Arc::clone(&store) as Arc<dyn EventStore>,
+        Arc::clone(store) as Arc<dyn EventStore>,
         StreamId::new("personal"),
         agent_principal(),
     );
@@ -155,7 +160,7 @@ async fn build(grants: &[&str]) -> (TestAgent, Arc<SqliteEventStore<Metadata>>) 
         .await
         .unwrap();
     assert_eq!(installed, ["echo-1"]);
-    (agent, store)
+    agent
 }
 
 async fn request(store: &Arc<SqliteEventStore<Metadata>>, message: &str) -> CommittedEvent {
@@ -431,5 +436,22 @@ async fn historical_checkpoints_do_not_delay_capability_admission() {
             .request
             .event_type,
         "capability.completed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reinstalled_provider_serves_requests_after_a_restart() {
+    let (agent, store) = build(&["system.echo"]).await;
+    drop(agent);
+    let mut agent = build_on(&store, &["system.echo"]).await;
+    let event = request(&store, "hello").await;
+
+    agent.tick_wait(1).await.unwrap();
+
+    let result = agent.result_for(&event.event_id).await.unwrap().unwrap();
+    assert_eq!(result.request.event_type, "capability.completed");
+    assert!(
+        !types(&store).await.contains(&"component.failed".to_owned()),
+        "a restart must not report the previous source loop as a failure"
     );
 }

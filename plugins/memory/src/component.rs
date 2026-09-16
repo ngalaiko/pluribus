@@ -1,7 +1,7 @@
 use crate::engine::{Change, Config, Engine, Store};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-wit_bindgen::generate!({path:"../../wit",world:"plugin"});
+wit_bindgen::generate!({ generate_all,path:"../../wit",world:"plugin"});
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::types::{
     Error, ErrorCode, Event, Mutation, Payload, PrincipalKind, Proposal, StateEntry,
@@ -36,18 +36,28 @@ impl Store for HostStore {
             .collect()
     }
 }
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+
+fn setup(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let parsed: Config = serde_json::from_slice(&config).map_err(failure)?;
+    parsed.validate().map_err(failure)?;
+    CONFIG.with_borrow_mut(|c| *c = parsed);
+    Ok(Outcome {
+        events: vec![],
+        mutations: vec![],
+        checkpoint: None,
+    })
+}
+
 impl Guest for Memory {
-    fn init(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let parsed: Config = serde_json::from_slice(&config).map_err(failure)?;
-        parsed.validate().map_err(failure)?;
-        CONFIG.with_borrow_mut(|c| *c = parsed);
-        Ok(Outcome {
-            events: vec![],
-            mutations: vec![],
-            checkpoint: None,
-        })
+    async fn run(context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        serve::<Self>(context).await
     }
-    fn handle(context: Context, batch: Vec<Event>) -> Result<Outcome, Error> {
+
+    async fn handle(context: Context, batch: Vec<Event>) -> Result<Outcome, Error> {
         let config = CONFIG.with_borrow(Clone::clone);
         let mut engine = Engine::new(&HostStore, &config, &context.instance_id);
         let mut proposals = vec![];

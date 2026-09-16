@@ -157,7 +157,7 @@ async fn failed_attachment_preserves_observation_offset_and_polling() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attachment_retry_emits_ready_without_duplicate_observation() {
+async fn attachment_retry_emits_one_complete_observation() {
     run_polling(true, true).await;
 }
 
@@ -186,6 +186,8 @@ async fn run_polling(with_media: bool, recover: bool) {
         store.clone(),
     )
     .unwrap();
+    let source_clock = clock.clone();
+    let runtime = runtime.with_clock(Arc::new(move || source_clock.load(Ordering::SeqCst)));
     let principal = PrincipalRef::new(PrincipalKind::Agent, "fixture");
     let stream = StreamId::new("fixture");
     let mut agent = Agent::new(
@@ -263,8 +265,10 @@ async fn run_polling(with_media: bool, recover: bool) {
         .into_iter()
         .filter(|event| event.request.event_type == "observation.received")
         .collect();
-    assert_eq!(observations.len(), 1);
-    assert_eq!(payload(&observations[0])["message"]["text"], "pong");
+    assert_eq!(observations.len(), usize::from(!with_media));
+    if !with_media {
+        assert_eq!(payload(&observations[0])["message"]["text"], "pong");
+    }
     let offset = StateStore::get(
         store.as_ref(),
         &StateNamespace::new("telegram-1"),
@@ -281,7 +285,14 @@ async fn run_polling(with_media: bool, recover: bool) {
         );
         clock.store(1_800_000_002_000, Ordering::SeqCst);
         settle_poll(&mut agent, &http, clock.load(Ordering::SeqCst)).await;
-        assert_eq!(payload(&observations[0])["media"][0]["status"], "pending");
+        assert!(
+            !store
+                .read(&stream, 0, 100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.request.event_type == "observation.received")
+        );
         assert!(http.files.load(Ordering::SeqCst) > 0);
         assert!(http.calls.load(Ordering::SeqCst) > 2);
         let pending = StateStore::get(
@@ -319,19 +330,17 @@ async fn run_polling(with_media: bool, recover: bool) {
         let events = store.read(&stream, 0, 500).await.unwrap();
         let failure = events
             .iter()
-            .find(|event| {
-                event.request.event_type
-                    == if recover {
-                        "telegram.media-ready"
-                    } else {
-                        "telegram.media-failed"
-                    }
-            })
+            .find(|event| event.request.event_type == "observation.received")
             .unwrap();
+        assert_eq!(payload(failure)["message"]["text"], "pong");
         assert_eq!(
-            payload(failure)["observationDeduplicationKey"],
-            "telegram:update:47"
+            failure.request.deduplication_key.as_deref(),
+            Some("telegram:update:47")
         );
+        assert!(!events.iter().any(|event| matches!(
+            event.request.event_type.as_str(),
+            "telegram.media-ready" | "telegram.media-failed"
+        )));
         assert_eq!(
             payload(failure)["media"][0]["status"],
             if recover { "ready" } else { "failed" }

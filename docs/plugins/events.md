@@ -100,7 +100,6 @@ code.evaluate-requested code.yielded            code.resumed
 code.completed          code.failed
 code.close-requested    code.closed
 timer.set               timer.cancel
-telegram.media-ready    telegram.media-failed
 http.request.received    http.response.requested
 ```
 

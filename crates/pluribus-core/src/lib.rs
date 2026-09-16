@@ -26,7 +26,7 @@ pub use event::{
 };
 pub use http::{
     HttpError, HttpFrame, HttpFramePage, HttpGrant, HttpHeader, HttpRequest, HttpResponse,
-    HttpService, HttpStreamProtocol, HttpStreamService,
+    HttpService, HttpStreamProtocol, HttpStreamService, HttpStreamingResponse,
 };
 pub use identity::{PrincipalId, PrincipalKind, PrincipalRef};
 pub use registry::{

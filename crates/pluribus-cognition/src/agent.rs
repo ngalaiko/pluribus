@@ -83,7 +83,7 @@ impl<P, R> Drop for Agent<P, R> {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
         for cancellation in self.cancellations.values() {
-            cancellation.cancel();
+            cancellation.shutdown();
         }
         for worker in self.workers.values() {
             worker.handle.abort();
@@ -248,7 +248,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
     }
 
     async fn recover_installed_session(
-        &self,
+        &mut self,
         instance: &mut PluginInstance,
     ) -> Result<(), AgentError> {
         let mut after = 0;
@@ -340,7 +340,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
     }
 
     async fn cancelled_before(
-        &self,
+        &mut self,
         request: &CommittedEvent,
         before: u64,
     ) -> Result<bool, AgentError> {
@@ -415,14 +415,15 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         if !manifest.rebuilds.is_empty()
             && manifest.imports.iter().any(|import| {
                 ![
-                    "pluribus:plugin/events@1.0.0",
-                    "pluribus:plugin/state@1.0.0",
+                    "pluribus:plugin/events@2.0.0",
+                    "pluribus:plugin/state@2.0.0",
+                    "pluribus:plugin/runtime@2.0.0",
                 ]
                 .contains(&import.as_str())
             })
         {
             return Err(AgentError::Storage(
-                "rebuild providers may import only events and state".into(),
+                "rebuild providers may import only events, state, and runtime".into(),
             ));
         }
         for kind in &manifest.rebuilds {
@@ -451,7 +452,8 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         })
     }
 
-    fn activate_component(&mut self, staged: StagedComponent) {
+    fn activate_component(&mut self, mut staged: StagedComponent) {
+        staged.instance.start();
         let instance_id = staged.registration.instance_id.clone();
         if !staged.registration.subscriptions.whole_stream {
             self.external.insert(instance_id.clone());
@@ -473,7 +475,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         deadline_at_ms: i64,
     ) -> Result<(), AgentError> {
         if let Some(handle) = self.cancellations.remove(instance_id) {
-            handle.cancel();
+            handle.shutdown();
         }
         if let Some(worker) = self.workers.get_mut(instance_id) {
             let joined = (&mut worker.handle).await;
@@ -678,6 +680,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             )
             .await
             .map_err(AgentError::Runtime)?;
+        fresh.start();
         self.cancellations.insert(id.into(), fresh.cancellation());
         self.instances.insert(id.into(), fresh);
         self.recovered(id).await?;
@@ -781,7 +784,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         Ok(())
     }
 
-    async fn observations_delivered(&self) -> Result<bool, AgentError> {
+    async fn observations_delivered(&mut self) -> Result<bool, AgentError> {
         for registration in self
             .router
             .registrations()
@@ -812,7 +815,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         Ok(true)
     }
 
-    async fn due_timers(&self, now_ms: i64) -> Result<Vec<PendingTimer>, AgentError> {
+    async fn due_timers(&mut self, now_ms: i64) -> Result<Vec<PendingTimer>, AgentError> {
         Ok(self
             .router
             .timers(self.batch)
@@ -958,13 +961,12 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                     .instances
                     .get_mut(instance_id)
                     .unwrap()
-                    .has_stream_input()
+                    .has_background_output()
                 {
                     let mut instance = self.instances.remove(instance_id).unwrap();
                     let progress = self.runtime.progress_notification();
-                    let now_ms = self.admission_now_ms;
                     let handle = tokio::spawn(async move {
-                        let result = instance.receive_input(now_ms).await;
+                        let result = instance.background_output();
                         progress.notify_one();
                         (instance, result)
                     });
@@ -1210,15 +1212,17 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             .append_component_failure(instance_id, batch, &reason)
             .await
             .map_err(AgentError::Router)?;
-        if let Some(old) = instance.as_ref().filter(|i| i.pinned_session()) {
+        if let Some(old) = instance.as_mut().filter(|i| i.pinned_session()) {
             self.router
                 .fail_sessions(instance_id, batch)
                 .await
                 .map_err(AgentError::Router)?;
-            let restarted = async {
-                let mut fresh = old.restart().await?;
+            let restart = old.restart();
+            let restarted = async move {
+                let mut fresh = restart.await?;
                 fresh.init().await?;
                 fresh.skip(checkpoint).await?;
+                fresh.start();
                 Ok::<_, RuntimeError>(fresh)
             }
             .await;
@@ -1259,7 +1263,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
     /// Removes requests that already have a terminal result, so a provider
     /// does not execute an effect twice and a denied request never runs.
     async fn drop_answered_requests(
-        &self,
+        &mut self,
         events: Vec<CommittedEvent>,
     ) -> Result<Vec<CommittedEvent>, AgentError> {
         let mut kept = Vec::with_capacity(events.len());

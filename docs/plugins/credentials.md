@@ -161,11 +161,12 @@ The host rejects missing values and values expiring within 30 seconds. Plugins
 assign meaning to binding names: shell uses them as environment variable names
 and sends values directly over its executor socket, outside the event log.
 
-The `credentials` interface offers scoped get/compare-and-swap, secure random
-bytes, and the current time. Credential writes are atomic but independent of
+The `credentials` interface offers scoped get/compare-and-swap and HTTP
+credential attachment. Clocks and secure randomness use WASI. Credential writes are atomic but independent of
 event commits; plugins must make enrollment and token exchanges replay-safe.
-`http.exchange` provides bounded inline HTTP without persistent blobs, subject
-to the same destination and method grants as ordinary HTTP.
+WASI HTTP bodies remain transient unless the guest explicitly persists them.
+The guest inline helper bounds credential exchanges to 1 MiB. Destination and
+method grants apply to every request.
 
 For `plugin@1`, the private record's `enrollment` field contains
 `{id, input, expires_at_ms}`. The request event carries `{component, credential,

@@ -1,7 +1,24 @@
-package pluribus:plugin@1.0.0;
+package pluribus:plugin@2.0.0;
 
 /// Values shared by the host imports and the plugin export.
 interface types {
+  /// Host-assigned facts about the current call. A plugin cannot forge or
+  /// widen them.
+  record context {
+    instance-id: string,
+    agent: principal,
+
+    /// Highest acknowledged internal event sequence. Source state may exist
+    /// without an internal delivery checkpoint.
+    state-checkpoint: u64,
+
+    /// Recursion depth of the activity that produced this delivery.
+    depth: u32,
+
+    deadline-at-ms: option<s64>,
+  }
+
+
   /// One canonical JSON value, UTF-8 encoded.
   type json = list<u8>;
 
@@ -115,10 +132,5 @@ interface types {
   record state-entry {
     key: string,
     value: list<u8>,
-  }
-  /// Effects of transient source input, without an event-log checkpoint.
-  record ingress-outcome {
-    events: list<proposal>,
-    mutations: list<mutation>,
   }
 }

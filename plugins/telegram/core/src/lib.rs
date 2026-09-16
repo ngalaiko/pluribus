@@ -8,9 +8,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::cell::RefCell;
 
-wit_bindgen::generate!({
+wit_bindgen::generate!({ generate_all,
     path: "../../../wit",
-    world: "source",
+    world: "plugin",
     pub_export_macro: true,
     // Component crates take this crate as `telegram`.
     default_bindings_module: "telegram",
@@ -68,3 +68,6 @@ pub fn proposal(
         causation_id,
     })
 }
+
+#[path = "../../../shared/http.rs"]
+pub mod http;

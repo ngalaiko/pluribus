@@ -7,7 +7,7 @@ Example request: **Reply with pong.** This trace omits streaming deltas and rout
 | 1 | `observation.received` | A configured connector records the inbound message. |
 | 2 | `model.requested` → `model.completed` with `associate({action:"new",jobId:null})` | If eligible active jobs need disambiguation, classify the message. Otherwise skip this step. |
 | 3 | `model.requested` | `rlm/cognition` supplies task context and the `js` and `yield` tool schemas. |
-| 4 | Optional `model.completed` with `js(...)` → `code.evaluate-requested` → `code.completed` | `rlm/js` executes the cell in its own worker; the result feeds another model request. |
+| 4 | Optional `model.completed` with `js(...)` → `code.evaluate-requested` → `code.completed` | `rlm/repl` executes the cell in its own worker; the result feeds another model request. |
 | 5 | `model.completed` with `yield({action:"complete",reply:"pong"})` | Propose completion and a reply. The model does not address a connector directly. |
 | 6 | Validate, then commit | RLM records `cognition.completed`, `capability.requested` for `<provider>.reply`, `code.close-requested`, completed job state, and its checkpoint together. |
 | 7 | Capability admission and execution | Core checks origin-scoped authority and records the attempt; the connector's reply component executes the send. |
@@ -37,12 +37,13 @@ calls. A subsequent observation can amend the job and resume reasoning.
 Plain `pong` is not a control decision. RLM preserves the job and requests a
 corrected tool call. Invalid tool arguments receive a tool result explaining the
 schema error; they cannot update progress or request a reply. Three invalid
-outputs pause the root with a diagnostic instead of marking it completed.
+outputs fail the root and request a stall reply. Empty output is corrected toward
+executable JS or a terminal answer, not a continuation decision.
 
 ## Component boundaries
 
 A connector package may own separate receive and send components; the RLM
-package owns `cognition` and `js`. Configuration selects components explicitly
+package owns `cognition` and `repl`. Configuration selects components explicitly
 with `package-instance/component-name`; runtime IDs, cursors, state, host grants,
 and workers use those same IDs. No standalone JS package is installed.
 

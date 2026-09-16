@@ -1,4 +1,4 @@
-# JavaScript component
+# REPL component
 
 Boa packaged as Wasm, without host imports, WASI, filesystem, network, or
 credentials. The separate [cognition plugin](../README.md) owns
@@ -29,7 +29,7 @@ realm restores those values into `state` and sets `context.recovered` to true.
 Larger data needs blob/history references. Missing sessions cannot resume
 suspended cells; core reports interruption without replaying admitted source.
 
-The `js` component of the rlm package, not a plugin of its own: it ships inside
+The `repl` component of the rlm package, not a plugin of its own: it ships inside
 that package beside `cognition`, and an rlm instance configures both.
 
 Context, checkpoints, and host responses enter Boa as JSON values, not source.

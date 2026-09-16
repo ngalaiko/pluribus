@@ -2,10 +2,8 @@ use serde_json::{Map, Value, json};
 use telegram::api;
 use telegram::pluribus::plugin::types::{BlobRef, Error};
 
-/// One candidate observation: the dedup key the host needs and the payload it
-/// carries.
+/// One normalized update, including attachment download descriptors.
 pub struct Observation {
-    pub deduplication_key: String,
     pub payload: Value,
 }
 
@@ -48,7 +46,6 @@ fn normalize_update(update: &Value) -> Result<Observation, Error> {
     // observed_at_ms is provider data and untrusted, so it lives in the
     // payload rather than the host-stamped envelope.
     Ok(Observation {
-        deduplication_key: format!("telegram:update:{update_id}"),
         payload: json!({
             "provider": "telegram",
             "update_id": update_id,
@@ -116,11 +113,7 @@ fn conversation_id(content: &Value) -> Option<String> {
         .get("chat")
         .and_then(|chat| chat.get("id"))
         .and_then(Value::as_i64)?;
-    let thread = message.get("message_thread_id").and_then(Value::as_i64);
-    Some(thread.map_or_else(
-        || format!("chat:{chat}"),
-        |thread| format!("chat:{chat}:thread:{thread}"),
-    ))
+    Some(format!("chat:{chat}"))
 }
 
 fn normalize_message(message: &Value) -> Value {
@@ -132,7 +125,6 @@ fn normalize_message(message: &Value) -> Value {
             "id",
             "message_id",
             "date",
-            "message_thread_id",
             "media_group_id",
             "text",
             "caption",
@@ -141,7 +133,6 @@ fn normalize_message(message: &Value) -> Value {
             "from",
             "sender_chat",
             "chat",
-            "message",
             "user",
             "actor_chat",
             "chat_instance",
@@ -171,6 +162,9 @@ fn normalize_message(message: &Value) -> Value {
             "forum_topic_edited",
         ],
     );
+    if let Some(nested) = message.get("message") {
+        normalized.insert("message".into(), normalize_message(nested));
+    }
     if let Some(reply) = message.get("reply_to_message") {
         let mut summary = Map::new();
         copy_fields(
@@ -252,6 +246,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thread_ids_do_not_change_observation_identity() {
+        let result = updates(
+            &json!([
+                {"update_id":1,"message":{"from":{"id":7},"chat":{"id":9},"message_thread_id":10}},
+                {"update_id":2,"message":{"from":{"id":7},"chat":{"id":9},"message_thread_id":20}}
+            ]),
+            &["7".into()],
+            100,
+        )
+        .unwrap();
+        for observation in result {
+            assert_eq!(observation.payload["conversationId"], "chat:9");
+            assert!(
+                observation.payload["message"]
+                    .get("message_thread_id")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn ignored_malformed_update_does_not_block_admitted_sender() {
         let batch = json!([
             {"message":{"from":{"id":8},"document":{"file_id":"ignored"}}},
@@ -264,7 +279,6 @@ mod tests {
     #[test]
     fn only_listed_senders_are_admitted() {
         for kind in [
-            "message",
             "edited_message",
             "channel_post",
             "edited_channel_post",

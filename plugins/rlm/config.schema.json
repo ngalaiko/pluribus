@@ -7,7 +7,7 @@
         "type": "object"
       }
     },
-    "js": {
+    "repl": {
       "type": "object",
       "additionalProperties": false
     },

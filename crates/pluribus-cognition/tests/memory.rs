@@ -408,18 +408,21 @@ async fn memory_round_trip_rebuild_and_constraints() {
 #[allow(clippy::too_many_lines)]
 async fn rlm_recalls_remembers_and_replies_through_memory_events() {
     let (mut agent, store) = build(CAPS).await;
-    for (id, plugin, config) in [("rlm", "rlm", json!({"js":{}})), ("js", "js", json!({}))] {
+    for (id, plugin, config) in [
+        ("rlm", "rlm", json!({"repl":{}})),
+        ("repl", "repl", json!({})),
+    ] {
         let mut d = delivery();
         d.instance_id = id.into();
         let package = PluginPackage::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
             "../../target/plugins/{}",
-            if plugin == "js" { "rlm" } else { plugin }
+            if plugin == "repl" { "rlm" } else { plugin }
         )))
         .unwrap();
         agent
             .install_component(
                 package
-                    .component(if plugin == "rlm" { "cognition" } else { "js" })
+                    .component(if plugin == "rlm" { "cognition" } else { "repl" })
                     .unwrap(),
                 &config,
                 d,
@@ -438,12 +441,14 @@ async fn rlm_recalls_remembers_and_replies_through_memory_events() {
     origin.payload = EventPayload::CanonicalJson(serde_json::to_vec(&json!({"provider":"telegram","externalSenderId":"7","conversationId":"chat:7","message":{"chat":{"id":7},"text":"Remember to use Jujutsu"}})).unwrap());
     store.append(origin).await.unwrap();
     let scripts = [
-        Some("return await memory.recall({scope:'project:p',query:'Jujutsu'});"),
         Some(
-            "state.saved=await memory.remember({operationId:context.observationEventId,scope:'project:p',kind:'procedure',content:'Use Jujutsu',sources:[context.observationEventId],basis:'explicit'}); return state.saved;",
+            "return (await capabilities.invoke('memory.recall',{scope:'project:p',query:'Jujutsu'})).output;",
         ),
         Some(
-            "const found=await memory.recall({scope:'project:p',query:'Jujutsu'}); if(found.records.length!==1 || found.records[0].record.id!==state.saved.id) throw Error('memory mismatch'); return 'verified';",
+            "state.saved=(await capabilities.invoke('memory.remember',{operationId:context.observationEventId,scope:'project:p',kind:'procedure',content:'Use Jujutsu',sources:[context.observationEventId],basis:'explicit'})).output; return state.saved;",
+        ),
+        Some(
+            "const found=(await capabilities.invoke('memory.recall',{scope:'project:p',query:'Jujutsu'})).output; if(found.records.length!==1 || found.records[0].record.id!==state.saved.id) throw Error('memory mismatch'); return 'verified';",
         ),
         None,
     ];

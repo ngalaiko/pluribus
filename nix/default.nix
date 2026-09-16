@@ -77,7 +77,7 @@ rec {
       name = "rlm";
       components = [
         "cognition"
-        "js"
+        "repl"
       ];
     };
     shell = package {

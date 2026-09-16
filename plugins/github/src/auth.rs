@@ -1,7 +1,8 @@
 use crate::{
     Config,
     common::*,
-    pluribus::plugin::{credentials, http, types::Error},
+    http,
+    pluribus::plugin::{credentials, types::Error},
 };
 use base64::{
     Engine,

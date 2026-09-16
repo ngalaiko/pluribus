@@ -124,7 +124,7 @@ Resource exhaustion is a plugin failure, not permission to discard audit data.
 
 ## Supply chain
 
-ABI `1.0.0` has no signing authority or public registry. Operators review the manifest, digest, source, build provenance, and grants.
+ABI `2.0.0` has no signing authority or public registry. Operators review the manifest, digest, source, build provenance, and grants.
 
 Authors SHOULD:
 

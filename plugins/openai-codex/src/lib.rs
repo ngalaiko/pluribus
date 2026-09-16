@@ -5,16 +5,16 @@ use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-wit_bindgen::generate!({
+wit_bindgen::generate!({ generate_all,
     path: "../../wit",
     world: "plugin",
 });
 
+use crate::http::Reader;
+use crate::http::{Header, Request};
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::blobs;
 use pluribus::plugin::events;
-use pluribus::plugin::http::{self, Header, Request};
-use pluribus::plugin::reader::Reader;
 use pluribus::plugin::types::{self, Error, ErrorCode, Event, Payload, Proposal};
 
 use pluribus_model::{
@@ -53,21 +53,30 @@ struct Config {
 
 struct Codex;
 
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+
+fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let parsed: Config = serde_json::from_slice(&config)
+        .map_err(|error| invalid_argument(format!("invalid configuration: {error}")))?;
+    if parsed.credentials.subscription.is_empty() {
+        return Err(invalid_argument("credential handle is empty"));
+    }
+    if parsed.models.is_empty() {
+        return Err(invalid_argument("at least one model is required"));
+    }
+    CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
+    Ok(empty_outcome())
+}
+
 impl Guest for Codex {
-    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let parsed: Config = serde_json::from_slice(&config)
-            .map_err(|error| invalid_argument(format!("invalid configuration: {error}")))?;
-        if parsed.credentials.subscription.is_empty() {
-            return Err(invalid_argument("credential handle is empty"));
-        }
-        if parsed.models.is_empty() {
-            return Err(invalid_argument("at least one model is required"));
-        }
-        CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
-        Ok(empty_outcome())
+    async fn run(context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        serve::<Self>(context).await
     }
 
-    fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         let config = config()?;
         let mut proposals = Vec::new();
         let mut checkpoint = None;
@@ -935,3 +944,6 @@ data: {"type":"response.completed","response":{"status":"completed"}}"#,
         assert_eq!(base64(b"foo"), "Zm9v");
     }
 }
+
+#[path = "../../shared/http.rs"]
+pub mod http;

@@ -44,13 +44,13 @@ Copy the exact ABI package into `wit/deps/pluribus-plugin` or consume the releas
 There is one world, so most plugins target it directly:
 
 ```rust
-wit_bindgen::generate!({
+wit_bindgen::generate!({ generate_all,
     path: "wit",
     world: "plugin",
 });
 ```
 
-The generated `Guest` trait has three methods — `init`, `handle`, `stop` —
+The generated `Guest` trait has three methods — `run`, `handle`, `stop` —
 whatever the plugin does.
 
 A plugin that wants fewer imports linked than the standard world offers may
@@ -60,9 +60,11 @@ declare its own:
 package dev-example:battery@0.1.0;
 
 world battery {
-  import pluribus:plugin/events@1.0.0;
-  import pluribus:plugin/http@1.0.0;
-  export pluribus:plugin/lifecycle@1.0.0;
+  import pluribus:plugin/runtime@2.0.0;
+  import pluribus:plugin/events@2.0.0;
+  import wasi:http/types@0.3.0;
+  import wasi:http/client@0.3.0;
+  export pluribus:plugin/lifecycle@2.0.0;
 }
 ```
 
@@ -82,7 +84,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = { version = "=0.41.0", default-features = false, features = ["macros", "realloc"] }
+wit-bindgen = { version = "0.62", default-features = false, features = ["macros", "realloc", "async", "async-spawn"] }
 ```
 
 Pin the guest binding version and `Cargo.lock`. Generated binding module paths may change between tool versions; the WIT interface does not.
@@ -92,7 +94,7 @@ Pin the guest binding version and `Cargo.lock`. Generated binding module paths m
 Generated bindings expose one guest trait per exported interface and functions for imported interfaces. A component normally uses one zero-sized type:
 
 ```rust
-wit_bindgen::generate!({
+wit_bindgen::generate!({ generate_all,
     path: "wit",
     world: "battery",
 });
@@ -103,11 +105,24 @@ use pluribus::plugin::types::{Error, Event, Payload, Proposal};
 struct Plugin;
 
 impl Guest for Plugin {
-    fn init(_context: Context, _config: Vec<u8>) -> Result<Outcome, Error> {
-        Ok(empty())
+    async fn run(mut context: Context, _config: Vec<u8>) -> Result<(), Error> {
+        use pluribus::plugin::runtime;
+        runtime::ready(vec![], vec![]).await?;
+        loop {
+            match runtime::next().await? {
+                runtime::Wake::Events(events) => match Self::handle(context.clone(), events).await {
+                    Ok(outcome) => {
+                        runtime::commit(&outcome.events, &outcome.mutations, outcome.checkpoint)?;
+                        context.state_checkpoint = outcome.checkpoint.unwrap_or(context.state_checkpoint);
+                    }
+                    Err(error) => runtime::reject(&error)?,
+                },
+                runtime::Wake::Stop(_) => return Ok(()),
+            }
+        }
     }
 
-    fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         let mut proposals = Vec::new();
         let mut checkpoint = None;
 

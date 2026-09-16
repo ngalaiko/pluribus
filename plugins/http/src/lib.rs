@@ -1,24 +1,80 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-wit_bindgen::generate!({path:"../../wit",world:"source"});
+wit_bindgen::generate!({ generate_all,path:"../../wit",world:"plugin"});
 mod common;
 use common::*;
 use exports::pluribus::plugin::lifecycle::{Context, Guest as Lifecycle, Outcome};
 use pluribus::plugin::{
     events, socket, state,
-    types::{Error, Event, IngressOutcome, Mutation, StateEntry},
+    types::{Error, Event, Mutation, StateEntry},
 };
 use serde_json::json;
 struct Http;
 impl Lifecycle for Http {
-    fn init(_: Context, _: Vec<u8>) -> Result<Outcome, Error> {
-        socket::subscribe(b"{\"op\":\"subscribe\"}\n")?;
-        Ok(Outcome {
-            events: vec![],
-            mutations: vec![],
-            checkpoint: None,
-        })
+    async fn run(mut context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        use pluribus::plugin::runtime;
+        let mut delay: u32 = 0;
+        loop {
+            if Self::waiting(&mut context, async {
+                crate::wasi::clocks::monotonic_clock::wait_for(u64::from(delay) * 1_000_000).await;
+                Ok(())
+            })
+            .await?
+            .is_none()
+            {
+                return Ok(());
+            }
+
+            let result: Result<bool, Error> = async {
+                let (read, write) = socket::listen()?;
+                let (mut input, completion) = read.read_via_stream().await?;
+                let mut completion = Some(completion);
+                write.send(b"{\"op\":\"subscribe\"}\n")?;
+                loop {
+                    let Some(chunk) = Self::waiting(&mut context, async {
+                        let (_, bytes) = input.read(Vec::with_capacity(32 * 1024)).await;
+                        let closed = bytes.is_empty();
+                        if closed {
+                            completion.take().unwrap().await?;
+                        }
+                        Ok(pluribus::plugin::types::Chunk { bytes, closed })
+                    })
+                    .await?
+                    else {
+                        return Ok(true);
+                    };
+                    if !chunk.bytes.is_empty() {
+                        let out = Self::poll()?;
+                        runtime::commit(&out.events, &out.mutations, None)?;
+                    }
+                    if chunk.closed {
+                        return Err(error("listener disconnected"));
+                    }
+                }
+                #[allow(unreachable_code)]
+                Ok(false)
+            }
+            .await;
+            match result {
+                Ok(true) => return Ok(()),
+                Ok(false) => delay = 100,
+                Err(error)
+                    if !error.retryable
+                        && !matches!(
+                            error.code,
+                            pluribus::plugin::types::ErrorCode::DeadlineExceeded
+                        ) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => delay = delay.saturating_mul(2).clamp(100, 30_000),
+            }
+        }
     }
-    fn handle(context: Context, input: Vec<Event>) -> Result<Outcome, Error> {
+
+    async fn handle(context: Context, input: Vec<Event>) -> Result<Outcome, Error> {
         let output = Outcome {
             events: vec![],
             mutations: vec![],
@@ -61,17 +117,15 @@ impl Lifecycle for Http {
         })
     }
 }
-impl exports::pluribus::plugin::ingress::Guest for Http {
-    fn receive(input: Vec<u8>) -> Result<IngressOutcome, Error> {
-        let input: serde_json::Value =
-            serde_json::from_slice(&input).map_err(|_| error("invalid stream input"))?;
-        let mut output = IngressOutcome {
+
+export!(Http);
+
+impl Http {
+    fn poll() -> Result<SourceOutput, Error> {
+        let mut output = SourceOutput {
             events: vec![],
             mutations: vec![],
         };
-        if input["kind"] != "socket" {
-            return Ok(output);
-        }
         let after = state::get("cursor")?
             .and_then(|b| String::from_utf8(b).ok())
             .and_then(|s| s.parse::<u64>().ok())
@@ -110,4 +164,48 @@ impl exports::pluribus::plugin::ingress::Guest for Http {
         Ok(output)
     }
 }
-export!(Http);
+
+struct SourceOutput {
+    events: Vec<pluribus::plugin::types::Proposal>,
+    mutations: Vec<pluribus::plugin::types::Mutation>,
+}
+
+impl Http {
+    /// Services internal deliveries while external work is suspended.
+    async fn waiting<T>(
+        context: &mut Context,
+        work: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<Option<T>, Error> {
+        use futures_util::future::{Either, select};
+        use pluribus::plugin::runtime::{self, Wake};
+        futures_util::pin_mut!(work);
+        loop {
+            match select(Box::pin(runtime::next()), work.as_mut()).await {
+                Either::Left((wake, _)) => match wake? {
+                    Wake::Stop(_) => {
+                        // Finish cancelled imports before dropping their borrowed resources.
+                        let _ = work.await;
+                        return Ok(None);
+                    }
+                    Wake::Events(events) => match Self::handle(context.clone(), events).await {
+                        Ok(out) => {
+                            runtime::commit(&out.events, &out.mutations, out.checkpoint)?;
+                            context.state_checkpoint =
+                                out.checkpoint.unwrap_or(context.state_checkpoint);
+                        }
+                        Err(error) => runtime::reject(&error)?,
+                    },
+                },
+                Either::Right((result, _)) => return result.map(Some),
+            }
+        }
+    }
+}
+
+fn setup(_: Context, _: Vec<u8>) -> Result<Outcome, Error> {
+    Ok(Outcome {
+        events: vec![],
+        mutations: vec![],
+        checkpoint: None,
+    })
+}

@@ -456,8 +456,6 @@ records secret bytes.
 Plugin-emitted, both carrying `dev.pluribus.telegram.media.v1`:
 
 ```text
-telegram.media-ready
-telegram.media-failed
 ```
 
 ## Deduplication

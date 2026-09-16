@@ -1,4 +1,4 @@
-abi = "pluribus:plugin@1.0.0"
+abi = "pluribus:plugin@2.0.0"
 manifest_version = 1
 id = "dev.pluribus.shell"
 name = "Shell"
@@ -8,15 +8,10 @@ license = "MIT OR Apache-2.0"
 
 [components.main]
 config_schema = "config.schema.json"
-world = "pluribus:plugin/plugin@1.0.0"
+world = "pluribus:plugin/plugin@2.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
-imports = [
-  "pluribus:plugin/credentials@1.0.0",
-  "pluribus:plugin/reader@1.0.0",
-  "pluribus:plugin/socket@1.0.0",
-  "pluribus:plugin/writer@1.0.0",
-]
+imports = ["pluribus:plugin/runtime@2.0.0", "pluribus:plugin/credentials@2.0.0", "pluribus:plugin/reader@2.0.0", "pluribus:plugin/socket@2.0.0", "pluribus:plugin/writer@2.0.0"]
 emits = ["capability.completed", "capability.failed"]
 [[components.main.provides]]
 capability = "shell.execute"

@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+http.workspace = true
+http-body-util.workspace = true
+http-body.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+wasmtime-wasi-http.workspace = true
 getrandom.workspace = true
 pluribus-host-http = { path = "../pluribus-host-http" }
 tokio.workspace = true

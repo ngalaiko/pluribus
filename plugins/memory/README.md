@@ -81,21 +81,21 @@ RLM configurations must include those tool descriptions and schemas themselves.
 ## RLM
 
 ```js
-const found = await memory.recall({
+const found = (await capabilities.invoke('memory.recall', {
   scope: 'project:pluribus-v2', query: 'version control', limit: 8
-});
+})).output;
 return found.records;
 ```
 
 ```js
-return await memory.remember({
+return (await capabilities.invoke('memory.remember', {
   operationId: context.observationEventId + ':vcs',
   scope: 'project:pluribus-v2',
   kind: 'procedure',
   content: 'Use Jujutsu. Never push to remote.',
   sources: [context.observationEventId],
   basis: 'explicit'
-});
+})).output;
 ```
 
 Await the write receipt before claiming success. Reuse an operation ID only
@@ -120,6 +120,6 @@ Children receive selected records as context and cannot call memory directly.
 ```sh
 cargo +1.95.0 test --manifest-path plugins/memory/Cargo.toml
 cargo +1.95.0 test --manifest-path plugins/rlm/Cargo.toml
-cargo +1.95.0 test --manifest-path plugins/rlm/js/Cargo.toml
+cargo +1.95.0 test --manifest-path plugins/rlm/repl/Cargo.toml
 cargo +1.95.0 test -p pluribus-cognition --test memory
 ```

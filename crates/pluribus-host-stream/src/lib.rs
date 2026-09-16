@@ -101,7 +101,7 @@ impl StreamService for LocalStreamService {
         self.open_channel(grant, false).await
     }
 
-    async fn subscribe(&self, grant: &StreamGrant) -> Result<String, StreamError> {
+    async fn listen(&self, grant: &StreamGrant) -> Result<String, StreamError> {
         self.open_channel(grant, true).await
     }
 

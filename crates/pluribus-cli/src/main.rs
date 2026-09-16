@@ -1462,12 +1462,7 @@ mod tests {
                 .unwrap()
                 .contains(&json!("observation.received"))
         );
-        assert!(
-            receive["subscribes"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("timer.fired"))
-        );
+        assert_eq!(receive["subscribes"], json!([]));
         assert!(
             serde_json::to_value(&config.plugin_instances["rlm"]).unwrap()["config"]
                 .get("components")

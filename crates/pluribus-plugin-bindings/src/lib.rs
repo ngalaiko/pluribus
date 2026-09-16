@@ -9,5 +9,14 @@
 wasmtime::component::bindgen!({
     path: "../../wit",
     world: "plugin",
-    async: true,
+    with: { "wasi:http/types": wasmtime_wasi_http::p3::bindings::http::types },
+    imports: {
+        "wasi:random/random.get-random-bytes": async | trappable,
+        "wasi:random/random.get-random-u64": async | trappable,
+        default: async
+    },
+    exports: {
+
+        default: async,
+    },
 });

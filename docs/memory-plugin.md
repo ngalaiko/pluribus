@@ -25,7 +25,7 @@ reject multiple providers for the same memory capability within an agent.
 
 ## Package
 
-Use the existing `pluribus:plugin@1.0.0` world and lifecycle. Import only `events`
+Use the existing `pluribus:plugin@2.0.0` world and lifecycle. Import only `events`
 and `state`; no HTTP, sockets, credentials, or filesystem access.
 
 Provide `memory.recall`, `memory.get`, `memory.remember`, `memory.supersede`, and
@@ -211,10 +211,11 @@ Replay rejects event emission; replay providers may import only events/state.
 
 ## RLM integration
 
-Map JS `memory.recall/get/remember/supersede/forget` yields to ordinary
-`capability.requested` events. Preserve the root observation as the authority
-origin and persist request/session/yield correlation in RLM state. The memory
-facade unwraps `output`; failed or denied requests reject the suspended promise.
+Use the generic `capabilities.invoke(name, arguments)` bridge and supplied
+capability schemas to emit ordinary `capability.requested` events. Preserve the root observation as the authority
+origin and persist request/session/yield correlation in RLM state. Successful
+calls return the capability receipt; callers read its `output` field. Failed or
+denied requests reject the suspended promise.
 Handle all terminal outcomes, including cancellation and timeout, so cells
 cannot wait forever. These calls count toward the existing cell yield ceiling.
 
@@ -235,12 +236,12 @@ ID as `context.observationEventId` in the proposed JS context.
 First model-generated cell retrieves evidence:
 
 ```js
-state.workflow = await memory.recall({
+state.workflow = (await capabilities.invoke('memory.recall', {
   query: "version control workflow",
   scope: "project:pluribus-v2",
   limit: 8,
   maxBytes: 6000
-});
+})).output;
 return state.workflow;
 ```
 
@@ -248,14 +249,14 @@ The cell yields; core authorizes recall; memory answers; RLM resumes the cell.
 The next model call sees the Jujutsu record and its source, and requests a write:
 
 ```js
-state.saved = await memory.remember({
+state.saved = (await capabilities.invoke('memory.remember', {
   operationId: context.observationEventId + ":no-push",
   kind: "procedure",
   content: "Never push to remote in pluribus-v2.",
   scope: "project:pluribus-v2",
   sources: [context.observationEventId],
   basis: "explicit"
-});
+})).output;
 return state.saved;
 ```
 

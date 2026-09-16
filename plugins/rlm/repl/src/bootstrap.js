@@ -22,9 +22,6 @@
   globalThis.history = Object.freeze({read: args => request('history.read', args)});
   globalThis.rlm = Object.freeze({query: args => request('rlm.query', args)});
   globalThis.capabilities = Object.freeze({invoke: (name, args) => request('capability.invoke', {name, arguments: args})});
-  globalThis.memory = Object.freeze(Object.fromEntries(
-    ['recall', 'get', 'remember', 'supersede', 'forget'].map(name =>
-      [name, args => request('memory.' + name, args)])));
   globalThis.__start = source => {
     if (result?.status === 'running') throw Error('cell already running');
     result = {status: 'running'};

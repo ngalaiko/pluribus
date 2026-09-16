@@ -7,6 +7,8 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib"]
 [dependencies]
+url.workspace = true
+futures-util.workspace = true
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true

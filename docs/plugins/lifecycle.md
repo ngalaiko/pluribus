@@ -46,22 +46,16 @@ Changing configuration restarts the instance. Changing grants affects new activi
 
 Required capability requests without matching grants prevent activation. Optional requests remain denied.
 
-## Init
+## Startup
 
-The host instantiates declared imports as policy-enforcing host
-implementations, applies resource limits, then calls `lifecycle.init` once with
-the configuration already validated against the manifest schema. Secret values
-appear only as opaque credential handles.
+The host calls `lifecycle.run(context, config)` once with validated configuration
+and opaque credential handles. The plugin validates remaining constraints,
+loads local configuration, and calls `runtime.ready(events, mutations)` promptly.
 
-`init` MUST:
-
-- validate plugin-specific configuration not expressible in JSON Schema;
-- tolerate an empty state namespace;
-- return promptly;
-- avoid spawning background work.
-
-`init` MUST NOT alter grants, send user messages, or begin polling. The host
-schedules deliveries after a successful init.
+`ready` submits startup output for an atomic commit and suspends the loop.
+The host replays history through `handle` before activation releases `ready`.
+Startup must tolerate empty state and must not send messages or begin polling.
+An error or timeout before readiness prevents activation.
 
 Nothing is discovered by calling the plugin. Capabilities, models and
 credentials are manifest data, so activation needs no descriptor round trip.
@@ -85,10 +79,10 @@ nor clears namespaces on version changes.
 
 An update with the same plugin ID is staged beside the active version. The host
 validates it as a fresh package, checks grant expansion, drains the old
-instance, runs `init` on the candidate, and switches routing atomically.
+instance, runs the candidate to `ready`, and switches routing atomically.
 
-If init fails, the host restores old code, state, configuration, and routing.
-External effects made before failure cannot be rolled back; `init` forbids them
+If startup fails, the host restores old code, state, configuration, and routing.
+External effects made before failure cannot be rolled back; startup forbids them
 for this reason.
 
 Active calls finish on the old version during draining unless cancelled. New calls use only one version. A call never changes plugin code midway.
@@ -126,7 +120,7 @@ session, which fails its activity.
 The host does not automatically retry:
 
 - non-idempotent capability calls with ambiguous outcomes;
-- failed `init` calls;
+- failed startup calls;
 - invalid arguments;
 - permission denials.
 
@@ -142,12 +136,34 @@ Four versions are independent:
 - plugin version;
 - plugin-owned payload and state formats.
 
-ABI `1.0.0` requires an exact match. The host may support several ABI versions side by side later.
+ABI `2.0.0` requires an exact match. The host may support several ABI versions side by side later.
 
 Minor versions may add a standard world; patch versions may clarify behavior or fix documentation. Neither changes an existing interface type; that requires a new major ABI package version.
 
 Plugin SemVer describes plugin behavior. Changing capability semantics, schemas, provider IDs, state interpretation, or required authority is breaking even when WIT is unchanged.
 
-Source components may additionally export `ingress.receive` in the `source`
-world. Core delivers transient subscription input there; only returned events
-and mutations are durable. See [subscriptions](stream.md#subscriptions).
+## Source loops
+
+Every plugin starts through `lifecycle.run(context, config)` and waits at
+`runtime.ready` until activation and replay finish. Handler-only plugins then
+await `runtime.next` and dispatch events to their handler through a shared loop.
+
+The plugin owns polling, framing, downloads, retries, and pacing. It awaits
+`wasi:http/client.send`, native byte streams, WASI clock waits, or `runtime.next`. These suspend
+without occupying a worker thread. Core never repeats a network request.
+
+A source selects between its pending operation and `runtime.next()`. Internal
+deliveries invoke its own handler, then commit or reject the result before
+waiting for another delivery. One task owns the plugin state; core never
+re-enters its Wasm instance. Requests keep running while the loop handles
+internal events.
+
+`runtime.commit(events, mutations, checkpoint)` commits atomically. External
+observations require stable idempotency keys and omit the checkpoint. Internal
+deliveries must supply a checkpoint from their batch. `runtime.reject(error)`
+leaves that batch available for retry. Empty commits write no events; an idle
+source simply awaits work.
+
+Shutdown wakes the loop, waits for its async task and subtasks to exit, then
+calls `stop`. Cancellation interrupts waits. A restart starts
+a fresh `run` call with the committed state. Compute between waits remains bounded.

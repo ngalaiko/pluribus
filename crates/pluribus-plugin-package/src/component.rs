@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use wit_parser::decoding::{DecodedWasm, decode};
 use wit_parser::{Resolve, WorldItem};
 
-const ABI_PACKAGE: &str = "pluribus:plugin@1.0.0";
-const LIFECYCLE_EXPORT: &str = "pluribus:plugin/lifecycle@1.0.0";
+const ABI_PACKAGE: &str = "pluribus:plugin@2.0.0";
+const LIFECYCLE_EXPORT: &str = "pluribus:plugin/lifecycle@2.0.0";
 
 pub(crate) fn validate_component(
     abi: &str,
@@ -19,8 +19,11 @@ pub(crate) fn validate_component(
         ));
     };
     let world = &resolve.worlds[world_id];
-    if abi != ABI_PACKAGE {
-        return Err(PackageError::new(format!("unsupported plugin ABI: {abi}")));
+    if abi != ABI_PACKAGE || manifest.world != "pluribus:plugin/plugin@2.0.0" {
+        return Err(PackageError::new(format!(
+            "unsupported plugin ABI/world: {abi}/{}",
+            manifest.world
+        )));
     }
 
     let actual_imports = interface_ids(&resolve, world.imports.values(), "import", true)?;
@@ -30,16 +33,12 @@ pub(crate) fn validate_component(
     }
 
     let actual_exports = interface_ids(&resolve, world.exports.values(), "export", false)?;
-    let mut expected_exports = BTreeSet::from([String::from(LIFECYCLE_EXPORT)]);
-    if manifest.world == "pluribus:plugin/source@1.0.0" {
-        expected_exports.insert("pluribus:plugin/ingress@1.0.0".into());
-    }
+    let expected_exports = BTreeSet::from([String::from(LIFECYCLE_EXPORT)]);
     if actual_exports != expected_exports {
         return Err(set_mismatch("exports", &expected_exports, &actual_exports));
     }
 
-    // `manifest.world` is not checked against the component: encoding renames
-    // the component's own world to `root:component/root`, so the authored world
+    // Encoding renames the component's own world to `root:component/root`, so the authored world
     // name does not survive. Import and export set equality above is the real
     // check.
 

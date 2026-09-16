@@ -86,7 +86,7 @@ fn event_request(event_type: &str, payload: &Value) -> AppendRequest {
         stream_kind: StreamKind::Agent,
         observed_at_ms: None,
         event_type: event_type.into(),
-        payload_schema: "dev.pluribus.js.cell/1".into(),
+        payload_schema: "dev.pluribus.repl.cell/1".into(),
         payload: EventPayload::CanonicalJson(serde_json::to_vec(payload).unwrap()),
         actor: PrincipalRef::new(PrincipalKind::Agent, "personal"),
         authority_id: Some(AuthorityId::new("authority-1")),
@@ -151,17 +151,17 @@ async fn packaged_cognition_recurses_through_events_and_preserves_parent_state()
         PrincipalRef::new(PrincipalKind::Agent, "personal"),
     );
     for (id, path, config) in [
-        ("cognition", "rlm", json!({"js":{}})),
-        ("code", "js", json!({})),
+        ("cognition", "rlm", json!({"repl":{}})),
+        ("code", "repl", json!({})),
     ] {
         agent
             .install_component(
                 PluginPackage::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
                     "../../target/plugins/{}",
-                    if path == "js" { "rlm" } else { path }
+                    if path == "repl" { "rlm" } else { path }
                 )))
                 .unwrap()
-                .component(if path == "rlm" { "cognition" } else { "js" })
+                .component(if path == "rlm" { "cognition" } else { "repl" })
                 .unwrap(),
                 &config,
                 Delivery {
@@ -393,7 +393,7 @@ async fn blocked_provider(stopping: bool) {
         (
             "cognition",
             "rlm",
-            json!({"js":{}}),
+            json!({"repl":{}}),
             PluginServices {
                 model: Some("test".into()),
                 ..PluginServices::default()
@@ -405,12 +405,12 @@ async fn blocked_provider(stopping: bool) {
             .install_component(
                 PluginPackage::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
                     "../../target/plugins/{}",
-                    if plugin == "js" { "rlm" } else { plugin }
+                    if plugin == "repl" { "rlm" } else { plugin }
                 )))
                 .unwrap()
                 .component(match plugin {
                     "rlm" => "cognition",
-                    "js" => "js",
+                    "repl" => "repl",
                     "echo" => "",
                     _ => "main",
                 })
@@ -533,20 +533,20 @@ async fn persistent_agent_on(
         PrincipalRef::new(PrincipalKind::Agent, "personal"),
     );
     for (id, plugin, config) in [
-        ("cognition", "rlm", json!({"js":{}})),
-        ("code", "js", json!({})),
+        ("cognition", "rlm", json!({"repl":{}})),
+        ("code", "repl", json!({})),
         ("echo", "echo", json!({})),
     ] {
         agent
             .install_component(
                 PluginPackage::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
                     "../../target/plugins/{}",
-                    if plugin == "js" { "rlm" } else { plugin }
+                    if plugin == "repl" { "rlm" } else { plugin }
                 )))
                 .unwrap()
                 .component(match plugin {
                     "rlm" => "cognition",
-                    "js" => "js",
+                    "repl" => "repl",
                     "echo" => "",
                     _ => "main",
                 })
@@ -683,9 +683,12 @@ async fn projection(store: &Arc<SqliteEventStore<Metadata>>) -> Value {
     engine
 }
 async fn drive(agent: &mut Agent<AllowAll, TestAuthority>, now: i64) {
-    for _ in 0..8 {
-        agent.tick_wait(now).await.unwrap();
+    for _ in 0..64 {
+        if agent.tick_wait(now).await.unwrap().is_idle() {
+            return;
+        }
     }
+    panic!("agent did not become idle");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -732,7 +735,7 @@ async fn packaged_jobs_rebuild_corrections_and_wakes() {
     scripted(
         &store,
         &second,
-        yield_control(json!({"action":"continue","note":"Tests next"})),
+        yield_control(json!({"action":"wait","dueAtMs":clock.load(Ordering::Relaxed) + 60_000,"note":"External deadline"})),
     )
     .await;
     drive(&mut agent, clock.load(Ordering::Relaxed)).await;
@@ -768,7 +771,7 @@ async fn packaged_jobs_rebuild_corrections_and_wakes() {
     scripted(
         &store,
         &background,
-        yield_control(json!({"action":"continue"})),
+        yield_control(json!({"action":"wait","dueAtMs":clock.load(Ordering::Relaxed) + 120_000})),
     )
     .await;
     drive(&mut agent, clock.load(Ordering::Relaxed)).await;
@@ -960,7 +963,16 @@ async fn packaged_reference_scenario_corrects_running_tests_and_restarts_before_
                 && payload(e)["capability"] == "telegram.reply"
         })
         .collect::<Vec<_>>();
-    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        replies.len(),
+        1,
+        "projection: {}; events: {:?}",
+        projection(&store).await,
+        events
+            .iter()
+            .map(|e| (&e.request.event_type, payload(e)))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         replies[0].request.causation_id.as_ref(),
         Some(&origin.event_id)
@@ -1636,7 +1648,9 @@ async fn packaged_clarification_preserves_other_jobs_and_sends_specific_question
     scripted(
         &store,
         model_requests(&store).await.last().unwrap(),
-        yield_control(json!({"action":"continue","note":"Run tests"})),
+        yield_control(
+            json!({"action":"wait","dueAtMs":1_800_000_000_000_i64,"note":"External deadline"}),
+        ),
     )
     .await;
     drive(&mut agent, 1).await;
@@ -1695,7 +1709,7 @@ async fn packaged_router_cannot_ignore_user_input() {
     scripted(
         &store,
         model_requests(&store).await.last().unwrap(),
-        yield_control(json!({"action":"continue"})),
+        yield_control(json!({"action":"wait","dueAtMs":1_800_000_000_000_i64})),
     )
     .await;
     drive(&mut agent, 1).await;
@@ -2099,4 +2113,102 @@ async fn install_cancellable_shell(
         )
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packaged_reasoning_preserves_large_state_across_budget_pause() {
+    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1), clock.clone()))
+            .await
+            .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    let origin = observation(&store, json!({})).await;
+    drive(&mut agent, clock.load(Ordering::Relaxed)).await;
+    let js = |source: &str| json!([{"kind":"tool-call","name":"js","call_id":"cell","arguments":{"code":source}}]);
+    scripted(
+        &store,
+        model_requests(&store).await.last().unwrap(),
+        js("state.large = 'x'.repeat(250000); return state.large.length;"),
+    )
+    .await;
+    drive(&mut agent, clock.load(Ordering::Relaxed)).await;
+    for n in 1..32 {
+        scripted(
+            &store,
+            model_requests(&store).await.last().unwrap(),
+            js(&format!("return {{step:{n},length:state.large.length}};")),
+        )
+        .await;
+        drive(&mut agent, clock.load(Ordering::Relaxed)).await;
+    }
+    assert_eq!(
+        projection(&store).await["jobs"][origin.event_id.as_str()]["status"],
+        "paused-budget"
+    );
+    clock.fetch_add(60_000, Ordering::Relaxed);
+    drive(&mut agent, clock.load(Ordering::Relaxed)).await;
+    scripted(
+        &store,
+        model_requests(&store).await.last().unwrap(),
+        js("return {retained:state.large.length};"),
+    )
+    .await;
+    drive(&mut agent, clock.load(Ordering::Relaxed)).await;
+    let events = store
+        .read(&StreamId::new("personal"), 0, 10000)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.request.event_type == "code.completed"
+                && payload(e)["value"] == json!({"retained":250_000}))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.request.event_type == "code.close-requested")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packaged_empty_reasoning_reports_stall_without_timer() {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(
+            AtomicU64::new(1),
+            Arc::new(AtomicI64::new(1_700_000_000_000)),
+        ))
+        .await
+        .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    let origin = observation(&store, json!({})).await;
+    drive(&mut agent, 1).await;
+    for _ in 0..3 {
+        scripted(
+            &store,
+            model_requests(&store).await.last().unwrap(),
+            json!([]),
+        )
+        .await;
+        drive(&mut agent, 1).await;
+    }
+    assert_eq!(
+        projection(&store).await["jobs"][origin.event_id.as_str()]["status"],
+        "failed"
+    );
+    let events = store
+        .read(&StreamId::new("personal"), 0, 10000)
+        .await
+        .unwrap();
+    assert!(!events.iter().any(|e| e.request.event_type == "timer.set"));
+    assert!(events.iter().any(|e| {
+        e.request.event_type == "capability.requested"
+            && payload(e)["capability"] == "telegram.reply"
+            && payload(e)["arguments"]["text"]
+                .as_str()
+                .is_some_and(|s| s.contains("stalled"))
+    }));
 }

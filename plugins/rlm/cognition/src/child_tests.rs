@@ -95,6 +95,9 @@ fn child_cycle_timeout_settles_root_tool_call() {
     root_with_a_cell(&mut e, &c);
     e.now_ms = 1_800_000;
     let requests = delegated_child(&mut e, &c, "o", Value::Null);
+    assert!(requests.iter().any(|d| d.kind == "code.resumed" && d.payload["response"]["error"].is_string()));
+    assert!(!requests.iter().any(|d| d.kind == "timer.set"));
+    let requests = e.event(&c, "root-cell", "code.failed", &json!({"sessionId":"o","reason":"child budget exhausted"}), None);
     let timer = requests.iter().find(|d| d.kind == "timer.set").unwrap();
     e.event(&c, "budget-timer", "timer.set", &timer.payload, None);
     let mut e: Engine = serde_json::from_value(serde_json::to_value(&e).unwrap()).unwrap();

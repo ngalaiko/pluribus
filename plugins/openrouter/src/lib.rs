@@ -7,16 +7,16 @@ use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-wit_bindgen::generate!({
+wit_bindgen::generate!({ generate_all,
     path: "../../wit",
     world: "plugin",
 });
 
+use crate::http::Reader;
+use crate::http::{Header, Request};
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::blobs;
 use pluribus::plugin::events;
-use pluribus::plugin::http::{self, Header, Request};
-use pluribus::plugin::reader::Reader;
 use pluribus::plugin::types::{self, Error, ErrorCode, Event, Payload, Proposal};
 
 use pluribus_model::{
@@ -71,21 +71,30 @@ struct Config {
 
 struct OpenRouter;
 
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+
+fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let parsed: Config = serde_json::from_slice(&config)
+        .map_err(|error| invalid(format!("invalid configuration: {error}")))?;
+    if parsed.credentials.api_key.is_empty() {
+        return Err(invalid("credential handle is empty"));
+    }
+    if parsed.models.is_empty() {
+        return Err(invalid("at least one model is required"));
+    }
+    CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
+    Ok(empty_outcome())
+}
+
 impl Guest for OpenRouter {
-    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let parsed: Config = serde_json::from_slice(&config)
-            .map_err(|error| invalid(format!("invalid configuration: {error}")))?;
-        if parsed.credentials.api_key.is_empty() {
-            return Err(invalid("credential handle is empty"));
-        }
-        if parsed.models.is_empty() {
-            return Err(invalid("at least one model is required"));
-        }
-        CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
-        Ok(empty_outcome())
+    async fn run(context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        serve::<Self>(context).await
     }
 
-    fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         let config = config()?;
         let mut proposals = Vec::new();
         let mut checkpoint = None;
@@ -1000,3 +1009,6 @@ mod tests {
         assert!(!error.retryable);
     }
 }
+
+#[path = "../../shared/http.rs"]
+pub mod http;

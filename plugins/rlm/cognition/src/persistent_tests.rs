@@ -97,7 +97,7 @@ fn cancelled_job_ignores_late_model_result_and_duplicate_observation() {
     assert_eq!(e.jobs["one"].status, "cancelled");
 }
 #[test]
-fn continuation_uses_owned_revision_after_restart() {
+fn scheduled_wait_uses_owned_revision_after_restart() {
     let mut e = Engine::default();
     let c = config();
     let first = observe(&mut e, &c, "one", json!({})).remove(0);
@@ -105,7 +105,7 @@ fn continuation_uses_owned_revision_after_restart() {
         &mut e,
         &c,
         &first,
-        r#"{"transition":"continue","note":"more work"}"#,
+        r#"{"transition":"wait","dueAtMs":60000,"note":"Check external deadline"}"#,
     )
     .remove(0);
     e.event(&c, "timer1", "timer.set", &timer.payload, None);
@@ -129,7 +129,7 @@ fn continuation_uses_owned_revision_after_restart() {
         )
         .is_empty()
     );
-    let timer = answer(&mut e, &c, &next, r#"{"transition":"continue"}"#).remove(0);
+    let timer = answer(&mut e, &c, &next, r#"{"transition":"wait","dueAtMs":180000}"#).remove(0);
     e.event(&c, "timer2", "timer.set", &timer.payload, None);
     let mut e: Engine = serde_json::from_value(serde_json::to_value(&e).unwrap()).unwrap();
     e.now_ms = 180_000;
@@ -242,7 +242,7 @@ fn ambiguous_association_preserves_input_and_existing_wait() {
     assert!(!response.iter().any(|d| d.kind == "model.requested"));
 }
 #[test]
-fn elapsed_cycle_checkpoints_instead_of_admitting_more_inference() {
+fn elapsed_cycle_pauses_instead_of_admitting_more_inference() {
     let mut e = Engine::default();
     let c = config();
     let first = observe(&mut e, &c, "one", json!({})).remove(0);
@@ -255,7 +255,7 @@ fn elapsed_cycle_checkpoints_instead_of_admitting_more_inference() {
         &json!({"sessionId":"one","value":1}),
         None,
     );
-    assert_eq!(e.jobs["one"].status, "waiting-time");
+    assert_eq!(e.jobs["one"].status, "paused-budget");
     assert!(out.iter().any(|d| d.kind == "timer.set"));
     assert!(!out.iter().any(|d| d.kind == "model.requested"));
 }
@@ -299,7 +299,7 @@ fn omitted_progress_fields_preserve_completed_steps() {
         &mut e,
         &c,
         &next,
-        r#"{"transition":"continue","note":"Run tests"}"#,
+        r#"{"transition":"wait","dueAtMs":180000,"note":"Run tests"}"#,
     );
     assert_eq!(e.jobs["one"].completed_steps, json!(["reproduced"]));
     assert_eq!(e.jobs["one"].completion_conditions, json!(["tests pass"]));
@@ -397,13 +397,13 @@ fn retired_jobs_release_context_but_duplicate_observations_stay_inert() {
 }
 
 #[test]
-fn deferred_media_enriches_existing_observation_without_creating_work() {
+fn legacy_connector_events_do_not_mutate_observations() {
     let mut e = Engine::default();
     let c = config();
-    observe(&mut e, &c, "one", json!({"update_id":47,"media":[{"status":"pending"}]}));
+    observe(&mut e, &c, "one", json!({"update_id":47,"media":[{"status":"ready"}]}));
     let mut ready = e.inbox["one"].value.clone();
     ready["observationDeduplicationKey"] = json!("telegram:update:47");
-    ready["media"] = json!([{"status":"ready","blob":{"digest":"abc"}}]);
+    ready["media"] = json!([{"status":"failed"}]);
     assert!(e.event(&c, "media", "telegram.media-ready", &ready, None).is_empty());
     assert_eq!(e.jobs.len(), 1);
     assert_eq!(e.inbox["one"].value["media"][0]["status"], "ready");

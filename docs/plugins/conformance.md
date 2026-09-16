@@ -17,12 +17,13 @@ A plugin conforms only when its package, component, runtime behavior, and upgrad
 
 - Binary is a WebAssembly Component, not a core module.
 - Manifest world identifier is valid and the component shape matches its declared imports.
-- ABI is exactly `pluribus:plugin@1.0.0`.
+- ABI is exactly `pluribus:plugin@2.0.0`.
 - Actual Pluribus imports exactly equal `imports`.
 - No ambient WASI or unknown imports exist.
 - `lifecycle` is exported.
-- Exports are `lifecycle`, plus `ingress` for the `source` world.
-- Event consumers declare subscriptions; ingress sources declare emitted events.
+- The single `plugin` world exports `lifecycle` with `run`, `handle`, and `stop`.
+- Async source loops suspend while idle and commit events with state atomically.
+- Event consumers declare subscriptions; source loops declare emitted events.
 - Every type in `emits` is plugin-emittable or carries the `plugin.<id>.` prefix.
 - No unknown Pluribus role export exists.
 - Every descriptor and schema call succeeds within limits.

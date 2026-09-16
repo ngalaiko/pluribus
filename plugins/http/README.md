@@ -46,6 +46,7 @@ requests after restart. Core events provide persistence after delivery.
 No state directory, streaming, or WebSocket support.
 
 The listener pushes queue notifications over a persistent socket subscription.
-Core invokes the Wasm ingress callback, which drains the queue and emits HTTP
-requests. Idle waiting produces no timer or checkpoint events. Reconnects retain
+The Wasm plugin awaits socket input in its async `run` loop, drains the queue,
+and commits HTTP request events. It handles internal response events while
+waiting for more notifications. Idle waiting produces no timer or checkpoint events. Reconnects retain
 the committed queue cursor; request IDs deduplicate redelivery.

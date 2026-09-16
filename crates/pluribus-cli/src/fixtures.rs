@@ -40,8 +40,8 @@ pub fn config() -> Config {
             },
             "rlm": {
                 "package": package("rlm"),
-                "config": {"js": {}},
-                "components": {"cognition": {}, "js": {}}
+                "config": {"repl": {}},
+                "components": {"cognition": {}, "repl": {}}
             }
         },
         "model_instance": "codex-1/main"

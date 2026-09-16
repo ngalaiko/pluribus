@@ -54,14 +54,14 @@ rustPlatform.buildRustPackage {
     component telegram-send telegram/send.wasm
 
     component rlm-cognition rlm/cognition.wasm
-    # `getrandom` has no wasm32-unknown-unknown backend; the js component
+    # `getrandom` has no wasm32-unknown-unknown backend; the REPL component
     # supplies one. Its RUSTFLAGS would rebuild every other component, so it
     # builds under its own target directory.
     (
-      export CARGO_TARGET_DIR=target/js
+      export CARGO_TARGET_DIR=target/repl
       export RUSTFLAGS="$RUSTFLAGS --cfg getrandom_backend=\"custom\""
-      wasm=target/js/wasm32-unknown-unknown/release
-      component rlm-js rlm/js.wasm
+      wasm=target/repl/wasm32-unknown-unknown/release
+      component rlm-repl rlm/repl.wasm
     )
 
     cargo build --locked --release -p pluribus-plugin-http --bin pluribus-http-listener

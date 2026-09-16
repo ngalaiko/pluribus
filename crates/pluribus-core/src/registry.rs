@@ -41,8 +41,6 @@ pub const PLUGIN_EVENT_TYPES: &[&str] = &[
     "credential.enrollment.started",
     "http.request.received",
     "http.response.requested",
-    "telegram.media-ready",
-    "telegram.media-failed",
     // Requests. A requester proposes; the core gates dispatch and records
     // policy.decision either way, so a refused attempt stays auditable.
     "capability.requested",
@@ -128,8 +126,6 @@ impl EventTypeRegistry {
             );
         }
         for (kind, schema) in [
-            ("telegram.media-ready", "dev.pluribus.telegram.media.v1"),
-            ("telegram.media-failed", "dev.pluribus.telegram.media.v1"),
             ("operator.job-control", "pluribus.operator-job-control/1"),
             (
                 "operator.attempt-reconciled",

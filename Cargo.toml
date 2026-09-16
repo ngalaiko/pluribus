@@ -23,7 +23,7 @@ members = [
     "plugins/openai-codex",
     "plugins/openrouter",
     "plugins/rlm/cognition",
-    "plugins/rlm/js",
+    "plugins/rlm/repl",
     "plugins/shell",
     "plugins/telegram/core",
     "plugins/telegram/receive",
@@ -73,7 +73,13 @@ toml = { version = "1.1", default-features = false, features = ["parse", "serde"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt"] }
 url = "2.5"
-wasmtime = { version = "34.0", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "std"] }
-wit-bindgen = { version = "0.46", default-features = false, features = ["macros", "realloc"] }
-wit-component = { version = "0.258", features = ["dummy-module"] }
-wit-parser = { version = "0.258", default-features = false, features = ["decoding", "std"] }
+wasmtime = { version = "48.0.1", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift", "runtime", "std"] }
+wit-bindgen = { version = "0.62", default-features = false, features = ["macros", "realloc", "async", "async-spawn"] }
+wit-component = { version = "0.254", features = ["dummy-module"] }
+wit-parser = { version = "0.254", default-features = false, features = ["decoding"] }
+
+wasmtime-wasi-http = { version = "48.0.1", default-features = false, features = ["p3"] }
+http = "1"
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"

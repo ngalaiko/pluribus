@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64;
 use wit_component::ComponentEncoder;
 use wit_parser::{ManglingAndAbi, Resolve};
 
-struct Metadata(AtomicU64);
+pub(super) struct Metadata(AtomicU64);
 
 impl EventMetadataSource for Metadata {
     fn next_event_id(&self) -> EventId {
@@ -21,7 +21,7 @@ impl EventMetadataSource for Metadata {
     }
 }
 
-async fn store() -> Arc<SqliteEventStore<Metadata>> {
+pub(super) async fn store() -> Arc<SqliteEventStore<Metadata>> {
     Arc::new(
         SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1)))
             .await
@@ -50,7 +50,7 @@ fn delivery() -> Delivery {
     }
 }
 
-async fn host(emits: Vec<String>) -> HostState {
+pub(super) async fn host(emits: Vec<String>) -> HostState {
     let store = store().await;
     HostState::new(
         1024 * 1024,
@@ -62,13 +62,14 @@ async fn host(emits: Vec<String>) -> HostState {
             blobs: Arc::new(InMemoryBlobStore::default()),
             registry: Arc::new(EventTypeRegistry::core()),
             progress: Arc::new(tokio::sync::Notify::new()),
+            clock: Arc::new(system_time_ms),
         },
         PluginServices::default(),
         emits,
     )
 }
 
-fn proposal(event_type: &str) -> types::Proposal {
+pub(super) fn proposal(event_type: &str) -> types::Proposal {
     types::Proposal {
         event_type: event_type.into(),
         payload_schema: "test/1".into(),
@@ -280,8 +281,7 @@ async fn every_host_import_links() {
     let component = stub_component();
     let mut linker = Linker::new(&runtime.ticker.engine);
 
-    bindings::Plugin::add_to_linker::<HostState, HasSelf<HostState>>(&mut linker, |state| state)
-        .unwrap();
+    wasi_http::add_to_linker(&mut linker).unwrap();
     let compiled = Component::new(&runtime.ticker.engine, &component).unwrap();
 
     assert!(
@@ -379,20 +379,6 @@ impl StreamService for NullStream {
     fn shutdown_write(&self, _: &str) {}
     fn close(&self, _: &str) {}
 }
-fn byte_request() -> http::Request {
-    http::Request {
-        method: "GET".into(),
-        url: "https://example.com".into(),
-        headers: vec![],
-        body: None,
-        credential: None,
-        timeout_ms: 1000,
-    }
-}
-/// Host-side stand-in for the borrow the guest would pass.
-fn borrow<T: 'static>(handle: &Resource<T>) -> Resource<T> {
-    Resource::new_borrow(handle.rep())
-}
 async fn byte_host() -> HostState {
     let mut host = host(vec![]).await;
     host.http = Some(Arc::new(ByteHttp));
@@ -408,41 +394,6 @@ async fn byte_host() -> HostState {
         max_timeout_ms: 1000,
     });
     host
-}
-#[tokio::test]
-async fn sse_requests_unframed_bytes() {
-    let mut host = byte_host().await;
-    http::Host::sse(&mut host, byte_request()).await.unwrap();
-}
-#[tokio::test]
-async fn a_reader_keeps_unread_bytes_until_the_last_chunk() {
-    let mut host = byte_host().await;
-    let read = http::Host::sse(&mut host, byte_request()).await.unwrap();
-    let mut all = vec![];
-    loop {
-        let chunk = reader::HostReader::receive(&mut host, borrow(&read), 3, 1000)
-            .await
-            .unwrap();
-        all.extend(chunk.bytes);
-        if chunk.closed {
-            break;
-        }
-    }
-    assert_eq!(all, b"data: hello\n\n");
-}
-#[tokio::test]
-async fn an_exhausted_reader_rejects_further_reads() {
-    let mut host = byte_host().await;
-    let read = http::Host::sse(&mut host, byte_request()).await.unwrap();
-    while !reader::HostReader::receive(&mut host, borrow(&read), 64, 1000)
-        .await
-        .unwrap()
-        .closed
-    {}
-    let error = reader::HostReader::receive(&mut host, borrow(&read), 64, 1000)
-        .await
-        .expect_err("a closed channel has no transport left");
-    assert_eq!(error.code, types::ErrorCode::InvalidArgument);
 }
 #[tokio::test]
 async fn dropping_one_half_keeps_the_transport_for_the_other() {
@@ -496,22 +447,11 @@ async fn provider_http_timeout_cannot_exceed_the_lifecycle_deadline() {
             call_timeout: Duration::from_millis(100),
         },
     );
-    let request = store
-        .data()
-        .http_request(http::Request {
-            method: "GET".into(),
-            url: "https://test.invalid".into(),
-            headers: vec![],
-            body: None,
-            credential: None,
-            timeout_ms: 300_000,
-        })
-        .unwrap();
-    assert!(request.timeout_ms <= 100);
+    assert!(store.data().call_budget().unwrap() <= 100);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn packaged_telegram_subscription_requires_http_access() {
+async fn packaged_telegram_init_does_not_start_network_requests() {
     let (runtime, _) = runtime().await;
     let package = PluginPackage::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/telegram"),
@@ -526,8 +466,7 @@ async fn packaged_telegram_subscription_requires_http_access() {
         )
         .await
         .unwrap();
-    let error = instance.init().await.unwrap_err();
-    assert!(error.to_string().contains("HTTP service is unavailable"));
+    assert!(instance.init().await.unwrap().events.is_empty());
 }
 
 #[tokio::test]
@@ -572,13 +511,23 @@ async fn lifecycle_outcomes_have_distinct_deduplication_domains() {
         )
         .await
         .unwrap();
-    instance.store.data_mut().emits.push("timer.set".into());
+    instance
+        .core
+        .as_mut()
+        .unwrap()
+        .store
+        .data_mut()
+        .emits
+        .push("timer.set".into());
     let initialization = guest::Outcome {
         events: vec![proposal("timer.set")],
         mutations: vec![],
         checkpoint: None,
     };
     let initialized = instance
+        .core
+        .as_mut()
+        .unwrap()
         .commit(
             &initialization,
             Some(&EventId::new("origin-1")),
@@ -587,6 +536,9 @@ async fn lifecycle_outcomes_have_distinct_deduplication_domains() {
         .await
         .unwrap();
     let repeated = instance
+        .core
+        .as_mut()
+        .unwrap()
         .commit(
             &initialization,
             Some(&EventId::new("origin-1")),
@@ -597,6 +549,9 @@ async fn lifecycle_outcomes_have_distinct_deduplication_domains() {
     assert_eq!(initialized.events[0].event_id, repeated.events[0].event_id);
     let origin = EventId::new("origin-1");
     let handled = instance
+        .core
+        .as_mut()
+        .unwrap()
         .commit(
             &guest::Outcome {
                 events: vec![proposal("timer.set")],
@@ -610,6 +565,9 @@ async fn lifecycle_outcomes_have_distinct_deduplication_domains() {
         .unwrap();
     assert_ne!(initialized.events[0].event_id, handled.events[0].event_id);
     let stopped = instance
+        .core
+        .as_mut()
+        .unwrap()
         .commit(
             &guest::Outcome {
                 events: vec![proposal("timer.set")],
@@ -622,6 +580,9 @@ async fn lifecycle_outcomes_have_distinct_deduplication_domains() {
         .await
         .unwrap();
     let handled_again = instance
+        .core
+        .as_mut()
+        .unwrap()
         .commit(
             &guest::Outcome {
                 events: vec![proposal("timer.set")],
@@ -636,77 +597,13 @@ async fn lifecycle_outcomes_have_distinct_deduplication_domains() {
     assert_ne!(stopped.events[0].event_id, handled_again.events[0].event_id);
 }
 
-struct PendingHttp;
-#[async_trait::async_trait]
-impl pluribus_core::HttpService for PendingHttp {
-    async fn send(
-        &self,
-        _: &HttpGrant,
-        _: &HttpRequest,
-    ) -> Result<pluribus_core::HttpResponse, HttpError> {
-        std::future::pending().await
-    }
-}
-#[async_trait::async_trait]
-impl HttpStreamService for PendingHttp {
-    async fn open_stream(
-        &self,
-        _: &HttpGrant,
-        _: HttpStreamProtocol,
-        _: &HttpRequest,
-    ) -> Result<String, HttpError> {
-        std::future::pending().await
-    }
-    async fn receive(
-        &self,
-        _: &HttpGrant,
-        _: &str,
-        _: u32,
-        _: u32,
-    ) -> Result<pluribus_core::HttpFramePage, HttpError> {
-        std::future::pending().await
-    }
-    async fn send_frame(
-        &self,
-        _: &HttpGrant,
-        _: &str,
-        _: &pluribus_core::HttpFrame,
-    ) -> Result<(), HttpError> {
-        unreachable!()
-    }
-    fn close_stream(&self, _: &HttpGrant, _: &str) {}
-}
-
-#[tokio::test]
-async fn cancellation_interrupts_pending_http() {
-    let mut host = byte_host().await;
-    host.http = Some(Arc::new(PendingHttp));
-    let cancelled = host.cancelled.clone();
-    let (result, ()) = tokio::join!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            http::Host::send(&mut host, byte_request())
-        ),
-        async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            cancelled.store(true, Ordering::Release);
-        }
-    );
-    assert!(matches!(
-        result
-            .expect("pending HTTP ignored cancellation")
-            .unwrap_err()
-            .code,
-        types::ErrorCode::Cancelled
-    ));
-}
-
 struct GatedDelivery {
     store: Arc<dyn DeliveryStore>,
     entered: Arc<tokio::sync::Notify>,
     completed: Arc<tokio::sync::Notify>,
     release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
+
 #[async_trait::async_trait]
 impl DeliveryStore for GatedDelivery {
     async fn checkpoint(&self, cursor: &CursorKey) -> Result<u64, pluribus_core::DeliveryError> {
@@ -758,8 +655,8 @@ async fn interrupted_lifecycle_requires_reinstantiation() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let completed = Arc::new(tokio::sync::Notify::new());
     let (release, wait) = std::sync::mpsc::channel();
-    instance.delivery_store = Arc::new(GatedDelivery {
-        store: instance.delivery_store.clone(),
+    instance.core.as_mut().unwrap().delivery_store = Arc::new(GatedDelivery {
+        store: instance.core.as_mut().unwrap().delivery_store.clone(),
         entered: entered.clone(),
         completed: completed.clone(),
         release: std::sync::Mutex::new(Some(wait)),
@@ -936,9 +833,10 @@ async fn credential_exports_are_scoped_without_raw_record_access() {
 }
 
 #[derive(Default)]
-struct SubscriptionFixture {
+pub(super) struct SubscriptionFixture {
+    pub(super) fail: AtomicBool,
     opens: AtomicU64,
-    reads: AtomicU64,
+    pub(super) reads: AtomicU64,
     closed: tokio::sync::Notify,
 }
 #[async_trait::async_trait]
@@ -946,12 +844,15 @@ impl StreamService for SubscriptionFixture {
     async fn open(&self, _: &StreamGrant) -> Result<String, StreamError> {
         unreachable!()
     }
-    async fn subscribe(&self, _: &StreamGrant) -> Result<String, StreamError> {
+    async fn listen(&self, _: &StreamGrant) -> Result<String, StreamError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
         Ok("input".into())
     }
     async fn next(&self, _: &str, _: u32) -> Result<pluribus_core::StreamPage, StreamError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::Acquire) {
+            return Err(StreamError::Unavailable("disconnected".into()));
+        }
         Ok(pluribus_core::StreamPage {
             bytes: vec![1],
             closed: false,
@@ -975,61 +876,9 @@ impl StreamService for SubscriptionFixture {
     }
 }
 
-#[tokio::test]
-async fn subscriptions_require_grants_and_wait_for_callback_commit() {
-    let mut host = host(vec![]).await;
-    assert!(socket::Host::subscribe(&mut host, vec![]).await.is_err());
-    let service = Arc::new(SubscriptionFixture::default());
-    host.stream = Some(service.clone());
-    host.stream_grant = Some(StreamGrant {
-        endpoint: pluribus_core::StreamEndpoint::Unix {
-            path: "/unused".into(),
-            peer_uids: vec![1],
-        },
-        max_bytes: 1024,
-        max_timeout_ms: 1000,
-    });
-    assert!(socket::Host::subscribe(&mut host, vec![]).await.is_err());
-    host.ingress_supported = true;
-    host.replaying = true;
-    assert!(socket::Host::subscribe(&mut host, vec![]).await.is_err());
-    host.replaying = false;
-    socket::Host::subscribe(&mut host, b"subscribe".to_vec())
-        .await
-        .unwrap();
-    assert_eq!(
-        service.opens.load(Ordering::SeqCst),
-        0,
-        "subscription is staged until commit"
-    );
-    let request = host.pending_subscription.take().unwrap();
-    let mut subscription = subscription::Subscription::start(&host, request);
-    let first = subscription.inbox.recv().await.unwrap();
-    assert_eq!(first.payload["bytes"], serde_json::json!([1]));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), subscription.inbox.recv())
-            .await
-            .is_err()
-    );
-    assert_eq!(service.reads.load(Ordering::SeqCst), 1);
-    first.committed.send(()).unwrap();
-    let _second = subscription.inbox.recv().await.unwrap();
-    assert_eq!(service.reads.load(Ordering::SeqCst), 2);
-    assert!(
-        host.event_store
-            .read(&StreamId::new("personal"), 0, 100)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    drop(subscription);
-    tokio::time::timeout(Duration::from_secs(1), service.closed.notified())
-        .await
-        .unwrap();
-}
-
 #[derive(Default)]
 struct CliSubscriptionFixture {
+    idle: AtomicBool,
     sequence: AtomicU64,
     frames: std::sync::Mutex<HashMap<String, VecDeque<Vec<u8>>>>,
     offsets: std::sync::Mutex<Vec<u64>>,
@@ -1039,7 +888,7 @@ impl StreamService for CliSubscriptionFixture {
     async fn open(&self, _: &StreamGrant) -> Result<String, StreamError> {
         Ok("reply".into())
     }
-    async fn subscribe(&self, _: &StreamGrant) -> Result<String, StreamError> {
+    async fn listen(&self, _: &StreamGrant) -> Result<String, StreamError> {
         Ok(format!(
             "input-{}",
             self.sequence.fetch_add(1, Ordering::SeqCst)
@@ -1065,6 +914,9 @@ impl StreamService for CliSubscriptionFixture {
         Ok(())
     }
     async fn next(&self, id: &str, _: u32) -> Result<pluribus_core::StreamPage, StreamError> {
+        if self.idle.load(Ordering::Acquire) {
+            return std::future::pending().await;
+        }
         let bytes = self
             .frames
             .lock()
@@ -1098,7 +950,7 @@ impl StreamService for CliSubscriptionFixture {
 }
 
 #[tokio::test]
-async fn packaged_cli_subscription_frames_input_and_commits_offsets() {
+async fn packaged_cli_run_frames_input_and_commits_offsets() {
     let (runtime, store) = runtime().await;
     let package = PluginPackage::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/cli"),
@@ -1120,22 +972,29 @@ async fn packaged_cli_subscription_frames_input_and_commits_offsets() {
                     max_bytes: 1024,
                     max_timeout_ms: 1000,
                 }),
+                limits: Some(RuntimeLimits {
+                    memory_bytes: 32 * 1024 * 1024,
+                    call_timeout: Duration::from_millis(100),
+                }),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
     assert!(instance.init().await.unwrap().events.is_empty());
-    for _ in 0..4 {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !instance.has_stream_input() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        instance.receive_input(1000).await.unwrap();
-    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        stream.offsets.lock().unwrap().is_empty(),
+        "staged run must not open its source"
+    );
+    instance.start();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while stream.offsets.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     let events = store
         .read(&StreamId::new("personal"), 0, 100)
         .await
@@ -1159,7 +1018,74 @@ async fn packaged_cli_subscription_frames_input_and_commits_offsets() {
         .unwrap(),
         b"1"
     );
-    instance.stop(1000).await.unwrap();
+    stream.idle.store(true, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let handled = tokio::time::timeout(Duration::from_secs(1), instance.handle(&events))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(handled.checkpoint, events[0].sequence);
+    assert!(handled.events.is_empty());
+    while instance.has_background_output() {
+        instance.background_output().unwrap();
+    }
+    instance.stop(system_time_ms() + 2000).await.unwrap();
     tokio::task::yield_now().await;
     assert!(stream.frames.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn startup_error_prevents_activation() {
+    let (runtime, _) = runtime().await;
+    let package = PluginPackage::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/echo"),
+    )
+    .unwrap();
+    let mut instance = runtime
+        .instantiate(
+            package.component("").unwrap(),
+            &serde_json::json!({}),
+            delivery(),
+            PluginServices::default(),
+        )
+        .await
+        .unwrap();
+    instance.core.as_mut().unwrap().config = b"null".to_vec();
+    let error = instance.init().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configuration must be an object"),
+        "{error}"
+    );
+    assert!(instance.requires_reinstantiation());
+    instance.start();
+    assert!(!instance.has_background_output());
+}
+
+#[tokio::test]
+async fn staged_run_can_stop_without_activation() {
+    let (runtime, _) = runtime().await;
+    let package = PluginPackage::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/echo"),
+    )
+    .unwrap();
+    let mut instance = runtime
+        .instantiate(
+            package.component("").unwrap(),
+            &serde_json::json!({}),
+            delivery(),
+            PluginServices::default(),
+        )
+        .await
+        .unwrap();
+    instance.init().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        instance.stop(system_time_ms() + 2000),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!instance.has_background_output());
 }

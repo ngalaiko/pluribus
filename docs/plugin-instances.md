@@ -2,7 +2,7 @@
 
 `config.json` under `--data-dir` assembles an agent from package instances and operator overrides. Each package declares named components; each component runs independently with the stable ID `package-instance/component-name`.
 
-Telegram contains `receive` and `send`. RLM contains `cognition` and `js`. Each component has separate linear memory, state namespace, delivery cursor, cancellation handle, worker, imports, and grants. A blocked Telegram poll cannot occupy the sender's worker.
+Telegram contains `receive` and `send`. RLM contains `cognition` and `repl`. Each component has separate linear memory, state namespace, delivery cursor, cancellation handle, worker, imports, and grants. A blocked Telegram poll cannot occupy the sender's worker.
 
 ```json
 {
@@ -47,11 +47,11 @@ Credential declarations belong to the package and name their authorized componen
 }
 ```
 
-Inbound Telegram observations must originate from the selected receiver. Their origin retains that receiver's identity. Conversation-scoped reply grants name the selected sender and retain the original chat/thread restriction. Connectors control admission. Telegram admits only IDs in its `config.trusted_senders`; all other updates are ignored. Admitted observations receive the configured grants.
+Inbound Telegram observations must originate from the selected receiver. Their origin retains that receiver's identity. Conversation-scoped reply grants name the selected sender and retain the original conversation restriction. Connectors control admission. Telegram admits only IDs in its `config.trusted_senders`; all other updates are ignored. Admitted observations receive the configured grants.
 
 ## Installation boundary
 
-The agent validates the entire package, configuration against every component schema, component names, subscription conflicts, and host grants, then compiles and instantiates every component before calling any `init`. A failed preflight starts nothing and registers nothing.
+The agent validates the entire package, configuration against every component schema, component names, subscription conflicts, and host grants, then compiles and instantiates every component before starting any `run`. A failed preflight starts nothing and registers nothing.
 
 After preflight, each component initializes and rebuilds its projections. Components become active only after every lifecycle call succeeds. An initialization failure leaves no active registrations from that package; initialization events and state already committed by earlier components are not rolled back.
 

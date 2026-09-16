@@ -1,27 +1,8 @@
-package pluribus:plugin@1.0.0;
+package pluribus:plugin@2.0.0;
 
-/// Event-driven lifecycle. Source components additionally export ingress.
-/// sources, capability providers, model providers, event sinks, context
-/// providers, and cognition. A plugin's role is described by the request
-/// schemas it declares in its manifest, not by a distinct interface.
+/// Shared lifecycle for all component roles, described by their manifests.
 interface lifecycle {
-  use types.{error, event, json, mutation, principal, proposal};
-
-  /// Host-assigned facts about the current call. A plugin cannot forge or
-  /// widen them.
-  record context {
-    instance-id: string,
-    agent: principal,
-
-    /// Sequence this instance's state namespace is current as of. Zero
-    /// means the namespace is empty and must be rebuilt.
-    state-checkpoint: u64,
-
-    /// Recursion depth of the activity that produced this delivery.
-    depth: u32,
-
-    deadline-at-ms: option<s64>,
-  }
+  use types.{error, event, json, mutation, principal, proposal, context};
 
   /// The transactional result of one call. The host commits `events`,
   /// `mutations`, and the advance to `checkpoint` atomically, or commits
@@ -33,19 +14,15 @@ interface lifecycle {
 
     /// Highest delivered sequence fully reflected in `events` and
     /// `mutations`. MUST fall within the delivered batch. `handle` MUST
-    /// set it or the batch is delivered again. Absent in `init` and
+    /// set it or the batch is delivered again. Absent in startup output and
     /// `stop`, which deliver no events.
     checkpoint: option<u64>,
   }
 
-  /// Called once per instance lifetime, before any delivery, with the
-  /// configuration validated against the manifest schema. Secret values
-  /// appear only as opaque credential handles.
-  ///
-  /// A configuration change restarts the instance and calls `init` again.
-  /// A state schema change clears the namespace first, so `init` and the
-  /// deliveries that follow must tolerate an empty projection.
-  init: func(context: context, config: json) -> result<outcome, error>;
+  /// Loads validated configuration, then calls runtime.ready with startup output.
+  /// The host commits startup output and replays history before releasing ready.
+  /// Continues until shutdown; configuration changes restart the instance.
+  run: async func(context: context, config: json) -> result<_, error>;
 
   /// Delivers events in ascending sequence order, at least once. The
   /// plugin MUST tolerate events it has already applied and MUST NOT
@@ -58,7 +35,7 @@ interface lifecycle {
   ///
   /// The plugin holds no live work across a return. To wait on another
   /// plugin, propose a request event and resume from its result event.
-  handle: func(context: context, events: list<event>) -> result<outcome, error>;
+  handle: async func(context: context, events: list<event>) -> result<outcome, error>;
 
   /// Final call before the instance is torn down. Handles are already
   /// closed; further deliveries will not arrive.
@@ -70,28 +47,20 @@ interface lifecycle {
 /// narrower custom world for defense in depth; its manifest records which
 /// world the component encodes.
 world plugin {
+  import wasi:clocks/system-clock@0.3.0;
+  import wasi:clocks/monotonic-clock@0.3.0;
+  import wasi:random/random@0.3.0;
+  import runtime;
   import events;
   import state;
   import blobs;
   import reader;
   import writer;
-  import http;
+  import wasi:http/types@0.3.0;
+  import wasi:http/client@0.3.0;
   import socket;
   import credentials;
 
   export lifecycle;
 }
 
-/// Optional ingress callback. Transport input is transient; only the returned
-/// observations and state changes are committed. Empty long-poll responses do
-/// not produce log entries. Init restores the
-/// subscription; the source protocol must tolerate redelivery after restart.
-interface ingress {
-  use types.{json, error, ingress-outcome};
-  receive: func(input: json) -> result<ingress-outcome, error>;
-}
-
-world source {
-  include plugin;
-  export ingress;
-}

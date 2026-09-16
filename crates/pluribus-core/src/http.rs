@@ -26,6 +26,13 @@ pub struct HttpResponse {
     pub credentials_used: Vec<SecretHandle>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpStreamingResponse {
+    pub status: u16,
+    pub headers: Vec<HttpHeader>,
+    pub stream_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpStreamProtocol {
     Bytes,
@@ -74,6 +81,25 @@ pub trait HttpService: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait HttpStreamService: HttpService {
+    /// Opens an HTTP body without buffering it or rejecting HTTP error statuses.
+    /// `None` selects the buffered compatibility path.
+    async fn start_response(
+        &self,
+        _grant: &HttpGrant,
+        _request: &HttpRequest,
+    ) -> Result<Option<HttpStreamingResponse>, HttpError> {
+        Ok(None)
+    }
+
+    /// Creates an isolated transport using the supplied body store.
+    /// In-memory fixtures may retain their existing store.
+    fn with_body_store(
+        &self,
+        _store: std::sync::Arc<dyn crate::BlobStore>,
+    ) -> Option<std::sync::Arc<dyn HttpStreamService>> {
+        None
+    }
+
     /// Opens one policy-controlled stream.
     ///
     /// # Errors

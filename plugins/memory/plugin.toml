@@ -1,4 +1,4 @@
-abi = "pluribus:plugin@1.0.0"
+abi = "pluribus:plugin@2.0.0"
 manifest_version = 1
 id = "dev.pluribus.memory"
 name = "Memory"
@@ -8,10 +8,10 @@ license = "MIT OR Apache-2.0"
 
 [components.main]
 config_schema = "config.schema.json"
-world = "pluribus:plugin/plugin@1.0.0"
+world = "pluribus:plugin/plugin@2.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
-imports = ["pluribus:plugin/events@1.0.0", "pluribus:plugin/state@1.0.0"]
+imports = ["pluribus:plugin/runtime@2.0.0", "pluribus:plugin/events@2.0.0", "pluribus:plugin/state@2.0.0"]
 subscribes = ["memory.remembered", "memory.superseded", "memory.forgotten"]
 rebuilds = ["memory.remembered", "memory.superseded", "memory.forgotten"]
 emits = ["memory.remembered", "memory.superseded", "memory.forgotten", "capability.completed", "capability.failed"]

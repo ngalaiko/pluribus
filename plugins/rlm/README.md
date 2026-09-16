@@ -23,22 +23,20 @@ JS operations:
   internal checkpoints. Filter aggressively to the evidence needed. Oversized
   payloads return `payloadOmitted` metadata; the cursor still advances.
 - `rlm.query({question, context})`: read-only child; at most 64 KiB of context.
-- `memory.recall/get/remember/supersede/forget(...)`: root-only
-  [memory capabilities](../memory/README.md), subject to scoped grants.
-- `capabilities.invoke(name, arguments)`: authorized root activity.
+- `capabilities.invoke(name, arguments)`: authorized root activity described by
+  `context.tools`; returns a receipt with the provider result in `output`.
 - `checkpoint({named: values})`: up to 32 KiB of JSON working values.
 
 Children inherit the job revision. Delegated history
 cannot exceed the parent's access. Children share the job's 32-call cycle budget
-and have depth limit four. Jobs
-can continue silently, wait for input or time, complete, or fail. Waiting for
+and have depth limit four. JS results automatically advance reasoning. Jobs
+can wait for user input or an external deadline, complete, or fail. Waiting for
 input makes no idle model calls. Wakes survive restart.
 
 The model uses `js` to compute and `yield` to return control:
 
 ```json
 {"action":"complete","reply":"pong"}
-{"action":"continue","note":"Tests remain"}
 {"action":"wait","waitFor":"input","question":"Which repository?"}
 ```
 
@@ -46,14 +44,14 @@ Each control call must stand alone. Its schema is supplied with the model
 request; assistant prose does not finish jobs or send replies. Invalid calls
 receive bounded correction attempts. Children yield only a result to their
 parent. An optional root `reply` requests `<provider>.reply` to the original
-conversation, including while continuing or waiting.
+conversation, including while waiting.
 
 Observation routing uses a separate `associate` tool to create, amend, cancel,
 or clarify work. It cannot discard messages, execute JS, or yield a root decision.
 Messages needing no response may complete through root `yield` with `reply: null`.
 Input waits require a specific `question`. Routing distinguishes unanswered
 questions, provider failures, and scheduled work. Routing stays within the same
-sender and conversation, including a Telegram topic. `clarify` requires a question
+sender and conversation. `clarify` requires a question
 and pauses only the unresolved observation.
 
 [Durable jobs, budgets, recovery, and operational limits](../../docs/persistent-work.md).
@@ -101,3 +99,8 @@ tool histories fail locally instead of entering provider retries.
 The CLI derives `context.components` from installed manifests: instance IDs,
 plugin IDs, capabilities, subscriptions, and emissions. This interface map helps
 select history filters; it does not assert component health or permissions.
+
+The scheduler pauses exhausted cycles for one minute while preserving live REPL
+state. Models cannot schedule continuations. Three invalid outputs or identical
+cells/results without host activity stop the attempt and report a stall. Return
+progress from incremental computations to distinguish advancing work.

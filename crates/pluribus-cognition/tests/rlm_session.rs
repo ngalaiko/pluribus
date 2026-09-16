@@ -79,7 +79,7 @@ async fn append(
             stream_kind: StreamKind::Agent,
             observed_at_ms: None,
             event_type: event_type.into(),
-            payload_schema: "dev.pluribus.js.cell/1".into(),
+            payload_schema: "dev.pluribus.repl.cell/1".into(),
             payload: EventPayload::CanonicalJson(serde_json::to_vec(payload).unwrap()),
             actor: PrincipalRef::new(PrincipalKind::Agent, "personal"),
             authority_id: Some(AuthorityId::new("authority-1")),
@@ -121,17 +121,13 @@ async fn a_cell_yields_a_request_then_resumes_with_its_result() {
     )
     .unwrap();
     assert!(
-        package.component("js").unwrap().manifest().pinned_session,
+        package.component("repl").unwrap().manifest().pinned_session,
         "rlm must declare a pinned session"
     );
-    assert!(
-        package
-            .component("js")
-            .unwrap()
-            .manifest()
-            .imports
-            .is_empty(),
-        "the interpreter needs no host import: results travel in the outcome"
+    assert_eq!(
+        package.component("repl").unwrap().manifest().imports,
+        ["pluribus:plugin/runtime@2.0.0"],
+        "the interpreter imports only lifecycle coordination"
     );
 
     let router = Router::new(
@@ -151,7 +147,7 @@ async fn a_cell_yields_a_request_then_resumes_with_its_result() {
     );
     agent
         .install_component(
-            package.component("js").unwrap(),
+            package.component("repl").unwrap(),
             &json!({}),
             Delivery {
                 instance_id: "rlm-1".into(),

@@ -4,8 +4,8 @@ use serde::Deserialize;
 use telegram::api::{
     CHUNK_BYTES, CREDENTIAL_MARKER, ORIGIN, TelegramResponse, decode_response, internal, write,
 };
+use telegram::http::{self, Header, Request};
 use telegram::pluribus::plugin::blobs;
-use telegram::pluribus::plugin::http::{self, Header, Request};
 use telegram::pluribus::plugin::types::{BlobRef, Error};
 
 #[derive(Clone, Deserialize)]

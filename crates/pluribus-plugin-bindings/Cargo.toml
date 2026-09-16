@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+wasmtime-wasi-http.workspace = true
 wasmtime.workspace = true
 
 [lints.rust]

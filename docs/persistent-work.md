@@ -84,7 +84,6 @@ and `cancel` may supply `resolvesObservationId` naming one of them.
 Roots call `yield` with a typed decision:
 
 ```json
-{"action":"continue","note":"Tests remain","nextStep":"Run tests"}
 {"action":"wait","waitFor":"input","question":"Which repository?"}
 {"action":"wait","dueAtMs":1800000000000,"note":"Wait for deadline"}
 {"action":"complete","note":"Checks passed","reply":null}
@@ -93,8 +92,8 @@ Roots call `yield` with a typed decision:
 
 Assistant prose is not parsed as a decision. Each `yield` must be the only tool
 call in its batch. Invalid calls receive bounded correction opportunities; they
-cannot change job progress or send a reply. Three invalid outputs pause the root
-job for input with a diagnostic; a child returns an error to its parent. The
+cannot change job progress or send a reply. Three invalid outputs fail the root
+job and request a stall reply; a child returns an error to its parent. The
 model receives the control schema on each call. Children call `yield` with
 `{"result":"answer"}` and cannot schedule work or send human replies. A root may
 complete with `reply: null` when no response is needed.
@@ -124,15 +123,22 @@ explicit resume action.
 
 `timer.fired` routes through its original request actor. Payload targets confer
 neither ownership nor authority. Job revisions invalidate obsolete wakes. Waiting
-for input produces no periodic inference. Continuations default to one minute,
-doubling up to six hours; `productive:true` resets backoff, and omitted progress
-fields retain their values.
+for input produces no periodic inference. Timed waits require a future external
+deadline. Code results automatically request the next reasoning step. There is
+no model-controlled continuation or productivity flag; omitted progress fields
+retain their values. Provider retries alone use exponential backoff.
 
 ## Budgets
 
 Thirty-two calls and thirty minutes bound a cycle; children share its allowance
-and have recursion depth four. Cycle exhaustion schedules a wake instead of
-polling the model.
+and have recursion depth four. Cycle exhaustion enters `paused-budget` with a
+fixed one-minute wake and preserves live REPL state. An exhausted child returns an error to its suspended
+parent; the root pauses after its cell settles.
+
+Three identical cells and results without host activity fail with a stall reply.
+Incremental computations must return changing progress or checkpoint values;
+state changes invisible in output cannot demonstrate progress. Stall counters
+survive checkpoints.
 
 ## Checkpoints and persistence
 

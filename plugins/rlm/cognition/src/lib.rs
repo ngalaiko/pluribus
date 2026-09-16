@@ -8,7 +8,7 @@ mod component {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::{Value, json};
     use std::cell::RefCell;
-    wit_bindgen::generate!({path:"../../../wit",world:"plugin"});
+    wit_bindgen::generate!({ generate_all,path:"../../../wit",world:"plugin"});
     use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
     use pluribus::plugin::types::{
         Error, ErrorCode, Event, Mutation, Payload, PrincipalKind, Proposal, StateEntry,
@@ -16,17 +16,27 @@ mod component {
     use pluribus::plugin::{events, state};
     thread_local! {static CONFIG:RefCell<Option<Config>>=const {RefCell::new(None)};}
     struct Cognition;
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../shared/run.rs"));
+
+    fn setup(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+        let parsed: Config = serde_json::from_slice(&config).map_err(failure)?;
+        CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
+        Ok(Outcome {
+            events: vec![],
+            mutations: vec![],
+            checkpoint: None,
+        })
+    }
+
     impl Guest for Cognition {
-        fn init(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-            let parsed: Config = serde_json::from_slice(&config).map_err(failure)?;
-            CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
-            Ok(Outcome {
-                events: vec![],
-                mutations: vec![],
-                checkpoint: None,
-            })
+        async fn run(context: Context, config: Vec<u8>) -> Result<(), Error> {
+            let outcome = setup(context.clone(), config)?;
+            pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+            serve::<Self>(context).await
         }
-        fn handle(context: Context, batch: Vec<Event>) -> Result<Outcome, Error> {
+
+        async fn handle(context: Context, batch: Vec<Event>) -> Result<Outcome, Error> {
             let config = CONFIG
                 .with_borrow(|slot| slot.clone())
                 .ok_or_else(|| failure("not initialized"))?;

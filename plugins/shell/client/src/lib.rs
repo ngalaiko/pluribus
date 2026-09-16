@@ -5,7 +5,7 @@
 #[allow(dead_code)]
 mod protocol;
 
-wit_bindgen::generate!({ path: "../../wit", world: "plugin" });
+wit_bindgen::generate!({ generate_all, path: "../../wit", world: "plugin" });
 
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::reader::Reader;
@@ -38,26 +38,35 @@ fn default_timeout() -> u32 {
     30_000
 }
 
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+
+fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let config: serde_json::Value = serde_json::from_slice(&config)
+        .map_err(|_| failure(ErrorCode::InvalidArgument, "invalid shell config"))?;
+    let names: Vec<String> = config
+        .get("credential_exports")
+        .and_then(serde_json::Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    if names.len() > 64 || names.iter().any(|n| !protocol::valid_env_name(n)) {
+        return Err(failure(
+            ErrorCode::InvalidArgument,
+            "invalid environment binding",
+        ));
+    }
+    EXPORTS.with_borrow_mut(|exports| *exports = names);
+    Ok(empty_outcome())
+}
+
 impl Guest for Shell {
-    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let config: serde_json::Value = serde_json::from_slice(&config)
-            .map_err(|_| failure(ErrorCode::InvalidArgument, "invalid shell config"))?;
-        let names: Vec<String> = config
-            .get("credential_exports")
-            .and_then(serde_json::Value::as_object)
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
-        if names.len() > 64 || names.iter().any(|n| !protocol::valid_env_name(n)) {
-            return Err(failure(
-                ErrorCode::InvalidArgument,
-                "invalid environment binding",
-            ));
-        }
-        EXPORTS.with_borrow_mut(|exports| *exports = names);
-        Ok(empty_outcome())
+    async fn run(context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        serve::<Self>(context).await
     }
 
-    fn handle(context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         let mut proposals = Vec::new();
         let mut checkpoint = None;
 

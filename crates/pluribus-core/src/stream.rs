@@ -46,22 +46,26 @@ pub trait StreamService: Send + Sync {
     /// Returns connection, authentication, or limit failures.
     async fn open(&self, grant: &StreamGrant) -> Result<String, StreamError>;
 
-    /// Opens a subscription. The timeout bounds connection establishment;
+    /// Opens a readiness-driven connection. The timeout bounds connection establishment;
     /// idle reads have no deadline. The byte budget still bounds each connection.
     ///
     /// # Errors
     /// Returns connection, grant, or unsupported-transport failures.
-    async fn subscribe(&self, _grant: &StreamGrant) -> Result<String, StreamError> {
-        Err(StreamError::Unavailable("subscriptions unsupported".into()))
+    async fn listen(&self, _grant: &StreamGrant) -> Result<String, StreamError> {
+        Err(StreamError::Unavailable(
+            "readiness-driven I/O unsupported".into(),
+        ))
     }
 
-    /// Waits for subscription bytes without polling. Dropping the future cancels
-    /// the read; the subscription owner must close its connection on teardown.
+    /// Waits for bytes without polling. Dropping the future cancels the read;
+    /// the caller must close its connection on teardown.
     ///
     /// # Errors
     /// Returns transport, byte-budget, or unsupported-operation failures.
     async fn next(&self, _stream_id: &str, _max_bytes: u32) -> Result<StreamPage, StreamError> {
-        Err(StreamError::Unavailable("subscriptions unsupported".into()))
+        Err(StreamError::Unavailable(
+            "readiness-driven I/O unsupported".into(),
+        ))
     }
 
     /// Reads until bytes arrive, the peer closes, the timeout elapses, or the

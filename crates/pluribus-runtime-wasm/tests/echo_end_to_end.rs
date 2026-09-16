@@ -115,6 +115,46 @@ fn payload(event: &pluribus_core::CommittedEvent) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_loop_starts_after_ready_and_stops_cleanly() {
+    let harness = harness().await;
+    let mut instance = harness
+        .runtime
+        .instantiate(
+            package().component("").unwrap(),
+            &json!({}),
+            delivery(),
+            PluginServices::default(),
+        )
+        .await
+        .unwrap();
+    instance.init().await.unwrap();
+    instance.start();
+    let event = request(&harness.store, Some("run loop")).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        instance.handle(std::slice::from_ref(&event)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.checkpoint, event.sequence);
+    assert!(
+        outcome
+            .events
+            .iter()
+            .any(|e| e.request.event_type == "capability.completed")
+    );
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    instance.stop(now + 2000).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_produces_a_completion_and_advances_the_cursor() {
     let harness = harness().await;
     let mut instance = harness

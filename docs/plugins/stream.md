@@ -1,8 +1,8 @@
 # Byte channels
 
-Implemented for ABI `pluribus:plugin@1.0.0`. A channel is two resources: a
+Implemented for ABI `pluribus:plugin@2.0.0`. A channel is two resources: a
 `reader` and a `writer`. `socket.connect` returns both halves for one
-configured Unix socket; `http.sse` returns a reader alone. Core owns transport
+configured Unix socket. HTTP uses WASI request/response body streams. Core owns transport
 and peer verification; the plugin owns framing and protocol semantics.
 
 ## Interface
@@ -12,6 +12,7 @@ interface reader {
   use types.{chunk, error};
 
   resource reader {
+    read-via-stream: async func() -> result<tuple<stream<u8>, future<result<_, error>>>, error>;
     receive: func(max-bytes: u32, timeout-ms: u32) -> result<chunk, error>;
   }
 }
@@ -47,8 +48,7 @@ with `closed = false`, not a deadline error. EOF returns `closed = true`,
 possibly with final bytes, and closes the transport. A zero `max-bytes` is
 `invalid-argument`. `send` writes the whole buffer or fails; there is no
 host-side write buffer. Bytes are inline; plugins can use `blobs` to store
-content. HTTP request and response bodies use blob references, while an SSE
-reader returns inline bytes.
+content. WASI HTTP request and response bodies use native byte streams.
 
 ## Grant
 
@@ -92,8 +92,8 @@ Merge into the runtime configuration:
 
 Each opened stream receives its own byte budget; this is not a delivery-wide
 quota. Connecting requires an endpoint grant. The manifest must import
-`pluribus:plugin/socket@1.0.0`, `pluribus:plugin/reader@1.0.0`, and
-`pluribus:plugin/writer@1.0.0`, and request `host.stream` with exactly
+`pluribus:plugin/socket@2.0.0`, `pluribus:plugin/reader@2.0.0`, and
+`pluribus:plugin/writer@2.0.0`, and request `host.stream` with exactly
 `constraints = { unrestricted = true }`. Describe the endpoint's authority in
 the manifest. `connect`, `receive`, and `send` require a granted endpoint; without one they
 return `permission-denied`, which the plugin turns into a `capability.failed`
@@ -174,40 +174,30 @@ band. See [shell deployment](../../plugins/shell/README.md).
 ## Scope
 
 Only same-machine Unix endpoints are supported. TCP and TLS are deferred.
-`socket` performs no secret injection. Use `http` when the host must inject
-credentials into HTTP requests.
+`socket` performs no secret injection. Use WASI HTTP with
+`credentials.authorize-http` for requests needing host-injected credentials.
 
 The GitHub plugin signs and verifies inside Wasm using libraries. Its
 `credentials` grant provides access to its own core-stored credential record.
 The HTTP plugin uses a Unix socket only to communicate with its native listener.
 
-## Subscriptions
+## Async source I/O
 
-Components using `pluribus:plugin/source@1.0.0` also export
-`pluribus:plugin/ingress@1.0.0.receive`. In `init`, call `socket.subscribe(request)`
-or `http.subscribe(request)` with the existing endpoint or HTTP grant.
+`socket.listen()` opens a readiness-driven connection to the granted endpoint.
+The plugin sends its protocol request, opens `reader.read-via-stream()`, and
+awaits bytes from the returned native stream. After EOF, it awaits the completion
+future to detect transport errors. Each reader opens at most one stream.
+Framing and reconnects belong to the plugin. Connections remain alive across
+source commits and close when their resources are dropped or the source stops.
+Peer checks and byte budgets still apply.
 
-The subscription starts after commit. Core waits outside Wasm and invokes
-`receive` with transient JSON input:
+`wasi:http/client.send(request).await` performs a granted HTTP exchange.
+The host enforces deadlines, destination policy, and credential constraints.
+`credentials.authorize-http` selects the credential before sending. The plugin
+decides when to retry. Guest helpers provide blob-backed and inline responses
+without defining another HTTP ABI.
 
-- Socket: `{kind:"socket",bytes:[...],receivedAtMs:...}`; chunks are at most 32 KiB.
-- HTTP: `{kind:"http",status:200,body:{digest,size,mediaType},receivedAtMs:...}`;
-  the response blob is visible to the callback.
-- Transport failure: `{kind:"error",reason:"...",receivedAtMs:...}`.
-
-The callback returns events and mutations, without an event cursor. They commit
-atomically. Empty results create no events. Normal event deliveries retain their
-existing cursor and authority checks. Only one input can remain uncommitted;
-reads resume after commit. A failed callback retains its input for retry.
-
-A component has one subscription. Replacing it closes the previous connection.
-Stopping, removing, or dropping the instance cancels it. Init restores it after
-restart. Source protocols must tolerate redelivery; commit acknowledgements and
-observation deduplication keys together prevent lost or duplicated observations.
-
-Socket subscriptions reconnect and resend their request with bounded backoff.
-The grant's timeout bounds connection establishment; idle reads wait on socket
-readiness without timers. The byte budget still applies per connection. HTTP
-subscriptions repeat the granted request after callback commit; plugins replace
-it with an updated offset. HTTP deadlines and credential checks apply to every
-request. Subscription callbacks and retries do not generate scheduler events.
+A plugin can select between I/O, `runtime.next()` for internal events, and
+`wasi:clocks/monotonic-clock.wait-for()` for timers. Only plugin commits produce
+events; transport bytes never enter the event log implicitly.
+See [source loops](lifecycle.md#source-loops).

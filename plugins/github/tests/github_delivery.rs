@@ -70,25 +70,6 @@ fn services(dir: &Path, socket: PathBuf, _instance: &str) -> PluginServices {
         ..PluginServices::default()
     }
 }
-async fn timer(store: &SqliteEventStore<Metadata>) -> CommittedEvent {
-    store
-        .append(AppendRequest {
-            stream_id: StreamId::new("test"),
-            stream_kind: StreamKind::Agent,
-            observed_at_ms: None,
-            event_type: "timer.fired".into(),
-            payload_schema: "test".into(),
-            payload: EventPayload::CanonicalJson(b"{}".to_vec()),
-            actor: PrincipalRef::new(PrincipalKind::Node, "timer"),
-            authority_id: None,
-            activity_id: None,
-            correlation_id: None,
-            causation_id: None,
-            deduplication_key: None,
-        })
-        .await
-        .unwrap()
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
@@ -176,6 +157,7 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
         .await
         .unwrap();
     http.init().await.unwrap();
+    http.start();
     github.init().await.unwrap();
     for (index, (id, owner, valid, expected)) in [
         ("delivery-1", "me", true, 200),
@@ -236,8 +218,11 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
         );
         let events = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let input = timer(&store).await;
-                let polled = http.handle(&[input]).await.unwrap();
+                if !http.has_background_output() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+                let polled = http.background_output().unwrap();
                 let events: Vec<_> = polled
                     .events
                     .into_iter()
@@ -250,7 +235,7 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
             }
         })
         .await
-        .expect("HTTP request was not delivered");
+        .unwrap_or_else(|e| panic!("HTTP delivery {index} was not delivered: {e}"));
         assert_eq!(events.len(), 1);
         let result = github.handle(&events).await.unwrap();
         let responses: Vec<_> = result

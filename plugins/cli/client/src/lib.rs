@@ -2,15 +2,13 @@
 
 //! A terminal connector. Subscribed bridge input produces observations.
 
-wit_bindgen::generate!({ path: "../../wit", world: "source" });
+wit_bindgen::generate!({ generate_all, path: "../../wit", world: "plugin" });
 
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::reader::Reader;
 use pluribus::plugin::socket;
 use pluribus::plugin::state;
-use pluribus::plugin::types::{
-    Error, ErrorCode, Event, IngressOutcome, Mutation, Payload, Proposal, StateEntry,
-};
+use pluribus::plugin::types::{Error, ErrorCode, Event, Mutation, Payload, Proposal, StateEntry};
 use pluribus::plugin::writer::Writer;
 use protocol::{MAX_RESPONSE, Message, Request, Response, VERSION};
 use serde::Deserialize;
@@ -49,19 +47,85 @@ fn default_poll_timeout() -> u32 {
     20
 }
 
+fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let parsed = parse_config(&config)?;
+    CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
+    Ok(Outcome {
+        events: Vec::new(),
+        mutations: Vec::new(),
+        checkpoint: None,
+    })
+}
+
 impl Guest for Cli {
-    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let parsed = parse_config(&config)?;
-        CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
-        subscribe(&configuration()?, cursor()?)?;
-        Ok(Outcome {
-            events: Vec::new(),
-            mutations: Vec::new(),
-            checkpoint: None,
-        })
+    async fn run(mut context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        use pluribus::plugin::runtime;
+        let mut delay: u32 = 0;
+        loop {
+            if Self::waiting(&mut context, async {
+                crate::wasi::clocks::monotonic_clock::wait_for(u64::from(delay) * 1_000_000).await;
+                Ok(())
+            })
+            .await?
+            .is_none()
+            {
+                return Ok(());
+            }
+            INPUT.with_borrow_mut(Vec::clear);
+            let result: Result<bool, Error> = async {
+                let (read, write) = socket::listen()?;
+                let (mut input, completion) = read.read_via_stream().await?;
+                let mut completion = Some(completion);
+                write.send(&poll_request(&configuration()?, cursor()?)?)?;
+                loop {
+                    let Some(chunk) = Self::waiting(&mut context, async {
+                        let (_, bytes) = input.read(Vec::with_capacity(32 * 1024)).await;
+                        let closed = bytes.is_empty();
+                        if closed {
+                            completion.take().unwrap().await?;
+                        }
+                        Ok(pluribus::plugin::types::Chunk { bytes, closed })
+                    })
+                    .await?
+                    else {
+                        return Ok(true);
+                    };
+                    if !chunk.bytes.is_empty() {
+                        let out = Self::process_bytes(chunk.bytes)?;
+                        runtime::commit(&out.events, &out.mutations, None)?;
+                        if INPUT.with_borrow(|b| b.is_empty()) {
+                            break;
+                        }
+                    }
+                    if chunk.closed {
+                        return Err(unavailable("bridge disconnected"));
+                    }
+                }
+                #[allow(unreachable_code)]
+                Ok(false)
+            }
+            .await;
+            match result {
+                Ok(true) => return Ok(()),
+                Ok(false) => delay = 100,
+                Err(error)
+                    if !error.retryable
+                        && !matches!(
+                            error.code,
+                            pluribus::plugin::types::ErrorCode::DeadlineExceeded
+                        ) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => delay = delay.saturating_mul(2).clamp(100, 30_000),
+            }
+        }
     }
 
-    fn handle(context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         let mut proposals = Vec::new();
         let mutations = Vec::new();
         let mut checkpoint = None;
@@ -94,7 +158,7 @@ impl Guest for Cli {
     }
 }
 
-fn subscribe(config: &Config, after: u64) -> Result<(), Error> {
+fn poll_request(config: &Config, after: u64) -> Result<Vec<u8>, Error> {
     let mut request = serde_json::to_vec(&Request::Poll {
         version: VERSION,
         after,
@@ -102,65 +166,11 @@ fn subscribe(config: &Config, after: u64) -> Result<(), Error> {
     })
     .map_err(|e| internal(e.to_string()))?;
     request.push(b'\n');
-    socket::subscribe(&request)
+    Ok(request)
 }
 
 thread_local! {
     static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-impl exports::pluribus::plugin::ingress::Guest for Cli {
-    fn receive(input: Vec<u8>) -> Result<IngressOutcome, Error> {
-        let input: Value = serde_json::from_slice(&input).map_err(|e| invalid(e.to_string()))?;
-        let mut out = IngressOutcome {
-            events: vec![],
-            mutations: vec![],
-        };
-        if input["kind"] != "socket" {
-            INPUT.with_borrow_mut(Vec::clear);
-            return Ok(out);
-        }
-        let bytes: Vec<u8> =
-            serde_json::from_value(input["bytes"].clone()).map_err(|e| invalid(e.to_string()))?;
-        let frame = INPUT.with_borrow_mut(|buffer| {
-            if buffer.len().saturating_add(bytes.len()) > MAX_RESPONSE {
-                buffer.clear();
-                return Err(invalid("bridge response exceeds limit"));
-            }
-            buffer.extend(bytes);
-            Ok(if buffer.last() == Some(&b'\n') {
-                Some(std::mem::take(buffer))
-            } else {
-                None
-            })
-        })?;
-        let Some(frame) = frame else {
-            return Ok(out);
-        };
-        let config = configuration()?;
-        let after = cursor()?;
-        let response: Response =
-            serde_json::from_slice(&frame).map_err(|e| invalid(e.to_string()))?;
-        match response {
-            Response::Messages { messages } => {
-                let next = messages.last().map_or(after, |message| message.sequence);
-                for message in &messages {
-                    out.events.push(observation(&config, message)?);
-                }
-                if next != after {
-                    out.mutations.push(Mutation::Set(StateEntry {
-                        key: CURSOR_KEY.into(),
-                        value: next.to_string().into_bytes(),
-                    }));
-                }
-                subscribe(&config, next)?;
-            }
-            Response::Unavailable { message } => return Err(unavailable(message)),
-            Response::Delivered => {
-                return Err(invalid("unexpected reply receipt on input subscription"));
-            }
-        }
-        Ok(out)
-    }
 }
 
 fn dispatch(event: &Event, request: &Value) -> Proposal {
@@ -356,3 +366,87 @@ fn internal(message: impl Into<String>) -> Error {
 }
 
 export!(Cli);
+
+impl Cli {
+    fn process_bytes(bytes: Vec<u8>) -> Result<SourceOutput, Error> {
+        let mut out = SourceOutput {
+            events: vec![],
+            mutations: vec![],
+        };
+        let frame = INPUT.with_borrow_mut(|buffer| {
+            if buffer.len().saturating_add(bytes.len()) > MAX_RESPONSE {
+                buffer.clear();
+                return Err(invalid("bridge response exceeds limit"));
+            }
+            buffer.extend(bytes);
+            Ok(if buffer.last() == Some(&b'\n') {
+                Some(std::mem::take(buffer))
+            } else {
+                None
+            })
+        })?;
+        let Some(frame) = frame else {
+            return Ok(out);
+        };
+        let config = configuration()?;
+        let after = cursor()?;
+        let response: Response =
+            serde_json::from_slice(&frame).map_err(|e| invalid(e.to_string()))?;
+        match response {
+            Response::Messages { messages } => {
+                let next = messages.last().map_or(after, |message| message.sequence);
+                for message in &messages {
+                    out.events.push(observation(&config, message)?);
+                }
+                if next != after {
+                    out.mutations.push(Mutation::Set(StateEntry {
+                        key: CURSOR_KEY.into(),
+                        value: next.to_string().into_bytes(),
+                    }));
+                }
+            }
+            Response::Unavailable { message } => return Err(unavailable(message)),
+            Response::Delivered => {
+                return Err(invalid("unexpected reply receipt on input subscription"));
+            }
+        }
+        Ok(out)
+    }
+}
+
+struct SourceOutput {
+    events: Vec<pluribus::plugin::types::Proposal>,
+    mutations: Vec<pluribus::plugin::types::Mutation>,
+}
+
+impl Cli {
+    /// Services internal deliveries while external work is suspended.
+    async fn waiting<T>(
+        context: &mut Context,
+        work: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<Option<T>, Error> {
+        use futures_util::future::{Either, select};
+        use pluribus::plugin::runtime::{self, Wake};
+        futures_util::pin_mut!(work);
+        loop {
+            match select(Box::pin(runtime::next()), work.as_mut()).await {
+                Either::Left((wake, _)) => match wake? {
+                    Wake::Stop(_) => {
+                        // Finish cancelled imports before dropping their borrowed resources.
+                        let _ = work.await;
+                        return Ok(None);
+                    }
+                    Wake::Events(events) => match Self::handle(context.clone(), events).await {
+                        Ok(out) => {
+                            runtime::commit(&out.events, &out.mutations, out.checkpoint)?;
+                            context.state_checkpoint =
+                                out.checkpoint.unwrap_or(context.state_checkpoint);
+                        }
+                        Err(error) => runtime::reject(&error)?,
+                    },
+                },
+                Either::Right((result, _)) => return result.map(Some),
+            }
+        }
+    }
+}

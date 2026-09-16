@@ -2,41 +2,44 @@
 
 ## WIT package
 
-The ABI package is `pluribus:plugin@1.0.0` in [`wit/`](../../wit):
+The ABI package is `pluribus:plugin@2.0.0` in [`wit/`](../../wit):
 
 - [`types.wit`](../../wit/types.wit): shared values;
 - [`host.wit`](../../wit/host.wit): host imports;
 - [`plugin.wit`](../../wit/plugin.wit): the `lifecycle` export and the world.
 
-The `plugin` world exposes the host interfaces. The `source` world additionally
-exports `ingress` for transient subscription callbacks. Grants are enforced per
+The single `plugin` world exposes host interfaces and the `lifecycle` export.
+Lifecycle contains `run`, `handle`, and `stop`. Grants are enforced per
 call, so an import present in the world may still return `permission-denied`.
-A plugin MAY declare a narrower custom world for defense in depth; its manifest
-records which world the component encodes.
 
-The component MUST export `lifecycle`, plus `ingress` for the `source` world.
+The component MUST export only `lifecycle`.
 Its imports MUST equal those the manifest declares. The host rejects unresolved imports,
 unexpected exports, type mismatches, and ABI version mismatches before
 instantiation.
 
-`manifest.world` is not checked against the component: encoding renames the
+`manifest.world` must name the standard plugin world. Its authored name cannot
+be compared directly against the component: encoding renames the
 component's own world to `root:component/root`, so the authored name does not
 survive. Import and export set equality is the real check.
 
 ## Execution model
 
-The host creates one component instance per configured plugin instance and
-serializes exported calls to it. It does not re-enter an instance concurrently.
+The host creates one component instance per configured plugin instance.
+`run` suspends at `runtime.ready` while the host commits startup output and
+replays history through `handle`. After activation, the plugin dispatches its
+own deliveries; only one handler runs at a time.
 
-The host may suspend a synchronous WIT call while waiting for network or
-storage I/O. This does not permit plugin work after the export returns.
+Every component uses a plugin-owned async `run` task.
+The toolchain uses Wasmtime 48, wit-bindgen 0.62, and WASI 0.3.0.
+`run` and `handle` are async exports; calls remain serialized per instance.
+Host I/O suspends through async imports.
 
 Plugins MUST:
 
-- return control while idle;
-- keep durable state in `outcome.mutations` or blobs;
+- suspend through host imports while idle;
+- keep durable state in transactional outcomes, `runtime.commit`, or blobs;
 - treat instance memory as disposable;
-- tolerate restart between any two exported calls;
+- tolerate restart after any committed transaction;
 - tolerate an empty state namespace at any time;
 - stop before the delivery deadline.
 
@@ -159,10 +162,12 @@ abandoned uploads at the end of the delivery.
 returned bytes. A plugin MUST verify that cumulative length equals
 `blob-ref.size`.
 
-### `http`
+### `wasi:http`
 
-`send` performs one policy-controlled request. Bodies are blobs. Header order
-and duplicate names are preserved; names compare case-insensitively.
+`wasi:http/client.send` accepts a standard request resource and returns a
+response resource. Bodies use `stream<u8>` and completion futures. Plugins
+MUST consume the completion future after EOF to detect body errors.
+`credentials.authorize-http(request, handle)` attaches a granted credential.
 
 The host enforces:
 
@@ -182,12 +187,11 @@ A credential may instead define a secret URL path prefix for APIs, including
 Telegram, that authenticate in the path. Components never receive or construct
 the resulting URL.
 
-`sse` opens the response body as server-sent events and returns a `reader`. The
-plugin owns record framing.
-
-`exchange` uses inline request and response bytes, bounded to 1 MiB and the
-HTTP grant's limits. It applies the same network policy without persistent
-blobs. Plugins handling credentials use it for sensitive API exchanges.
+SSE uses an ordinary HTTP response body; plugins own record framing.
+Production transport bodies use temporary storage. The guest HTTP helpers
+explicitly copy selected responses to `blobs`; inline credential exchanges
+remain private. `x-pluribus-credential-handle` is reserved adapter metadata,
+removed before the request reaches the network.
 
 ### `credentials`
 
@@ -201,8 +205,16 @@ event commits; plugins must make external exchanges replay-safe.
 `config.credential_exports` binding. It grants no raw-record access. Missing
 exports and exports expiring within 30 seconds fail.
 
-`random-bytes` returns up to 1024 cryptographically random bytes.
-`now-ms` returns the current Unix time in milliseconds.
+### WASI clocks and randomness
+
+`wasi:clocks/system-clock.now` returns Unix seconds and nanoseconds, including
+pre-epoch times. `monotonic-clock.wait-for` and `wait-until` suspend using
+nanosecond durations and marks. `wasi:random/random` provides secure randomness;
+byte requests may return short reads, bounded to 1024 bytes per call.
+
+The world imports no filesystem, CLI, or general socket APIs. Vendored
+transitive WIT definitions grant no access; the host links only selected
+interfaces. See [WASI security](https://wasi.dev/security).
 
 ### `reader` and `writer`
 
@@ -217,8 +229,9 @@ writer half-closes the channel: the peer reads EOF while the read half stays
 open, and an endpoint MAY treat that as cancellation. The transport closes when
 both halves are gone, or when the delivery ends.
 
-Which halves exist is a property of the opener, so a receive-only channel
-cannot be written: `http.sse` returns a reader alone.
+For source sockets, `reader.read-via-stream` opens one native `stream<u8>`
+and a completion future. It is exclusive with bounded reads; keep the reader
+resource alive while consuming the stream. HTTP bodies use WASI directly.
 
 ### `socket`
 
@@ -235,6 +248,12 @@ of band, through fuel and epoch interruption, so a plugin that ignores or
 cannot observe cancellation is still stopped. Emergency stop does not depend on
 plugin cooperation.
 
+Cancellation reaches the delivery in flight, not the loop that received it: a
+cancelled `handle` fails its host calls with `cancelled`, and `next` returns
+the following delivery. Only shutdown ends the loop, through `stop`. A loop
+waiting between deliveries therefore survives the cancellation of an activity
+it already returned.
+
 ## Logging
 
 There is no log import and no log event. Operational logs would be retained
@@ -244,7 +263,7 @@ can be reconstructed from.
 
 ## Limits
 
-These are ABI `1.0.0` hard maxima. A deployment may configure lower limits.
+These are ABI `2.0.0` hard maxima. A deployment may configure lower limits.
 
 | Item | Maximum |
 | --- | ---: |

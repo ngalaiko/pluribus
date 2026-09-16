@@ -4,7 +4,10 @@
 //! import. A delivery's proposed events, state mutations, and cursor advance
 //! commit in a single transaction.
 
-mod subscription;
+mod runner;
+mod wasi;
+mod wasi_http;
+pub use runner::PluginInstance;
 
 #[cfg(test)]
 mod tests;
@@ -27,12 +30,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use wasmtime::component::{Component, HasSelf, Linker, Resource};
+use wasmtime::component::{Component, Linker, Resource};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use bindings::exports::pluribus::plugin::lifecycle as guest;
 use bindings::pluribus::plugin::{
-    blobs, credentials, events, http, reader, socket, state, types, writer,
+    blobs, credentials, events, reader, runtime as execution, socket, state, types, writer,
 };
 
 const MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -45,7 +48,7 @@ const MAX_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_PAGE: u32 = 1000;
 const MAX_OUTCOME_EVENTS: usize = 1000;
 
-const ABI_WORLD: &str = "pluribus:plugin/plugin@1.0.0";
+const ABI_WORLD: &str = "pluribus:plugin/plugin@2.0.0";
 
 /// Ceilings on one call. Compute is bounded by wall clock, not by an
 /// instruction count: epoch interruption stops the same runaway loops that
@@ -219,20 +222,49 @@ impl fmt::Display for RuntimeError {
 impl Error for RuntimeError {}
 
 #[derive(Clone)]
-pub struct CancellationHandle(Arc<AtomicBool>);
+pub struct CancellationHandle {
+    cancelled: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
 
 impl CancellationHandle {
+    /// Abandons the delivery in flight. A source loop between deliveries keeps
+    /// running; only [`Self::shutdown`] ends it.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
+        self.wake();
+    }
+
+    /// Ends the instance: the delivery in flight and the source loop both stop.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Re-arms for the next delivery. Shutdown is terminal and survives it.
     pub fn reset(&self) {
-        self.0.store(false, Ordering::Release);
+        self.cancelled.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn of(state: &HostState) -> Self {
+        Self {
+            cancelled: Arc::clone(&state.cancelled),
+            shutdown: Arc::clone(&state.shutdown),
+            notify: state.cancel_notify.clone(),
+        }
     }
 }
 
@@ -264,6 +296,7 @@ pub struct Runtime {
     delivery_store: Arc<dyn DeliveryStore>,
     registry: Arc<EventTypeRegistry>,
     progress: Arc<tokio::sync::Notify>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl Runtime {
@@ -286,8 +319,9 @@ impl Runtime {
         }
         let mut config = Config::new();
         config
-            .async_support(true)
+            .concurrency_support(true)
             .wasm_component_model(true)
+            .wasm_component_model_async(true)
             .epoch_interruption(true);
         let engine = Engine::new(&config)
             .map_err(|error| RuntimeError::new(format!("cannot configure Wasmtime: {error}")))?;
@@ -302,7 +336,15 @@ impl Runtime {
             delivery_store,
             registry: Arc::new(EventTypeRegistry::core()),
             progress: Arc::new(tokio::sync::Notify::new()),
+            clock: Arc::new(system_time_ms),
         })
+    }
+
+    /// Sets the clock used by plugin source loops.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Notification shared with the agent driving this runtime.
@@ -336,7 +378,7 @@ impl Runtime {
             ));
         }
         let manifest = package.manifest();
-        if manifest.world != ABI_WORLD && manifest.world != "pluribus:plugin/source@1.0.0" {
+        if manifest.world != ABI_WORLD {
             return Err(RuntimeError::new(format!(
                 "unsupported runtime world: {}",
                 manifest.world
@@ -388,10 +430,12 @@ impl Runtime {
         let services = recipe.services.clone();
         let component = recipe.component.clone();
         let mut linker = Linker::new(&self.ticker.engine);
-        bindings::Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        wasi_http::add_to_linker(&mut linker)
             .map_err(|error| RuntimeError::new(format!("cannot link host imports: {error}")))?;
 
         let cancellation = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
         let instance_id = delivery.instance_id.clone();
         let cursor = CursorKey {
             stream_id: StreamId::new(delivery.agent.id.clone()),
@@ -414,10 +458,14 @@ impl Runtime {
                 blobs: Arc::clone(&self.blob_store),
                 registry: Arc::clone(&self.registry),
                 progress: self.progress.clone(),
+                clock: self.clock.clone(),
             },
             services,
             recipe.emits.clone(),
         );
+        let mut host = host;
+        host.cancel_notify = cancel_notify.clone();
+        host.shutdown = Arc::clone(&shutdown);
         let mut store = Store::new(&self.ticker.engine, host);
         store.limiter(|state| &mut state.limits);
         prepare_call(&mut store, &limits);
@@ -427,37 +475,28 @@ impl Runtime {
             .map_err(|error| RuntimeError::new(format!("cannot instantiate component: {error}")))?;
         let plugin = bindings::Plugin::new(&mut store, &instance)
             .map_err(|error| RuntimeError::new(format!("cannot bind component: {error}")))?;
-        let ingress = instance
-            .get_export_index(&mut store, None, "pluribus:plugin/ingress@1.0.0")
-            .and_then(|interface| {
-                instance.get_export_index(&mut store, Some(&interface), "receive")
-            })
-            .map(|function| {
-                instance
-                    .get_typed_func::<(Vec<u8>,), (Result<types::IngressOutcome, types::Error>,)>(
-                        &mut store, function,
-                    )
-            })
-            .transpose()
-            .map_err(|e| RuntimeError::new(format!("invalid ingress export: {e}")))?;
-        store.data_mut().ingress_supported = ingress.is_some();
 
-        Ok(PluginInstance {
+        Ok(PluginInstance::new(InstanceCore {
             _ticker: Arc::clone(&self.ticker),
             limits,
             store,
             plugin,
-            ingress,
-            cancellation: CancellationHandle(cancellation),
+            cancellation: CancellationHandle {
+                cancelled: cancellation,
+                shutdown,
+                notify: cancel_notify,
+            },
             instance_id,
             cursor,
             checkpoint,
             config: config_bytes,
             delivery_store: Arc::clone(&self.delivery_store),
-            pinned_session: recipe.pinned_session,
             interrupted: false,
+            run_task: None,
+            run_result: None,
+            activation: None,
             recipe,
-        })
+        }))
     }
 }
 
@@ -470,25 +509,23 @@ struct InstanceRecipe {
     pinned_session: bool,
 }
 
-type IngressFunction =
-    wasmtime::component::TypedFunc<(Vec<u8>,), (Result<types::IngressOutcome, types::Error>,)>;
-
 /// One instantiated plugin. Exported calls are serialized by ownership.
-pub struct PluginInstance {
+struct InstanceCore {
     recipe: Arc<InstanceRecipe>,
     _ticker: Arc<EpochTicker>,
     limits: RuntimeLimits,
     store: Store<HostState>,
     plugin: bindings::Plugin,
-    ingress: Option<IngressFunction>,
     cancellation: CancellationHandle,
     instance_id: String,
     cursor: CursorKey,
     checkpoint: u64,
     config: Vec<u8>,
     delivery_store: Arc<dyn DeliveryStore>,
-    pinned_session: bool,
     interrupted: bool,
+    run_task: Option<wasmtime::component::JoinHandle>,
+    run_result: Option<tokio::sync::oneshot::Receiver<Result<(), RuntimeError>>>,
+    activation: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -496,7 +533,6 @@ enum CommitPhase {
     Init,
     Handle,
     Stop,
-    Ingress([u8; 16]),
 }
 
 impl CommitPhase {
@@ -505,123 +541,12 @@ impl CommitPhase {
             Self::Handle => format!("{instance}:{checkpoint}:{ordinal}"),
             Self::Init => format!("{instance}:{checkpoint}:{ordinal}:init"),
             Self::Stop => format!("{instance}:{checkpoint}:{ordinal}:stop"),
-            Self::Ingress(id) => format!("{instance}:ingress:{id:02x?}:{ordinal}"),
         }
     }
 }
 
-impl PluginInstance {
-    /// Creates fresh linear memory using the original grants and configuration.
-    ///
-    /// # Errors
-    /// Returns cursor, linking, or instantiation failures.
-    pub async fn restart(&self) -> Result<Self, RuntimeError> {
-        self.recipe
-            .runtime
-            .instantiate_recipe(
-                self.recipe.clone(),
-                self.config.clone(),
-                self.limits.clone(),
-            )
-            .await
-    }
-
-    /// Whether a dropped lifecycle future requires a fresh instance.
-    #[must_use]
-    pub fn requires_reinstantiation(&self) -> bool {
-        self.interrupted
-    }
-
-    #[must_use]
-    pub fn cancellation(&self) -> CancellationHandle {
-        self.cancellation.clone()
-    }
-
-    #[must_use]
-    pub fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
-    /// A pinned session keeps its linear memory for one activity because its
-    /// continuation is a suspended call stack. Losing the instance fails the
-    /// activity rather than resuming against a fresh one.
-    #[must_use]
-    pub fn pinned_session(&self) -> bool {
-        self.pinned_session
-    }
-
-    #[must_use]
-    pub fn checkpoint(&self) -> u64 {
-        self.checkpoint
-    }
-
-    /// Whether a subscription has uncommitted input ready for its callback.
-    pub fn has_stream_input(&mut self) -> bool {
-        let host = self.store.data_mut();
-        if host.stream_input.is_none() {
-            host.stream_input = host
-                .subscription
-                .as_mut()
-                .and_then(|s| s.inbox.try_recv().ok());
-        }
-        host.stream_input.is_some()
-    }
-
-    /// Processes transient transport input. Only plugin outcomes enter the log.
-    ///
-    /// # Errors
-    /// Returns callback, transport, or commit failures.
-    pub async fn receive_input(&mut self, now_ms: i64) -> Result<Outcome, RuntimeError> {
-        self.begin_lifecycle()?;
-        let result = self.receive_input_inner(now_ms).await;
-        self.interrupted = false;
-        result
-    }
-
-    async fn receive_input_inner(&mut self, now_ms: i64) -> Result<Outcome, RuntimeError> {
-        let input = self
-            .store
-            .data()
-            .stream_input
-            .as_ref()
-            .ok_or_else(|| RuntimeError::new("no subscription input"))?;
-        let id = input.id;
-        let mut payload = input.payload.clone();
-        payload["receivedAtMs"] = Value::from(now_ms);
-        let bytes = serde_json::to_vec(&payload).unwrap();
-        let blob = input.blob.clone();
-        prepare_call(&mut self.store, &self.limits);
-        self.store.data_mut().ingress_call = true;
-        if let Some(blob) = blob {
-            self.store.data_mut().visible_blobs.insert(blob);
-        }
-        let function = self
-            .ingress
-            .ok_or_else(|| RuntimeError::new("missing receive export"))?;
-        let (outcome,) = function
-            .call_async(&mut self.store, (bytes,))
-            .await
-            .map_err(|e| RuntimeError::trap(format!("receive trapped: {e:#}")))?;
-        function
-            .post_return_async(&mut self.store)
-            .await
-            .map_err(|e| RuntimeError::trap(format!("receive post-return trapped: {e:#}")))?;
-        let outcome = outcome.map_err(|e| plugin_failure(&e))?;
-        let outcome = guest::Outcome {
-            events: outcome.events,
-            mutations: outcome.mutations,
-            checkpoint: None,
-        };
-        let result = self
-            .commit(&outcome, None, CommitPhase::Ingress(id))
-            .await?;
-        if let Some(input) = self.store.data_mut().stream_input.take() {
-            let _ = input.committed.send(());
-        }
-        Ok(result)
-    }
-
-    /// Calls `init` once, before any delivery.
+impl InstanceCore {
+    /// Runs setup to the readiness boundary before any delivery.
     ///
     /// # Errors
     ///
@@ -629,28 +554,49 @@ impl PluginInstance {
     pub async fn init(&mut self) -> Result<Outcome, RuntimeError> {
         self.begin_lifecycle()?;
         let result = self.init_inner().await;
-        self.interrupted = false;
+        self.interrupted = result.is_err();
         result
     }
 
     async fn init_inner(&mut self) -> Result<Outcome, RuntimeError> {
-        let config = self.config.clone();
+        if self.run_task.is_some() {
+            return Err(RuntimeError::new("plugin already initialized"));
+        }
         let context = self.context();
         prepare_call(&mut self.store, &self.limits);
-        let result = self
-            .plugin
-            .pluribus_plugin_lifecycle()
-            .call_init(&mut self.store, &context, &config)
-            .await;
-        if result.as_ref().map_or(true, Result::is_err) {
-            self.store.data_mut().release_handles();
-        }
-        let outcome = result
-            .map_err(|error| RuntimeError::trap(format!("init trapped: {error:#}")))?
-            .map_err(|error| plugin_failure(&error))?;
+        let (startup, ready) = tokio::sync::oneshot::channel();
+        let (activation, activated) = tokio::sync::oneshot::channel();
+        let (completed, mut result) = tokio::sync::oneshot::channel();
+        self.store.data_mut().runner.startup = Some(startup);
+        self.store.data_mut().runner.activation = Some(activated);
+        self.activation = Some(activation);
+        self.run_task = Some(
+            self.store
+                .spawn(runner::RunTask {
+                    lifecycle: self.plugin.pluribus_plugin_lifecycle().clone(),
+                    context,
+                    config: self.config.clone(),
+                    completed,
+                })
+                .map_err(|e| RuntimeError::trap(e.to_string()))?,
+        );
+        let startup = tokio::time::timeout(self.limits.call_timeout,
+            self.store.run_concurrent(async |_accessor| {
+                tokio::select! {
+                    biased;
+                    finished = &mut result => Err(finished.ok().and_then(Result::err)
+                        .unwrap_or_else(|| RuntimeError::trap("run exited before ready"))),
+                    outcome = ready => outcome.map_err(|_| RuntimeError::trap("run exited before ready")),
+                }
+            })
+        ).await.map_err(|_| RuntimeError::trap("startup deadline exceeded"))?
+            .map_err(|e| RuntimeError::trap(format!("startup trapped: {e:#}")))??;
         let origin = EventId::new(self.store.data().delivery.origin_event_id.clone());
-        self.commit(&outcome, Some(&origin), CommitPhase::Init)
-            .await
+        let outcome = self
+            .commit(&startup, Some(&origin), CommitPhase::Init)
+            .await?;
+        self.run_result = Some(result);
+        Ok(outcome)
     }
 
     /// Delivers events in ascending sequence order.
@@ -661,7 +607,7 @@ impl PluginInstance {
     pub async fn handle(&mut self, events: &[CommittedEvent]) -> Result<Outcome, RuntimeError> {
         self.begin_lifecycle()?;
         let result = self.handle_inner(events).await;
-        self.interrupted = false;
+        self.interrupted = result.as_ref().err().is_some_and(RuntimeError::trapped);
         result
     }
 
@@ -692,11 +638,17 @@ impl PluginInstance {
             .collect::<Vec<_>>();
         let context = self.context();
         prepare_call(&mut self.store, &self.limits);
-        let result = self
-            .plugin
-            .pluribus_plugin_lifecycle()
-            .call_handle(&mut self.store, &context, &wit_events)
-            .await;
+        let lifecycle = self.plugin.pluribus_plugin_lifecycle();
+        let result = tokio::time::timeout(
+            self.limits.call_timeout,
+            self.store.run_concurrent(async |accessor| {
+                lifecycle.call_handle(accessor, context, wit_events).await
+            }),
+        )
+        .await
+        .map_err(|_| wasmtime::format_err!("handler deadline exceeded"))
+        .and_then(|r| r)
+        .and_then(|r| r);
         if result.as_ref().map_or(true, Result::is_err) {
             self.store.data_mut().release_handles();
         }
@@ -781,11 +733,17 @@ impl PluginInstance {
                 let context = self.context();
                 prepare_call(&mut self.store, &self.limits);
                 self.store.data_mut().replaying = true;
-                let result = self
-                    .plugin
-                    .pluribus_plugin_lifecycle()
-                    .call_handle(&mut self.store, &context, &own)
-                    .await;
+                let lifecycle = self.plugin.pluribus_plugin_lifecycle();
+                let result = tokio::time::timeout(
+                    self.limits.call_timeout,
+                    self.store.run_concurrent(async |accessor| {
+                        lifecycle.call_handle(accessor, context, own.clone()).await
+                    }),
+                )
+                .await
+                .map_err(|_| wasmtime::format_err!("replay deadline exceeded"))
+                .and_then(|r| r)
+                .and_then(|r| r);
                 self.store.data_mut().replaying = false;
                 outcome = result
                     .map_err(|e| RuntimeError::trap(format!("replay trapped: {e:#}")))?
@@ -861,8 +819,17 @@ impl PluginInstance {
     }
 
     async fn stop_inner(&mut self, deadline_at_ms: i64) -> Result<Outcome, RuntimeError> {
-        self.store.data_mut().subscription = None;
-        self.store.data_mut().stream_input = None;
+        if let Some(task) = self.run_task.take() {
+            task.abort();
+            self.store
+                .run_concurrent(async |_| task.await)
+                .await
+                .map_err(|e| RuntimeError::trap(e.to_string()))?;
+        }
+        self.activation.take();
+        // Shutdown cancels the delivery in flight; the final call gets its own
+        // deadline rather than inheriting that cancellation.
+        self.cancellation.reset();
         let context = self.context();
         prepare_call(&mut self.store, &self.limits);
         let result = self
@@ -933,12 +900,6 @@ impl PluginInstance {
             .map_err(|error| RuntimeError::new(format!("cannot commit delivery: {error}")))?;
         self.checkpoint = receipt.checkpoint;
         let host = self.store.data_mut();
-        if matches!(phase, CommitPhase::Stop) {
-            host.subscription = None;
-        } else if let Some(request) = host.pending_subscription.take() {
-            host.subscription = None;
-            host.subscription = Some(subscription::Subscription::start(host, request));
-        }
         host.progress.notify_one();
         Ok(Outcome {
             events: receipt.events,
@@ -950,21 +911,24 @@ impl PluginInstance {
 /// Arms the wall-clock ceiling for one call. The epoch ticker interrupts the
 /// guest when it runs out.
 fn prepare_call(store: &mut Store<HostState>, limits: &RuntimeLimits) {
-    store.data_mut().pending_subscription = None;
-    store.data_mut().ingress_call = false;
+    store.data_mut().emit_call = false;
     let deadline = Instant::now() + limits.call_timeout;
     store.data_mut().call_deadline = Some(deadline);
+    *store.data().io_completion_deadline.lock().unwrap() = None;
     store.data_mut().stream_deadline = store
         .data()
         .stream_grant
         .as_ref()
         .map(|grant| Instant::now() + Duration::from_millis(u64::from(grant.max_timeout_ms)));
-    let cancelled = Arc::clone(&store.data().cancelled);
-    store.epoch_deadline_callback(move |_| {
-        if cancelled.load(Ordering::Acquire) {
+    store.epoch_deadline_callback(move |store| {
+        if store.data().interrupted() {
             return Err(wasmtime::Error::msg("call cancelled"));
         }
-        if Instant::now() >= deadline {
+        if store
+            .data()
+            .effective_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             return Err(wasmtime::Error::msg("call deadline exceeded"));
         }
         Ok(wasmtime::UpdateDeadline::Yield(1))
@@ -1007,6 +971,7 @@ struct HostServices {
     blobs: Arc<dyn BlobStore>,
     registry: Arc<EventTypeRegistry>,
     progress: Arc<tokio::sync::Notify>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 struct HostState {
@@ -1017,6 +982,8 @@ struct HostState {
     limits: StoreLimits,
     delivery: Delivery,
     cancelled: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    cancel_notify: Arc<tokio::sync::Notify>,
     state_store: Arc<dyn StateStore>,
     state_namespace: StateNamespace,
     replaying: bool,
@@ -1024,6 +991,7 @@ struct HostState {
     blob_store: Arc<dyn BlobStore>,
     registry: Arc<EventTypeRegistry>,
     progress: Arc<tokio::sync::Notify>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     emits: Vec<String>,
     active_uploads: HashSet<BlobUploadId>,
     visible_blobs: HashSet<BlobRef>,
@@ -1034,15 +1002,17 @@ struct HostState {
     stream_grant: Option<StreamGrant>,
     stream_deadline: Option<Instant>,
     call_deadline: Option<Instant>,
+    io_completion_deadline: Arc<std::sync::Mutex<Option<Instant>>>,
     transports: HashMap<u32, Transport>,
+    wasi_http: wasmtime_wasi_http::WasiHttpCtx,
+    wasi_table: wasmtime::component::ResourceTable,
+    wasi_hooks: wasi_http::Hooks,
     readers: HashMap<u32, u32>,
+    streaming_readers: HashSet<u32>,
     writers: HashMap<u32, u32>,
     handle_sequence: u32,
-    pending_subscription: Option<subscription::Request>,
-    stream_input: Option<subscription::Input>,
-    ingress_supported: bool,
-    ingress_call: bool,
-    subscription: Option<subscription::Subscription>,
+    runner: runner::HostRunner,
+    emit_call: bool,
 }
 
 /// One connection and the halves the guest still holds. Reader and writer
@@ -1053,21 +1023,11 @@ struct Transport {
 }
 
 enum TransportKind {
-    /// Receive-only HTTP response body. Buffered because the service
-    /// hands over whole frames while a reader asks for bytes.
-    Http {
-        stream_id: String,
-        buffer: VecDeque<u8>,
-        ended: bool,
-    },
-    Socket {
-        stream_id: String,
-    },
+    Socket { stream_id: String },
 }
 
 /// A transport resolved without holding a borrow on the registry.
 enum Target {
-    Http(String),
     Socket(String),
 }
 
@@ -1106,6 +1066,8 @@ impl HostState {
                 .build(),
             delivery,
             cancelled,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
             state_store: services.state,
             state_namespace,
             replaying: false,
@@ -1113,6 +1075,7 @@ impl HostState {
             blob_store: services.blobs,
             registry: services.registry,
             progress: services.progress,
+            clock: services.clock,
             emits,
             active_uploads: HashSet::new(),
             visible_blobs,
@@ -1123,15 +1086,17 @@ impl HostState {
             stream_grant: granted.stream_grant,
             stream_deadline,
             call_deadline: None,
+            io_completion_deadline: Arc::default(),
             transports: HashMap::new(),
+            wasi_http: wasmtime_wasi_http::WasiHttpCtx::new(),
+            wasi_table: wasi_http::resource_table(),
+            wasi_hooks: wasi_http::Hooks,
             readers: HashMap::new(),
+            streaming_readers: HashSet::new(),
             writers: HashMap::new(),
             handle_sequence: 0,
-            pending_subscription: None,
-            stream_input: None,
-            ingress_supported: false,
-            ingress_call: false,
-            subscription: None,
+            runner: runner::HostRunner::default(),
+            emit_call: false,
         }
     }
 
@@ -1155,6 +1120,7 @@ impl HostState {
             self.close_transport(id);
         }
         self.readers.clear();
+        self.streaming_readers.clear();
         self.writers.clear();
     }
 
@@ -1186,7 +1152,7 @@ impl HostState {
             .as_ref()
             .map(|id| EventId::new(id.clone()))
             .or(causation);
-        if causation_id.is_none() && !self.ingress_call {
+        if causation_id.is_none() && !self.emit_call {
             return Err(RuntimeError::new(
                 "proposal needs an explicit causation ID when a batch carries several events",
             ));
@@ -1257,6 +1223,31 @@ impl HostState {
 impl types::Host for HostState {}
 
 impl credentials::Host for HostState {
+    async fn authorize_http(
+        &mut self,
+        request: Resource<wasmtime_wasi_http::p3::Request>,
+        handle: String,
+    ) -> Result<(), types::Error> {
+        self.http_grant()?;
+        let request = self
+            .wasi_table
+            .get_mut(&request)
+            .map_err(|_| closed_channel())?;
+        let mut headers = (*request.headers).clone();
+        headers.insert(
+            wasi_http::CREDENTIAL_HEADER,
+            handle.parse().map_err(|_| {
+                host_error(
+                    types::ErrorCode::InvalidArgument,
+                    "invalid credential handle",
+                )
+            })?,
+        );
+        request.headers =
+            wasmtime_wasi_http::FieldMap::new_immutable(&mut self.wasi_hooks, headers);
+        Ok(())
+    }
+
     async fn resolve_export(&mut self, binding: String) -> Result<String, types::Error> {
         self.credentials
             .as_ref()
@@ -1270,12 +1261,6 @@ impl credentials::Host for HostState {
             .await
     }
 
-    async fn now_ms(&mut self) -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64
-    }
     async fn get(&mut self, handle: String) -> Result<Option<Vec<u8>>, types::Error> {
         let access = self.credential_access(&handle)?;
         access
@@ -1317,18 +1302,6 @@ impl credentials::Host for HostState {
                     "credential storage unavailable",
                 )
             })
-    }
-    async fn random_bytes(&mut self, length: u32) -> Result<Vec<u8>, types::Error> {
-        if length > 1024 {
-            return Err(host_error(
-                types::ErrorCode::InvalidArgument,
-                "random request too large",
-            ));
-        }
-        let mut bytes = vec![0; length as usize];
-        getrandom::fill(&mut bytes)
-            .map_err(|_| host_error(types::ErrorCode::Unavailable, "randomness unavailable"))?;
-        Ok(bytes)
     }
 }
 impl HostState {
@@ -1588,105 +1561,19 @@ impl blobs::Host for HostState {
     }
 }
 
-impl http::Host for HostState {
-    async fn exchange(
-        &mut self,
-        request: http::InlineRequest,
-    ) -> Result<http::InlineResponse, types::Error> {
-        let mut grant = self.http_grant()?.clone();
-        grant.max_request_bytes = grant.max_request_bytes.min(1024 * 1024);
-        grant.max_response_bytes = grant.max_response_bytes.min(1024 * 1024);
-        let timeout = request.timeout_ms.min(self.call_budget()?);
-        let result = self
-            .http_wait(pluribus_host_http::exchange_inline(
-                &grant,
-                &request.method,
-                &request.url,
-                request
-                    .headers
-                    .into_iter()
-                    .map(|h| HttpHeader {
-                        name: h.name,
-                        value: h.value,
-                    })
-                    .collect(),
-                request.body,
-                timeout,
-            ))
-            .await?;
-        Ok(http::InlineResponse {
-            status: result.0,
-            body: result.1,
-        })
-    }
-
-    async fn subscribe(&mut self, request: http::Request) -> Result<(), types::Error> {
-        if !self.ingress_supported || self.replaying || self.cancelled.load(Ordering::Acquire) {
-            return Err(stream_denied());
-        }
-        self.http_service()?;
-        self.http_grant()?;
-        let timeout = request.timeout_ms.min(self.http_grant()?.max_timeout_ms);
-        let mut request = self.http_request(request)?;
-        request.timeout_ms = timeout;
-        self.pending_subscription = Some(subscription::Request::Http(request));
-        Ok(())
-    }
-
-    async fn send(&mut self, request: http::Request) -> Result<http::Response, types::Error> {
-        let request = self.http_request(request)?;
-        let service = self.http_service()?;
-        let grant = self.http_grant()?;
-        let response = self.http_wait(service.send(grant, &request)).await?;
-        self.visible_blobs.insert(response.body.clone());
-        Ok(http::Response {
-            status: response.status,
-            headers: response
-                .headers
-                .into_iter()
-                .map(|header| http::Header {
-                    name: header.name,
-                    value: header.value,
-                })
-                .collect(),
-            body: wit_blob_ref(&response.body),
-        })
-    }
-
-    async fn sse(
-        &mut self,
-        request: http::Request,
-    ) -> Result<Resource<reader::Reader>, types::Error> {
-        let request = self.http_request(request)?;
-        let stream_id = self
-            .http_wait(self.http_service()?.open_stream(
-                self.http_grant()?,
-                HttpStreamProtocol::Bytes,
-                &request,
-            ))
-            .await?;
-        Ok(self.register_read_only(TransportKind::Http {
-            stream_id,
-            buffer: VecDeque::new(),
-            ended: false,
-        }))
-    }
-}
-
 impl socket::Host for HostState {
-    async fn subscribe(&mut self, request: Vec<u8>) -> Result<(), types::Error> {
-        let (_, grant) = self.stream_access()?;
-        if !self.ingress_supported || self.replaying || self.cancelled.load(Ordering::Acquire) {
+    async fn listen(
+        &mut self,
+    ) -> Result<(Resource<reader::Reader>, Resource<writer::Writer>), types::Error> {
+        if !self.runner.active || self.replaying {
             return Err(stream_denied());
         }
-        if request.len() as u64 > grant.max_bytes || request.len() > 32 * 1024 {
-            return Err(host_error(
-                types::ErrorCode::ResourceExhausted,
-                "subscription request exceeds limit",
-            ));
-        }
-        self.pending_subscription = Some(subscription::Request::Socket(request));
-        Ok(())
+        let (service, grant) = self.stream_access()?;
+        let id = self
+            .cancellable(service.listen(&grant))
+            .await?
+            .map_err(stream_plugin_error)?;
+        Ok(self.register_duplex(TransportKind::Socket { stream_id: id }))
     }
 
     async fn connect(
@@ -1694,7 +1581,7 @@ impl socket::Host for HostState {
     ) -> Result<(Resource<reader::Reader>, Resource<writer::Writer>), types::Error> {
         let (service, grant) = self.stream_access()?;
         let deadline = self.stream_deadline.ok_or_else(stream_denied)?;
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.interrupted() {
             return Err(host_error(types::ErrorCode::Cancelled, "stream cancelled"));
         }
         let remaining = self.stream_budget(deadline)?;
@@ -1725,13 +1612,15 @@ impl reader::HostReader for HostState {
                 "max bytes must be positive",
             ));
         }
+        if self.streaming_readers.contains(&read.rep()) {
+            return Err(host_error(
+                types::ErrorCode::Conflict,
+                "reader already streaming",
+            ));
+        }
         let timeout_ms = timeout_ms.min(self.call_budget()?);
         let (id, target) = self.read_target(&read)?;
         match target {
-            Target::Http(stream_id) => {
-                self.receive_http(id, &stream_id, max_bytes, timeout_ms)
-                    .await
-            }
             Target::Socket(stream_id) => {
                 self.receive_socket(id, &stream_id, max_bytes, timeout_ms)
                     .await
@@ -1740,6 +1629,7 @@ impl reader::HostReader for HostState {
     }
 
     async fn drop(&mut self, read: Resource<reader::Reader>) -> wasmtime::Result<()> {
+        self.streaming_readers.remove(&read.rep());
         if let Some(id) = self.readers.remove(&read.rep()) {
             self.release_half(id);
         }
@@ -1766,12 +1656,6 @@ impl writer::HostWriter for HostState {
                         stream_plugin_error(error)
                     })
             }
-            // No opener hands out a writer over HTTP yet; a future
-            // `http.websocket` would route here.
-            Target::Http(_) => Err(host_error(
-                types::ErrorCode::Unsupported,
-                "HTTP channels are receive-only",
-            )),
         }
     }
 
@@ -1796,34 +1680,31 @@ impl writer::HostWriter for HostState {
 }
 
 impl HostState {
-    async fn http_wait<T>(
+    fn cancellable<T, F: Future<Output = T>>(
         &self,
-        operation: impl std::future::Future<Output = Result<T, HttpError>>,
-    ) -> Result<T, types::Error> {
-        self.cancellable(operation)
-            .await?
-            .map_err(|e| http_error(&e))
-    }
-
-    async fn cancellable<T>(
-        &self,
-        operation: impl std::future::Future<Output = T>,
-    ) -> Result<T, types::Error> {
-        tokio::pin!(operation);
-        loop {
-            self.call_budget()?;
-            tokio::select! {
-                biased;
-                result = &mut operation => return Ok(result),
-                () = tokio::time::sleep(EPOCH_TICK) => {}
+        operation: F,
+    ) -> impl Future<Output = Result<T, types::Error>> + use<T, F> {
+        let cancelled = Arc::clone(self.interrupt_flag());
+        let deadline = self.effective_deadline();
+        async move {
+            tokio::pin!(operation);
+            loop {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(host_error(types::ErrorCode::Cancelled, "call cancelled"));
+                }
+                if deadline.is_some_and(|d| d <= Instant::now()) {
+                    return Err(host_error(
+                        types::ErrorCode::DeadlineExceeded,
+                        "call deadline exceeded",
+                    ));
+                }
+                tokio::select! {
+                    biased;
+                    result = &mut operation => return Ok(result),
+                    () = tokio::time::sleep(EPOCH_TICK) => {}
+                }
             }
         }
-    }
-
-    fn http_service(&self) -> Result<&dyn HttpStreamService, types::Error> {
-        self.http
-            .as_deref()
-            .ok_or_else(|| host_error(types::ErrorCode::Unavailable, "HTTP service is unavailable"))
     }
 
     fn http_grant(&self) -> Result<&HttpGrant, types::Error> {
@@ -1832,36 +1713,30 @@ impl HostState {
             .ok_or_else(|| host_error(types::ErrorCode::PermissionDenied, "no HTTP grant"))
     }
 
-    fn http_request(&self, request: http::Request) -> Result<HttpRequest, types::Error> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(host_error(types::ErrorCode::Cancelled, "call cancelled"));
+    /// The flag that ends what the guest is doing now. Cancellation reaches a
+    /// delivery; a source loop between deliveries only ends on shutdown.
+    fn interrupt_flag(&self) -> &Arc<AtomicBool> {
+        if self.runner.active && !self.runner.has_pending_delivery() {
+            &self.shutdown
+        } else {
+            &self.cancelled
         }
-        let body = request.body.map(core_blob_ref).transpose()?;
-        if let Some(body) = &body {
-            self.ensure_visible_blob(body)?;
-        }
-        Ok(HttpRequest {
-            method: request.method,
-            url: request.url,
-            headers: request
-                .headers
-                .into_iter()
-                .map(|header| HttpHeader {
-                    name: header.name,
-                    value: header.value,
-                })
-                .collect(),
-            body,
-            credential_handle: request.credential.map(SecretHandle::new),
-            timeout_ms: request.timeout_ms.min(self.call_budget()?),
-        })
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt_flag().load(Ordering::Acquire)
+    }
+
+    fn effective_deadline(&self) -> Option<Instant> {
+        self.call_deadline
+            .max(*self.io_completion_deadline.lock().unwrap())
     }
 
     fn call_budget(&self) -> Result<u32, types::Error> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.interrupted() {
             return Err(host_error(types::ErrorCode::Cancelled, "call cancelled"));
         }
-        let remaining = self.call_deadline.map_or(u32::MAX, |deadline| {
+        let remaining = self.effective_deadline().map_or(u32::MAX, |deadline| {
             u32::try_from(
                 deadline
                     .saturating_duration_since(Instant::now())
@@ -1911,14 +1786,6 @@ impl HostState {
         self.handle_sequence
     }
 
-    fn register_read_only(&mut self, kind: TransportKind) -> Resource<reader::Reader> {
-        let id = self.next_handle();
-        self.transports.insert(id, Transport { kind, halves: 1 });
-        let read = self.next_handle();
-        self.readers.insert(read, id);
-        Resource::new_own(read)
-    }
-
     fn register_duplex(
         &mut self,
         kind: TransportKind,
@@ -1948,10 +1815,6 @@ impl HostState {
     fn target(&self, id: u32) -> Result<Target, types::Error> {
         match self.transports.get(&id) {
             Some(Transport {
-                kind: TransportKind::Http { stream_id, .. },
-                ..
-            }) => Ok(Target::Http(stream_id.clone())),
-            Some(Transport {
                 kind: TransportKind::Socket { stream_id },
                 ..
             }) => Ok(Target::Socket(stream_id.clone())),
@@ -1978,14 +1841,6 @@ impl HostState {
     fn close_transport(&mut self, id: u32) {
         match self.transports.remove(&id) {
             Some(Transport {
-                kind: TransportKind::Http { stream_id, .. },
-                ..
-            }) => {
-                if let (Some(service), Some(grant)) = (&self.http, &self.http_grant) {
-                    service.close_stream(grant, &stream_id);
-                }
-            }
-            Some(Transport {
                 kind: TransportKind::Socket { stream_id },
                 ..
             }) => {
@@ -1995,54 +1850,6 @@ impl HostState {
             }
             None => {}
         }
-    }
-
-    fn http_buffer(&mut self, id: u32) -> Result<(&mut VecDeque<u8>, &mut bool), types::Error> {
-        match self.transports.get_mut(&id) {
-            Some(Transport {
-                kind: TransportKind::Http { buffer, ended, .. },
-                ..
-            }) => Ok((buffer, ended)),
-            Some(Transport {
-                kind: TransportKind::Socket { .. },
-                ..
-            })
-            | None => Err(closed_channel()),
-        }
-    }
-
-    async fn receive_http(
-        &mut self,
-        id: u32,
-        stream_id: &str,
-        max_bytes: u32,
-        timeout_ms: u32,
-    ) -> Result<types::Chunk, types::Error> {
-        let (buffer, ended) = self.http_buffer(id)?;
-        if buffer.is_empty() && !*ended {
-            let page = self
-                .http_wait(self.http_service()?.receive(
-                    self.http_grant()?,
-                    stream_id,
-                    1,
-                    timeout_ms,
-                ))
-                .await?;
-            let (buffer, ended) = self.http_buffer(id)?;
-            buffer.extend(page.frames.into_iter().flat_map(|frame| frame.data));
-            *ended = page.closed;
-        }
-        let (buffer, ended) = self.http_buffer(id)?;
-        let count = buffer
-            .len()
-            .min(usize::try_from(max_bytes).unwrap_or(usize::MAX))
-            .min(MAX_BLOB_CHUNK_BYTES);
-        let bytes = buffer.drain(..count).collect();
-        let closed = *ended && buffer.is_empty();
-        if closed {
-            self.close_transport(id);
-        }
-        Ok(types::Chunk { bytes, closed })
     }
 
     async fn receive_socket(
@@ -2055,8 +1862,9 @@ impl HostState {
         let (service, _) = self.stream_access()?;
         let deadline = self.stream_deadline.ok_or_else(stream_denied)?;
         let timeout_ms = timeout_ms.min(self.stream_budget(deadline)?);
+        let interrupt = Arc::clone(self.interrupt_flag());
         match self
-            .cancellable(service.receive(stream_id, max_bytes, timeout_ms, &self.cancelled))
+            .cancellable(service.receive(stream_id, max_bytes, timeout_ms, &interrupt))
             .await?
         {
             Ok(page) => {
@@ -2229,23 +2037,6 @@ fn state_error(error: StateError) -> types::Error {
             details: None,
         },
     }
-}
-
-fn http_error(error: &HttpError) -> types::Error {
-    let code = match error {
-        HttpError::Invalid(_) => types::ErrorCode::InvalidArgument,
-        HttpError::Unsupported(_) => types::ErrorCode::Unsupported,
-        HttpError::PermissionDenied(_) | HttpError::AuthenticationRequired => {
-            types::ErrorCode::PermissionDenied
-        }
-        HttpError::NotFound(_) => types::ErrorCode::NotFound,
-        HttpError::ResourceExhausted(_) => types::ErrorCode::ResourceExhausted,
-        HttpError::Timeout => types::ErrorCode::DeadlineExceeded,
-        HttpError::Cancelled => types::ErrorCode::Cancelled,
-        HttpError::Unavailable(_) => types::ErrorCode::Unavailable,
-        HttpError::Internal(_) => types::ErrorCode::Internal,
-    };
-    host_error(code, &error.to_string())
 }
 
 fn closed_channel() -> types::Error {

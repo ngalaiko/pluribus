@@ -9,6 +9,8 @@ rust-version.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+url.workspace = true
+futures-util.workspace = true
 base64 = { workspace = true, features = ["alloc"] }
 pluribus-model = { path = "../../crates/pluribus-model" }
 serde = { workspace = true, features = ["derive"] }

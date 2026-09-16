@@ -1,7 +1,7 @@
 //! The Telegram HTTP surface both components call.
 
+use crate::http::{self, Header, Request};
 use crate::pluribus::plugin::blobs;
-use crate::pluribus::plugin::http::{self, Header, Request};
 use crate::pluribus::plugin::types::{BlobRef, Error, ErrorCode};
 use serde_json::Value;
 

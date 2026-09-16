@@ -6,8 +6,9 @@ mod normalize;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use telegram::exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
+use telegram::http;
+use telegram::pluribus::plugin::state;
 use telegram::pluribus::plugin::types::{Error, Event, Mutation, Proposal, StateEntry};
-use telegram::pluribus::plugin::{http, state};
 use telegram::{Slot, parse_config, proposal};
 
 /// Key holding the `getUpdates` offset. State is a rebuildable projection: an
@@ -36,14 +37,54 @@ thread_local! {
 
 struct Telegram;
 
+fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
+    let outcome = initialize(config)?;
+    Ok(outcome)
+}
+
 impl Guest for Telegram {
-    fn init(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
-        let outcome = initialize(config)?;
-        subscribe(&CONFIG.with(Slot::load)?, stored_offset()?)?;
-        Ok(outcome)
+    async fn run(mut context: Context, config: Vec<u8>) -> Result<(), Error> {
+        let outcome = setup(context.clone(), config)?;
+        telegram::pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
+
+        use telegram::pluribus::plugin::runtime;
+        let mut delay: u32 = 0;
+        loop {
+            if Self::waiting(&mut context, async {
+                telegram::wasi::clocks::monotonic_clock::wait_for(u64::from(delay) * 1_000_000)
+                    .await;
+                Ok(())
+            })
+            .await?
+            .is_none()
+            {
+                return Ok(());
+            }
+            let config = CONFIG.with(Slot::load)?;
+            let result: Result<bool, Error> = async {
+                let request = poll_request(&config, stored_offset()?)?;
+                let Some(response) = Self::waiting(&mut context, http::fetch(request)).await?
+                else {
+                    return Ok(true);
+                };
+                let out = Self::process_response(response, {
+                    let t = telegram::wasi::clocks::system_clock::now();
+                    t.seconds * 1000 + i64::from(t.nanoseconds / 1_000_000)
+                })?;
+                runtime::commit(&out.events, &out.mutations, None)?;
+                Ok(false)
+            }
+            .await;
+            match result {
+                Ok(true) => return Ok(()),
+                Ok(false) => delay = 100,
+                Err(error) if !should_retry(&error) => return Err(error),
+                Err(_) => delay = delay.saturating_mul(2).clamp(100, 30_000),
+            }
+        }
     }
 
-    fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         Ok(Outcome {
             events: vec![],
             mutations: vec![],
@@ -60,14 +101,22 @@ impl Guest for Telegram {
     }
 }
 
+fn should_retry(error: &Error) -> bool {
+    error.retryable
+        || matches!(
+            error.code,
+            telegram::pluribus::plugin::types::ErrorCode::DeadlineExceeded
+        )
+}
+
 struct Poll {
     observations: Vec<Proposal>,
     offset: Option<i64>,
     pending: Vec<Mutation>,
 }
 
-fn subscribe(config: &Config, offset: Option<i64>) -> Result<(), Error> {
-    http::subscribe(&telegram::api::request(
+fn poll_request(config: &Config, offset: Option<i64>) -> Result<http::Request, Error> {
+    telegram::api::request(
         "getUpdates",
         &json!({"offset":offset,"limit":100,"timeout":config.poll_timeout_seconds,
             "allowed_updates":["message","edited_message","channel_post","edited_channel_post","message_reaction","callback_query"]}),
@@ -76,61 +125,10 @@ fn subscribe(config: &Config, offset: Option<i64>) -> Result<(), Error> {
             .poll_timeout_seconds
             .saturating_add(10)
             .saturating_mul(1000),
-    )?)
+    )
 }
 
-impl telegram::exports::pluribus::plugin::ingress::Guest for Telegram {
-    fn receive(input: Vec<u8>) -> Result<telegram::pluribus::plugin::types::IngressOutcome, Error> {
-        let input: Value = serde_json::from_slice(&input).map_err(telegram::api::internal)?;
-        let mut out = telegram::pluribus::plugin::types::IngressOutcome {
-            events: vec![],
-            mutations: vec![],
-        };
-        if input["kind"] != "http" {
-            return Ok(out);
-        }
-        let config = CONFIG.with(Slot::load)?;
-        let response = telegram::api::decode_response(
-            input["status"].as_u64().unwrap_or(0) as u16,
-            telegram::pluribus::plugin::types::BlobRef {
-                algorithm: "sha256".into(),
-                digest: input["body"]["digest"]
-                    .as_str()
-                    .ok_or_else(|| telegram::api::invalid("missing body digest"))?
-                    .into(),
-                size: input["body"]["size"]
-                    .as_u64()
-                    .ok_or_else(|| telegram::api::invalid("missing body size"))?,
-                media_type: input["body"]["mediaType"]
-                    .as_str()
-                    .unwrap_or("application/json")
-                    .into(),
-            },
-        )?;
-        let previous = stored_offset()?;
-        let result = poll_response(&config, response.value, previous)?;
-        fetch_pending(
-            &config,
-            input["receivedAtMs"].as_i64().unwrap_or(0),
-            &mut out.events,
-            &mut out.mutations,
-        )?;
-        out.events.extend(result.observations);
-        out.mutations.extend(result.pending);
-        if result.offset != previous
-            && let Some(offset) = result.offset
-        {
-            out.mutations.push(Mutation::Set(StateEntry {
-                key: OFFSET_KEY.into(),
-                value: offset.to_string().into_bytes(),
-            }));
-        }
-        subscribe(&config, result.offset)?;
-        Ok(out)
-    }
-}
-
-/// Observations and offsets commit atomically, deduplicated by update ID.
+/// Ready observations or pending downloads commit atomically with the offset.
 fn poll_response(config: &Config, response: Value, offset: Option<i64>) -> Result<Poll, Error> {
     let observations = normalize::updates(&response, &config.trusted_senders, 100)?;
     let next = response
@@ -142,7 +140,8 @@ fn poll_response(config: &Config, response: Value, offset: Option<i64>) -> Resul
         .or(offset);
 
     let mut pending = Vec::new();
-    for observation in &observations {
+    let mut proposals = Vec::new();
+    for observation in observations {
         if observation.payload["media"]
             .as_array()
             .is_some_and(|media| media.iter().any(|item| item["status"] == "pending"))
@@ -154,25 +153,25 @@ fn poll_response(config: &Config, response: Value, offset: Option<i64>) -> Resul
                 ),
                 value: serde_json::to_vec(&observation.payload).map_err(telegram::api::internal)?,
             }));
+        } else {
+            proposals.push(observation_proposal(&observation.payload)?);
         }
     }
-    let proposals = observations
-        .into_iter()
-        .map(|observation| {
-            proposal(
-                "observation.received",
-                "dev.pluribus.telegram.observation.v1",
-                &observation.payload,
-                Some(observation.deduplication_key),
-                None,
-            )
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
     Ok(Poll {
         observations: proposals,
         offset: next,
         pending,
     })
+}
+
+fn observation_proposal(observation: &Value) -> Result<Proposal, Error> {
+    proposal(
+        "observation.received",
+        "dev.pluribus.telegram.observation.v1",
+        observation,
+        Some(format!("telegram:update:{}", observation["update_id"])),
+        None,
+    )
 }
 
 fn fetch_pending(
@@ -240,23 +239,11 @@ fn fetch_pending(
             value: serde_json::to_vec(&observation).map_err(telegram::api::internal)?,
         }));
     } else {
-        let failed = media.iter().any(|item| item["status"] == "failed");
-        observation["observationDeduplicationKey"] =
-            json!(format!("telegram:update:{}", observation["update_id"]));
-        proposals.push(proposal(
-            if failed {
-                "telegram.media-failed"
-            } else {
-                "telegram.media-ready"
-            },
-            "dev.pluribus.telegram.media.v1",
-            &observation,
-            Some(format!(
-                "telegram:update:{}:media",
-                observation["update_id"]
-            )),
-            None,
-        )?);
+        observation
+            .as_object_mut()
+            .unwrap()
+            .remove("mediaRetryAtMs");
+        proposals.push(observation_proposal(&observation)?);
         mutations.push(Mutation::Delete(entry.key));
     }
     Ok(())
@@ -289,8 +276,82 @@ fn default_poll_timeout() -> u32 {
 
 telegram::export!(Telegram);
 
+impl Telegram {
+    fn process_response(response: http::Response, now_ms: i64) -> Result<SourceOutput, Error> {
+        let mut out = SourceOutput {
+            events: vec![],
+            mutations: vec![],
+        };
+        let config = CONFIG.with(Slot::load)?;
+        let response = telegram::api::decode_response(response.status, response.body)?;
+        let previous = stored_offset()?;
+        let result = poll_response(&config, response.value, previous)?;
+        fetch_pending(&config, now_ms, &mut out.events, &mut out.mutations)?;
+        out.events.extend(result.observations);
+        out.mutations.extend(result.pending);
+        if result.offset != previous
+            && let Some(offset) = result.offset
+        {
+            out.mutations.push(Mutation::Set(StateEntry {
+                key: OFFSET_KEY.into(),
+                value: offset.to_string().into_bytes(),
+            }));
+        }
+
+        Ok(out)
+    }
+}
+
+struct SourceOutput {
+    events: Vec<telegram::pluribus::plugin::types::Proposal>,
+    mutations: Vec<telegram::pluribus::plugin::types::Mutation>,
+}
+
+impl Telegram {
+    /// Services internal deliveries while external work is suspended.
+    async fn waiting<T>(
+        context: &mut Context,
+        work: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<Option<T>, Error> {
+        use futures_util::future::{Either, select};
+        use telegram::pluribus::plugin::runtime::{self, Wake};
+        futures_util::pin_mut!(work);
+        loop {
+            match select(Box::pin(runtime::next()), work.as_mut()).await {
+                Either::Left((wake, _)) => match wake? {
+                    Wake::Stop(_) => {
+                        // Finish cancelled imports before dropping their borrowed resources.
+                        let _ = work.await;
+                        return Ok(None);
+                    }
+                    Wake::Events(events) => match Self::handle(context.clone(), events).await {
+                        Ok(out) => {
+                            runtime::commit(&out.events, &out.mutations, out.checkpoint)?;
+                            context.state_checkpoint =
+                                out.checkpoint.unwrap_or(context.state_checkpoint);
+                        }
+                        Err(error) => runtime::reject(&error)?,
+                    },
+                },
+                Either::Right((result, _)) => return result.map(Some),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod role_tests {
+    #[test]
+    fn long_poll_timeout_is_retryable() {
+        let error = Error {
+            code: telegram::pluribus::plugin::types::ErrorCode::DeadlineExceeded,
+            message: "timeout".into(),
+            retryable: false,
+            details: None,
+        };
+        assert!(should_retry(&error));
+    }
+
     use super::*;
     use telegram::pluribus::plugin::types::{Payload, Principal, PrincipalKind};
 
@@ -305,6 +366,25 @@ mod role_tests {
             depth: 0,
             deadline_at_ms: None,
         }
+    }
+
+    #[test]
+    fn media_observation_waits_for_downloads_but_text_does_not() {
+        let config: Config = serde_json::from_value(
+            json!({"credentials":{"bot-token":"fixture"},"trusted_senders":["7"]}),
+        )
+        .unwrap();
+        let result = poll_response(&config, json!([
+            {"update_id":47,"message":{"from":{"id":7},"chat":{"id":9},"caption":"photo","photo":[{"file_id":"file"}]}},
+            {"update_id":48,"message":{"from":{"id":7},"chat":{"id":9},"text":"text"}}
+        ]), None).unwrap();
+        assert_eq!(result.observations.len(), 1);
+        assert_eq!(
+            result.observations[0].idempotency_key.as_deref(),
+            Some("telegram:update:48")
+        );
+        assert_eq!(result.pending.len(), 1);
+        assert_eq!(result.offset, Some(49));
     }
 
     #[test]
@@ -327,7 +407,10 @@ mod role_tests {
             correlation_id: None,
             causation_id: None,
         };
-        let outcome = Telegram::handle(context(), vec![event]).unwrap();
+        let outcome =
+            futures_util::FutureExt::now_or_never(Telegram::handle(context(), vec![event]))
+                .unwrap()
+                .unwrap();
         assert!(outcome.events.is_empty());
         assert!(outcome.mutations.is_empty());
         assert_eq!(outcome.checkpoint, Some(1));

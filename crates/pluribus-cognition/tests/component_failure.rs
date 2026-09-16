@@ -92,7 +92,7 @@ async fn append_bytes(store: &Arc<SqliteEventStore<Metadata>>, event_type: &str,
             stream_kind: StreamKind::Agent,
             observed_at_ms: None,
             event_type: event_type.into(),
-            payload_schema: "dev.pluribus.js.cell/1".into(),
+            payload_schema: "dev.pluribus.repl.cell/1".into(),
             payload: EventPayload::CanonicalJson(payload),
             actor: PrincipalRef::new(PrincipalKind::Agent, "personal"),
             authority_id: Some(AuthorityId::new("authority-1")),
@@ -160,7 +160,7 @@ async fn agent_with_limits(
     );
     agent
         .install_component(
-            package.component("js").unwrap(),
+            package.component("repl").unwrap(),
             &json!({}),
             Delivery {
                 instance_id: "code-1".into(),
@@ -218,7 +218,7 @@ async fn a_trapped_session_component_fails_the_call_and_recovers() {
     agent.tick_wait(1).await.unwrap();
     append(&store, "code.evaluate-requested", &json!({
         "sessionId":"crashing", "context":{},
-        "source":format!("await history.read({{}}); let total=0; for(let i=0;i<{OUTER};i++) {{ for(let j=0;j<{INNER};j++) {{ total+=j; }} }} return total;")
+        "source":format!("await history.read({{}}); let total=0; for(let i=0;i<{OUTER};i++) {{ for(let j=0;j<{INNER};j++) {{ total+=JSON.stringify([i,j,total]).length; }} }} return total;")
     })).await;
     agent.tick_wait(1).await.unwrap();
     append(
@@ -232,11 +232,19 @@ async fn a_trapped_session_component_fails_the_call_and_recovers() {
         .await
         .expect("a trap must not fail the pass");
 
-    let failure = events(&store)
-        .await
-        .into_iter()
+    let recorded = events(&store).await;
+    let failure = recorded
+        .iter()
         .find(|event| event.request.event_type == "component.failed")
-        .expect("the host must record the component's death");
+        .unwrap_or_else(|| {
+            panic!(
+                "the host must record the component's death: {:?}",
+                recorded
+                    .iter()
+                    .map(|e| (&e.request.event_type, payload(e)))
+                    .collect::<Vec<_>>()
+            )
+        });
     assert_eq!(payload(&failure)["instanceId"], json!("code-1"));
     assert_eq!(
         failure.request.actor.kind,

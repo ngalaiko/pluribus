@@ -32,7 +32,16 @@ fn configured_file_archive_allows_concurrent_runners_without_its_source() {
             // Subscribe the fixture to bypass the default cognition package.
             let manifest = fs::read_to_string(entry.path())
                 .unwrap()
-                .replace("[component]", "[component]\nsubscribes = [\"*\"]");
+                .lines()
+                .map(|line| {
+                    if line.starts_with("subscribes =") {
+                        "subscribes = [\"*\"]"
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             let mut header = tar::Header::new_ustar();
             header.set_size(manifest.len() as u64);
             header.set_mode(0o644);

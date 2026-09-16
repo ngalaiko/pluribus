@@ -47,7 +47,7 @@ impl Monitor {
                 if path.try_exists().unwrap_or(true) {
                     stopped.store(true, Ordering::Release);
                     for handle in &handles {
-                        handle.cancel();
+                        handle.shutdown();
                     }
                     break;
                 }
