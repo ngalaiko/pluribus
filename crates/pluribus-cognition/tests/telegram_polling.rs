@@ -61,7 +61,7 @@ impl HttpService for TelegramFixture {
     async fn send(&self, _: &HttpGrant, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         if request.method == "GET" {
             assert!(self.recover);
-            assert!(request.url.ends_with("/document.txt"));
+            assert!(request.url.ends_with("/photos/file_2.jpg"));
             return Ok(self.response(200, b"attachment contents").await);
         }
         assert_eq!(request.method, "POST");
@@ -69,7 +69,10 @@ impl HttpService for TelegramFixture {
             let attempt = self.files.fetch_add(1, Ordering::SeqCst);
             if self.recover && attempt > 0 {
                 return Ok(self
-                    .response(200, br#"{"ok":true,"result":{"file_path":"document.txt"}}"#)
+                    .response(
+                        200,
+                        br#"{"ok":true,"result":{"file_path":"photos/file_2.jpg"}}"#,
+                    )
                     .await);
             }
             let bytes = br#"{"ok":false,"description":"temporary failure"}"#;
@@ -97,9 +100,10 @@ impl HttpService for TelegramFixture {
         };
         if self.with_media && number == 1 {
             let message = result[0]["message"].as_object_mut().unwrap();
+            // Photo sizes carry no file name or MIME type.
             message.insert(
-                "document".into(),
-                json!({"file_id":"broken","file_name":"file.txt"}),
+                "photo".into(),
+                json!([{"file_id":"tiny","width":90,"height":88},{"file_id":"broken","width":320,"height":312}]),
             );
             // An attachment carries its text in a caption.
             let text = message.remove("text").unwrap();
@@ -354,7 +358,14 @@ async fn run_polling(with_media: bool, recover: bool) {
             if recover { "ready" } else { "failed" }
         );
         if recover {
-            assert_eq!(payload(failure)["media"][0]["blob"]["size"], 19);
+            let media = &payload(failure)["media"][0];
+            assert_eq!(media["kind"], "photo");
+            assert_eq!(media["fileName"], "file_2.jpg");
+            assert_eq!(media["blob"]["size"], 19);
+            assert_eq!(
+                media["blob"]["mediaType"], "image/jpeg",
+                "Telegram serves files without a content type"
+            );
         }
         assert_eq!(
             events

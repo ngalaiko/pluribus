@@ -215,12 +215,18 @@ fn fetch_pending(
             .as_str()
             .ok_or_else(|| telegram::api::internal("missing pending file ID"))?;
         match files::download(file_id, &config.credentials.bot_token) {
-            Ok((blob, name)) => {
-                item["blob"] = normalize::blob_json(&blob);
-                item["status"] = json!("ready");
+            Ok((mut blob, name)) => {
                 if item["fileName"].is_null() {
                     item["fileName"] = json!(name);
                 }
+                blob.media_type = normalize::media_type(
+                    item["kind"].as_str().unwrap_or(""),
+                    &item["metadata"],
+                    item["fileName"].as_str(),
+                    &blob.media_type,
+                );
+                item["blob"] = normalize::blob_json(&blob);
+                item["status"] = json!("ready");
             }
             Err(error) => {
                 let attempts = item["attempts"].as_u64().unwrap_or(0) + 1;

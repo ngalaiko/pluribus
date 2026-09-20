@@ -75,6 +75,54 @@ pub(crate) fn blob_json(blob: &BlobRef) -> Value {
     })
 }
 
+/// The media type of a downloaded attachment. Telegram's file server labels
+/// bodies `application/octet-stream`, so the update metadata, the attachment
+/// kind, and the file extension take precedence over that default.
+pub(crate) fn media_type(
+    kind: &str,
+    metadata: &Value,
+    file_name: Option<&str>,
+    downloaded: &str,
+) -> String {
+    if let Some(declared) = metadata.get("mime_type").and_then(Value::as_str) {
+        return declared.to_owned();
+    }
+    if downloaded != "application/octet-stream" && !downloaded.is_empty() {
+        return downloaded.to_owned();
+    }
+    let by_kind = match kind {
+        "photo" => Some("image/jpeg"),
+        "sticker" if metadata["is_video"] == true => Some("video/webm"),
+        "sticker" if metadata["is_animated"] == true => Some("application/x-tgsticker"),
+        "sticker" => Some("image/webp"),
+        "voice" => Some("audio/ogg"),
+        "video" | "video_note" | "animation" => Some("video/mp4"),
+        _ => None,
+    };
+    let by_extension =
+        file_name
+            .and_then(|name| name.rsplit_once('.'))
+            .and_then(
+                |(_, extension)| match extension.to_ascii_lowercase().as_str() {
+                    "jpg" | "jpeg" => Some("image/jpeg"),
+                    "png" => Some("image/png"),
+                    "gif" => Some("image/gif"),
+                    "webp" => Some("image/webp"),
+                    "mp4" => Some("video/mp4"),
+                    "webm" => Some("video/webm"),
+                    "ogg" | "oga" => Some("audio/ogg"),
+                    "mp3" => Some("audio/mpeg"),
+                    "pdf" => Some("application/pdf"),
+                    "txt" => Some("text/plain"),
+                    "json" => Some("application/json"),
+                    _ => None,
+                },
+            );
+    by_kind
+        .or(by_extension)
+        .map_or_else(|| downloaded.to_owned(), str::to_owned)
+}
+
 fn update_content(update: &Value) -> (&str, &Value, bool) {
     for (field, edited) in [
         ("message", false),
@@ -317,5 +365,43 @@ mod tests {
         assert_eq!(observations.len(), 2);
         assert_eq!(observations[0].payload["media"][0]["status"], "failed");
         assert_eq!(observations[1].payload["message"]["text"], "next");
+    }
+
+    #[test]
+    fn media_type_prefers_telegram_metadata_over_download_headers() {
+        let octet = "application/octet-stream";
+        assert_eq!(
+            media_type("photo", &json!({"width": 1}), Some("file_2.jpg"), octet),
+            "image/jpeg"
+        );
+        assert_eq!(
+            media_type("photo", &json!({"width": 1}), None, octet),
+            "image/jpeg"
+        );
+        assert_eq!(
+            media_type(
+                "document",
+                &json!({"mime_type": "application/pdf"}),
+                Some("scan.bin"),
+                octet
+            ),
+            "application/pdf"
+        );
+        assert_eq!(
+            media_type("document", &json!({}), Some("notes.txt"), octet),
+            "text/plain"
+        );
+        assert_eq!(
+            media_type("document", &json!({}), Some("blob"), "image/png"),
+            "image/png"
+        );
+        assert_eq!(
+            media_type("sticker", &json!({"is_video": true}), None, octet),
+            "video/webm"
+        );
+        assert_eq!(
+            media_type("document", &json!({}), Some("blob"), octet),
+            octet
+        );
     }
 }
