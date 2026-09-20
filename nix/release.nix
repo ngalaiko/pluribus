@@ -57,8 +57,8 @@ let
     else
       ''
         for binary in tree/bin/*; do
-          if ! file "$binary" | grep -q "statically linked"; then
-            echo "$binary is not statically linked" >&2
+          if file "$binary" | grep -q "dynamically linked"; then
+            echo "$binary is dynamically linked" >&2
             exit 1
           fi
         done
@@ -81,6 +81,10 @@ rustPlatform.buildRustPackage {
   ++ lib.optional stdenv.hostPlatform.isDarwin darwin.sigtool;
 
   passthru = { inherit target; };
+
+  # The cargo hooks pass `--target` on their own command lines; these builds
+  # run cargo directly, so the target rides along in the environment.
+  env.CARGO_BUILD_TARGET = target;
 
   buildPhase = ''
     runHook preBuild
@@ -113,8 +117,7 @@ rustPlatform.buildRustPackage {
     ${tarball}
     mkdir -p $out tree/bin
 
-    # A cross build, the static Linux release included, names its target directory.
-    built=target/''${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release
+    built=target/$CARGO_BUILD_TARGET/release
     install -m755 "$built/pluribus" "$built/pluribus-shell-executor" \
       "$built/pluribus-cli-bridge" "$built/pluribus-http-listener" \
       tree/bin/

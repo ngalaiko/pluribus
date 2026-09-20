@@ -149,7 +149,10 @@ rec {
 
   pluribus = withPlugins (lib.attrValues plugins);
 
-  release = pkgs.callPackage ./release.nix {
+  # Release binaries run off a Nix store. Linux builds them against musl in
+  # the static package set; darwin rewrites store libraries instead.
+  releasePkgs = if pkgs.stdenv.hostPlatform.isLinux then pkgs.pkgsStatic else pkgs;
+  release = releasePkgs.callPackage ./release.nix {
     inherit
       plugins
       repository
