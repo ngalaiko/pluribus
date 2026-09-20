@@ -265,3 +265,79 @@ fn history_uses_conversation_identity_without_provider_thread_fields() {
     let next = observe(&mut e, &c, "two", json!({"message":{"text":"next", "message_thread_id":2}})).remove(0);
     assert_eq!(turn(&next)["recentConversation"]["entries"][0]["message"], "previous");
 }
+
+fn attachment(kind: &str, status: &str, media_type: &str, size: u64) -> Value {
+    json!({"kind":kind,"status":status,"fileName":"attachment","metadata":{},
+        "blob":{"algorithm":"sha256","digest":"a".repeat(64),"size":size,"mediaType":media_type}})
+}
+
+#[test]
+fn photo_caption_and_ready_images_reach_the_model() {
+    let mut e = Engine::default();
+    let c = config();
+    let request = observe(
+        &mut e,
+        &c,
+        "one",
+        json!({
+            "message":{"chat":{"id":1},"caption":"what is this"},
+            "media":[
+                attachment("photo", "ready", "image/jpeg", 11),
+                attachment("photo", "pending", "image/jpeg", 12),
+                attachment("photo", "failed", "image/jpeg", 13),
+                attachment("document", "ready", "application/pdf", 14),
+                attachment("photo", "ready", "image/png", 20 * 1024 * 1024 + 1),
+            ],
+        }),
+    )
+    .remove(0);
+    let content = request.payload["messages"][1]["content"]
+        .as_array()
+        .unwrap();
+    assert_eq!(turn(&request)["message"], "what is this");
+    assert_eq!(content.len(), 2);
+    assert_eq!(
+        content[1],
+        json!({"kind":"image","blob":{"algorithm":"sha256","digest":"a".repeat(64),"size":11,"media_type":"image/jpeg"}})
+    );
+    assert_eq!(request.payload["required_features"], json!(["vision"]));
+    assert_eq!(e.jobs["one"].objective, "what is this");
+}
+
+#[test]
+fn attached_images_are_capped_per_turn() {
+    let mut e = Engine::default();
+    let c = config();
+    let media: Vec<Value> = (0..MAX_TURN_IMAGES + 3)
+        .map(|_| attachment("photo", "ready", "image/png", 11))
+        .collect();
+    let request = observe(
+        &mut e,
+        &c,
+        "one",
+        json!({"message":{"chat":{"id":1},"caption":"many"},"media":media}),
+    )
+    .remove(0);
+    assert_eq!(
+        request.payload["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        MAX_TURN_IMAGES + 1
+    );
+}
+
+#[test]
+fn a_text_observation_requests_no_vision() {
+    let mut e = Engine::default();
+    let c = config();
+    let request = observe(&mut e, &c, "one", json!({})).remove(0);
+    assert_eq!(
+        request.payload["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(request.payload.get("required_features").is_none());
+}

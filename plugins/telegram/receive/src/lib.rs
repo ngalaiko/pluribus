@@ -385,6 +385,12 @@ mod role_tests {
         );
         assert_eq!(result.pending.len(), 1);
         assert_eq!(result.offset, Some(49));
+        let Mutation::Set(entry) = &result.pending[0] else {
+            panic!("pending media is stored")
+        };
+        let deferred: Value = serde_json::from_slice(&entry.value).unwrap();
+        assert_eq!(deferred["message"]["caption"], "photo");
+        assert_eq!(deferred["media"][0]["status"], "pending");
     }
 
     #[test]

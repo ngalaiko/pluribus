@@ -640,6 +640,63 @@ async fn http_request_reads_are_confined_to_consumer_and_listener() {
 }
 
 #[tokio::test]
+async fn a_delivered_event_reveals_the_blobs_its_payload_names() {
+    async fn stored(store: &Arc<dyn BlobStore>, bytes: &[u8]) -> BlobRef {
+        let upload = store
+            .begin_put("image/png", Some(bytes.len() as u64))
+            .await
+            .unwrap();
+        store.write(&upload, 0, bytes).await.unwrap();
+        store.finish_put(&upload).await.unwrap()
+    }
+    let mut host = host(vec!["observation.received".into()]).await;
+    let blobs = host.blob_store.clone();
+    let attached = stored(&blobs, b"attached bytes").await;
+    let unrelated = stored(&blobs, b"unrelated bytes").await;
+    let mut request = proposal("observation.received");
+    request.payload = types::Payload::Json(
+        serde_json::to_vec(&serde_json::json!({
+            "message": {"caption": "look"},
+            "media": [{"status":"ready","blob":{
+                "algorithm": attached.algorithm,
+                "digest": attached.digest,
+                "size": attached.size,
+                "mediaType": attached.media_type,
+            }}],
+            "malformed": {"algorithm":"sha256","digest":"short","size":1,"mediaType":"image/png"},
+        }))
+        .unwrap(),
+    );
+    request.idempotency_key = Some("observation".into());
+    events::Host::append(&mut host, request).await.unwrap();
+    let stream = StreamId::new(host.delivery.agent.id.clone());
+    let event = host
+        .event_store
+        .query(&stream, &EventQuery::default(), 10)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        blobs::Host::read(&mut host, wit_blob_ref(&attached), 0, 1024)
+            .await
+            .is_err()
+    );
+    host.reveal_event_blobs(std::slice::from_ref(&event));
+    assert_eq!(
+        blobs::Host::read(&mut host, wit_blob_ref(&attached), 0, 1024)
+            .await
+            .unwrap()
+            .bytes,
+        b"attached bytes"
+    );
+    assert!(
+        blobs::Host::read(&mut host, wit_blob_ref(&unrelated), 0, 1024)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn credential_exports_are_scoped_without_raw_record_access() {
     use pluribus_core::{InMemoryCredentialStore, PluginCredentialStore};
     let store = Arc::new(InMemoryCredentialStore::default());

@@ -12,7 +12,9 @@ The envelope is rebuilt from current state before admission to the model. Each J
 
 `trigger.kind` identifies `observation`, `routing`, `child-query`, `amendment`, `tool-result`, `scheduled-wake`, `retry`, or `correction`. Wakes include the schedule and reason; retries include the attempt. Tool-result triggers point to the native tool message rather than duplicating its output.
 
-Root message text is prioritized before transport metadata. Root and child envelopes have a 24 KiB inline-value budget. Routers retain their bounded candidate view inline because they cannot execute JS. Values exceeding the remaining budget become `{contextPointer, bytes}` references to the original JS context. References do not discard the underlying value. For example, `/observation` means `context.observation`. Recent conversation includes at most six preceding same-conversation observations and reports its available count. Full job activity details remain under `context.job`.
+Root message text is prioritized before transport metadata, taken from `message.text` or, for an attachment, `message.caption`. Root and child envelopes have a 24 KiB inline-value budget. Routers retain their bounded candidate view inline because they cannot execute JS. Values exceeding the remaining budget become `{contextPointer, bytes}` references to the original JS context. References do not discard the underlying value. For example, `/observation` means `context.observation`. Recent conversation includes at most six preceding same-conversation observations and reports its available count. Full job activity details remain under `context.job`.
+
+Ready image attachments of the trigger observation follow the envelope text as image content parts of the same user message, at most eight and none over 20 MiB. Such a request carries `required_features: ["vision"]`, so it reaches a provider that accepts images.
 
 Capability schemas are supplied immediately when they fit. `configuredConstraints` describes configured grants; it does not authorize an action. Host policy still checks the requesting origin and provider.
 

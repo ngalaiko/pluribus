@@ -96,7 +96,14 @@ impl HttpService for TelegramFixture {
             _ => json!([]),
         };
         if self.with_media && number == 1 {
-            result[0]["message"]["document"] = json!({"file_id":"broken","file_name":"file.txt"});
+            let message = result[0]["message"].as_object_mut().unwrap();
+            message.insert(
+                "document".into(),
+                json!({"file_id":"broken","file_name":"file.txt"}),
+            );
+            // An attachment carries its text in a caption.
+            let text = message.remove("text").unwrap();
+            message.insert("caption".into(), text);
         }
         let bytes = serde_json::to_vec(&json!({"ok":true,"result":result})).unwrap();
         let upload = self
@@ -332,7 +339,8 @@ async fn run_polling(with_media: bool, recover: bool) {
             .iter()
             .find(|event| event.request.event_type == "observation.received")
             .unwrap();
-        assert_eq!(payload(failure)["message"]["text"], "pong");
+        assert_eq!(payload(failure)["message"]["caption"], "pong");
+        assert!(payload(failure)["message"].get("text").is_none());
         assert_eq!(
             failure.request.deduplication_key.as_deref(),
             Some("telegram:update:47")

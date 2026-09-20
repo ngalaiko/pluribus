@@ -537,6 +537,7 @@ impl<T> execution::HostWithStore<T> for HostData {
                             value
                         })
                         .collect();
+                    host.reveal_event_blobs(&events);
                     host.runner.pending = Some((events, reply));
                     host.emit_call = false;
                     Ok(execution::Wake::Events(batch))

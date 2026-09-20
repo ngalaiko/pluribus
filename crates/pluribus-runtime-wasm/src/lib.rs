@@ -637,6 +637,7 @@ impl InstanceCore {
             })
             .collect::<Vec<_>>();
         let context = self.context();
+        self.store.data_mut().reveal_event_blobs(events);
         prepare_call(&mut self.store, &self.limits);
         let lifecycle = self.plugin.pluribus_plugin_lifecycle();
         let result = tokio::time::timeout(
@@ -1141,6 +1142,24 @@ impl HostState {
         }
         for transport in self.transports.drain(..) {
             transport.close();
+        }
+    }
+
+    /// Grants read access to the blobs a delivered batch names. An instance
+    /// reads a blob it stored itself or one an event handed it, nothing else.
+    pub(crate) fn reveal_event_blobs(&mut self, events: &[CommittedEvent]) {
+        let instance = self.delivery.instance_id.clone();
+        let mut found = Vec::new();
+        for event in events
+            .iter()
+            .filter(|event| http_request_visible(event, &instance))
+        {
+            referenced_blobs(event, &mut found);
+        }
+        for blob in found {
+            if validate_blob_ref(&blob).is_ok() {
+                self.visible_blobs.insert(blob);
+            }
         }
     }
 
@@ -1711,6 +1730,53 @@ fn http_request_visible(event: &CommittedEvent, instance: &str) -> bool {
     serde_json::from_slice::<Value>(bytes)
         .ok()
         .is_some_and(|v| v["consumer"].as_str() == Some(instance))
+}
+
+/// Blobs one delivered event names: its own blob payload, and every blob
+/// reference nested in an inline payload. Malformed references are skipped.
+fn referenced_blobs(event: &CommittedEvent, found: &mut Vec<BlobRef>) {
+    match &event.request.payload {
+        EventPayload::Blob(blob) => found.push(blob.clone()),
+        EventPayload::CanonicalJson(bytes) => {
+            if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+                collect_blob_refs(&value, found);
+            }
+        }
+    }
+}
+
+fn collect_blob_refs(value: &Value, found: &mut Vec<BlobRef>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(blob) = blob_ref_from(map) {
+                found.push(blob);
+            }
+            for nested in map.values() {
+                collect_blob_refs(nested, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_blob_refs(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A JSON object shaped like a blob reference. Payloads spell the media type
+/// either way, so both spellings are accepted.
+fn blob_ref_from(map: &serde_json::Map<String, Value>) -> Option<BlobRef> {
+    Some(BlobRef {
+        algorithm: map.get("algorithm")?.as_str()?.to_owned(),
+        digest: map.get("digest")?.as_str()?.to_owned(),
+        size: map.get("size")?.as_u64()?,
+        media_type: map
+            .get("media_type")
+            .or_else(|| map.get("mediaType"))?
+            .as_str()?
+            .to_owned(),
+    })
 }
 
 fn wit_event(event: &CommittedEvent) -> types::Event {

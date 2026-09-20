@@ -82,8 +82,10 @@ Operator commands require node actor `operator:<agent-id>`:
   Records a verified result and clears its reconciliation blocker. Execution
   requires a separate resume command.
 
-Deferred Telegram media events enrich their original observation and task context;
-only the configured connector can supply them.
+A Telegram observation arrives whole: the connector defers the update until every
+attachment is ready or permanently failed. Its `media` array stays in
+`context.observation`, and ready image attachments become image content parts of
+the turn's user message, which then requires the `vision` feature.
 
 A trapped session component fails suspended calls with an unknown outcome and
 restarts with fresh memory. Failed cells are not replayed; cognition can replan

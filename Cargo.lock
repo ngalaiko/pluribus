@@ -2312,6 +2312,7 @@ name = "pluribus-cognition"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "base64",
  "pluribus-core",
  "pluribus-model",
  "pluribus-plugin-package",

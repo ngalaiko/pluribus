@@ -2210,3 +2210,234 @@ async fn packaged_empty_reasoning_reports_stall_without_timer() {
                 .is_some_and(|s| s.contains("stalled"))
     }));
 }
+
+/// Records the provider request bodies instead of reaching the network.
+struct CapturingHttp {
+    blobs: Arc<InMemoryBlobStore>,
+    bodies: std::sync::Mutex<Vec<Value>>,
+}
+impl CapturingHttp {
+    async fn capture(&self, request: &pluribus_core::HttpRequest) {
+        use pluribus_core::BlobStore;
+        let blob = request.body.clone().expect("provider sends a body");
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = self
+                .blobs
+                .read(&blob, bytes.len() as u64, 64 * 1024)
+                .await
+                .unwrap();
+            bytes.extend(chunk.bytes);
+            if chunk.eof {
+                break;
+            }
+        }
+        self.bodies
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&bytes).unwrap());
+    }
+}
+#[async_trait::async_trait]
+impl pluribus_core::HttpService for CapturingHttp {
+    async fn send(
+        &self,
+        _: &pluribus_core::HttpGrant,
+        request: &pluribus_core::HttpRequest,
+    ) -> Result<pluribus_core::HttpResponse, pluribus_core::HttpError> {
+        self.capture(request).await;
+        Err(pluribus_core::HttpError::PermissionDenied("fixture".into()))
+    }
+}
+#[async_trait::async_trait]
+impl pluribus_core::HttpStreamService for CapturingHttp {
+    async fn open_stream(
+        &self,
+        _: &pluribus_core::HttpGrant,
+        _: pluribus_core::HttpStreamProtocol,
+        request: &pluribus_core::HttpRequest,
+    ) -> Result<String, pluribus_core::HttpError> {
+        self.capture(request).await;
+        Err(pluribus_core::HttpError::PermissionDenied("fixture".into()))
+    }
+    async fn receive(
+        &self,
+        _: &pluribus_core::HttpGrant,
+        _: &str,
+        _: u32,
+        _: u32,
+    ) -> Result<pluribus_core::HttpFramePage, pluribus_core::HttpError> {
+        unreachable!()
+    }
+    async fn send_frame(
+        &self,
+        _: &pluribus_core::HttpGrant,
+        _: &str,
+        _: &pluribus_core::HttpFrame,
+    ) -> Result<(), pluribus_core::HttpError> {
+        unreachable!()
+    }
+    fn close_stream(&self, _: &pluribus_core::HttpGrant, _: &str) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn a_photo_observation_reaches_the_provider_as_an_image_part() {
+    use base64::Engine as _;
+    use pluribus_core::BlobStore;
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(
+            AtomicU64::new(1),
+            Arc::new(AtomicI64::new(1_700_000_000_000)),
+        ))
+        .await
+        .unwrap(),
+    );
+    let blobs = Arc::new(InMemoryBlobStore::default());
+    let image: &[u8] = b"\x89PNG\r\n\x1a\nfixture image bytes";
+    let upload = blobs
+        .begin_put("image/png", Some(image.len() as u64))
+        .await
+        .unwrap();
+    blobs.write(&upload, 0, image).await.unwrap();
+    let blob = blobs.finish_put(&upload).await.unwrap();
+    let runtime = Runtime::new(
+        RuntimeLimits::default(),
+        store.clone(),
+        store.clone(),
+        blobs.clone(),
+        store.clone(),
+    )
+    .unwrap();
+    let mut agent = Agent::new(
+        Router::new(
+            StreamId::new("personal"),
+            PrincipalRef::new(PrincipalKind::Agent, "personal"),
+            store.clone(),
+            Arc::new(EventTypeRegistry::core()),
+            AllowAll,
+        ),
+        TestAuthority,
+        runtime,
+        store.clone(),
+        StreamId::new("personal"),
+        PrincipalRef::new(PrincipalKind::Agent, "personal"),
+    );
+    let http = Arc::new(CapturingHttp {
+        blobs: blobs.clone(),
+        bodies: std::sync::Mutex::new(Vec::new()),
+    });
+    for (id, plugin, config, services, models) in [
+        (
+            "provider",
+            "openrouter",
+            json!({"credentials": {"api-key": "test"},"models":["test"]}),
+            PluginServices {
+                http: Some(http.clone()),
+                http_grant: Some(pluribus_core::HttpGrant {
+                    component: PrincipalRef::new(PrincipalKind::Component, "provider"),
+                    origins: vec!["https://openrouter.ai".into()],
+                    methods: vec!["POST".into()],
+                    allow_http: false,
+                    allow_private_network: false,
+                    max_request_bytes: 1_000_000,
+                    max_response_bytes: 1_000_000,
+                    max_redirects: 0,
+                    max_timeout_ms: 300_000,
+                }),
+                ..PluginServices::default()
+            },
+            vec!["test".to_owned()],
+        ),
+        (
+            "cognition",
+            "rlm",
+            json!({"repl":{}}),
+            PluginServices {
+                model: Some("test".into()),
+                ..PluginServices::default()
+            },
+            vec![],
+        ),
+    ] {
+        agent
+            .install_component(
+                PluginPackage::load(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join(format!("../../target/plugins/{plugin}")),
+                )
+                .unwrap()
+                .component(if plugin == "rlm" { "cognition" } else { "main" })
+                .unwrap(),
+                &config,
+                Delivery {
+                    instance_id: id.into(),
+                    agent: Principal {
+                        kind: RuntimePrincipalKind::Agent,
+                        id: "personal".into(),
+                    },
+                    actor: Principal {
+                        kind: RuntimePrincipalKind::Agent,
+                        id: "personal".into(),
+                    },
+                    authority_id: "a".into(),
+                    activity_id: "a".into(),
+                    correlation_id: "a".into(),
+                    origin_event_id: "a".into(),
+                    depth: 0,
+                    deadline_at_ms: None,
+                    visible_blobs: vec![],
+                },
+                services,
+                &models,
+            )
+            .await
+            .unwrap();
+    }
+    let mut observation = event_request(
+        "observation.received",
+        &json!({"provider":"telegram","externalSenderId":"7","conversationId":"chat:42",
+            "message":{"chat":{"id":42},"caption":"what is in this picture?"},
+            "media":[{"kind":"photo","status":"ready","fileName":"photo.png","metadata":{},
+                "blob":{"algorithm":blob.algorithm,"digest":blob.digest,"size":blob.size,"mediaType":blob.media_type}}]}),
+    );
+    observation.actor = PrincipalRef::new(PrincipalKind::Component, "telegram-1");
+    store.append(observation).await.unwrap();
+    for _ in 0..64 {
+        if !http.bodies.lock().unwrap().is_empty() {
+            break;
+        }
+        if agent.tick_wait(1).await.unwrap().is_idle() {
+            break;
+        }
+    }
+    let request = model_requests(&store).await.remove(0);
+    assert_eq!(payload(&request)["required_features"], json!(["vision"]));
+    let body = http
+        .bodies
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("provider received a request");
+    let user = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    let parts = user["content"].as_array().unwrap();
+    assert!(
+        parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("what is in this picture?")
+    );
+    let url = parts[1]["image_url"]["url"].as_str().unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(url.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap(),
+        image
+    );
+}

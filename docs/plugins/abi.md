@@ -162,6 +162,10 @@ abandoned uploads at the end of the delivery.
 returned bytes. A plugin MUST verify that cumulative length equals
 `blob-ref.size`.
 
+An instance reads only the blobs visible to it: those it stored itself, and
+those referenced by an event delivered to it — the event's own blob payload, and
+any blob reference nested in an inline payload. Any other reference is denied.
+
 ### `wasi:http`
 
 `wasi:http/client.send` accepts a standard request resource and returns a
