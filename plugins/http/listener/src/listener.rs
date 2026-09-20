@@ -286,7 +286,12 @@ async fn unix_loop(listener: tokio::net::UnixListener, shared: Arc<Shared>) -> i
             .await
             .map_err(io::Error::other)?;
         let (mut stream, _) = listener.accept().await?;
-        if stream.peer_cred()?.uid() != shared.config.runtime_uid {
+        // A peer that disconnects before it is accepted fails `peer_cred`; that
+        // drops the connection, not the loop.
+        let Ok(peer) = stream.peer_cred() else {
+            continue;
+        };
+        if peer.uid() != shared.config.runtime_uid {
             continue;
         }
         let shared = shared.clone();
@@ -372,6 +377,45 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_peer_does_not_stop_the_socket_loop() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("listener.sock");
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            socket: socket.clone(),
+            runtime_uid: rustix::process::geteuid().as_raw(),
+            routes: vec![],
+            max_body_bytes: body_limit(),
+            max_queue_bytes: queue_limit(),
+            response_timeout_seconds: 30,
+        };
+        let served = tokio::spawn(serve(config));
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+        // Closed before the loop accepts it: `peer_cred` then reports ENOTCONN.
+        drop(std::os::unix::net::UnixStream::connect(&socket).unwrap());
+        let mut client = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        native::write(&mut client, &json!({"op":"poll","after":0}))
+            .await
+            .unwrap();
+        assert!(
+            native::read(&mut client).await.unwrap()["session"].is_string(),
+            "listener stopped serving after a peer disconnected"
+        );
+        served.abort();
     }
 
     #[test]
