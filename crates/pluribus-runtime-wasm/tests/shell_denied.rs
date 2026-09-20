@@ -134,12 +134,10 @@ impl pluribus_core::StreamService for ExecutorStream {
         self.sent.lock().unwrap().push(bytes.to_vec());
         Ok(())
     }
-    async fn receive(
+    async fn next(
         &self,
         _: &str,
         _: u32,
-        _: u32,
-        _: &std::sync::atomic::AtomicBool,
     ) -> Result<pluribus_core::StreamPage, pluribus_core::StreamError> {
         Ok(pluribus_core::StreamPage { bytes: b"{\"status\":\"completed\",\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":0,\"truncated\":false}\n".to_vec(), closed: false })
     }

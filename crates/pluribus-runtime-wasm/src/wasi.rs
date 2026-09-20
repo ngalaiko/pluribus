@@ -81,18 +81,34 @@ use std::{
     task::{Context, Poll},
 };
 use wasmtime::{
-    StoreContextMut,
-    component::{Destination, FutureReader, StreamProducer, StreamReader, StreamResult, VecBuffer},
+    AsContextMut, StoreContextMut,
+    component::{
+        Destination, FutureReader, Source, StreamConsumer, StreamProducer, StreamReader,
+        StreamResult, VecBuffer,
+    },
 };
+
+const READ_CHUNK_BYTES: u32 = 32 * 1024;
+const WRITE_CHUNK_BYTES: usize = 32 * 1024;
 
 type ReadFuture = Pin<Box<dyn Future<Output = Result<types::Chunk, types::Error>> + Send>>;
 
+/// Incoming half: peer bytes, read on demand and without an idle deadline.
+/// Ends on EOF, transport failure, byte-budget exhaustion, or cancellation.
 struct SocketBytes {
-    service: Arc<dyn StreamService>,
-    id: String,
+    transport: Arc<Transport>,
     cancelled: Arc<tokio::sync::Notify>,
     read: Option<ReadFuture>,
     completion: Option<tokio::sync::oneshot::Sender<Result<(), types::Error>>>,
+}
+
+impl Drop for SocketBytes {
+    fn drop(&mut self) {
+        self.transport.finish();
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(self.transport.outcome());
+        }
+    }
 }
 
 impl StreamProducer<HostState> for SocketBytes {
@@ -107,13 +123,12 @@ impl StreamProducer<HostState> for SocketBytes {
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
         if self.read.is_none() {
-            let service = self.service.clone();
-            let id = self.id.clone();
+            let transport = self.transport.clone();
             let cancelled = self.cancelled.clone();
             self.read = Some(Box::pin(async move {
                 loop {
                     let page = tokio::select! {
-                        page = service.next(&id, 32 * 1024) => page.map_err(stream_plugin_error)?,
+                        page = transport.service.next(&transport.stream_id, READ_CHUNK_BYTES) => page.map_err(stream_plugin_error)?,
                         () = cancelled.notified() => return Err(host_error(types::ErrorCode::Cancelled, "source cancelled")),
                     };
                     if page.closed || !page.bytes.is_empty() {
@@ -144,20 +159,20 @@ impl StreamProducer<HostState> for SocketBytes {
             Poll::Ready(result) => {
                 self.read = None;
                 let host = store.data_mut();
-                host.call_deadline = Some(Instant::now() + host.runner.timeout);
-                host.stream_deadline = host
-                    .stream_grant
-                    .as_ref()
-                    .map(|g| Instant::now() + Duration::from_millis(u64::from(g.max_timeout_ms)));
-                let (bytes, closed, outcome) = match result {
-                    Ok(chunk) => (chunk.bytes, chunk.closed, Ok(())),
-                    Err(error) => (vec![], true, Err(error)),
+                // A source loop spends its call budget waiting for the peer;
+                // a delivery may not extend its own deadline that way.
+                if host.runner.active && !host.runner.has_pending_delivery() {
+                    host.call_deadline = Some(Instant::now() + host.runner.timeout);
+                }
+                let (bytes, closed) = match result {
+                    Ok(chunk) => (chunk.bytes, chunk.closed),
+                    Err(error) => {
+                        self.transport.fail(error);
+                        (vec![], true)
+                    }
                 };
                 dst.set_buffer(bytes.into());
                 if closed {
-                    if let Some(tx) = self.completion.take() {
-                        let _ = tx.send(outcome);
-                    }
                     Poll::Ready(Ok(StreamResult::Dropped))
                 } else {
                     Poll::Ready(Ok(StreamResult::Completed))
@@ -167,57 +182,165 @@ impl StreamProducer<HostState> for SocketBytes {
     }
 }
 
-impl reader::HostReaderWithStore<HostState> for HostData {
-    async fn read_via_stream(
-        accessor: &Accessor<HostState, Self>,
-        read: Resource<reader::Reader>,
-    ) -> Result<(StreamReader<u8>, FutureReader<Result<(), types::Error>>), types::Error> {
-        let (_, cancelled) = runner::cancellation(accessor)?;
-        accessor.with(|mut access| {
-            let host = access.get();
-            let (service, id) = match host.read_target(&read)?.1 {
-                Target::Socket(id) => (host.stream_access()?.0, id),
-            };
-            if !host.streaming_readers.insert(read.rep()) {
-                return Err(host_error(
-                    types::ErrorCode::Conflict,
-                    "reader already streaming",
-                ));
+type SendFuture = Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send>>;
+
+/// Outgoing half: guest bytes forwarded to the peer. The guest ending or
+/// dropping the stream half-closes the connection.
+struct SocketSend {
+    transport: Arc<Transport>,
+    send: Option<SendFuture>,
+}
+
+impl Drop for SocketSend {
+    fn drop(&mut self) {
+        self.transport
+            .service
+            .shutdown_write(&self.transport.stream_id);
+        self.transport.finish();
+    }
+}
+
+impl StreamConsumer<HostState> for SocketSend {
+    type Item = u8;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<HostState>,
+        mut source: Source<'_, u8>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if self.send.is_none() {
+            if store.data().runner.stopping || store.data().cancelled.load(Ordering::Acquire) {
+                self.transport
+                    .fail(host_error(types::ErrorCode::Cancelled, "source stopped"));
+                return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let stream = StreamReader::new(
+            let mut bytes = Vec::with_capacity(WRITE_CHUNK_BYTES);
+            source.read(store.as_context_mut(), &mut bytes)?;
+            if bytes.is_empty() {
+                return Poll::Ready(Ok(if finish {
+                    StreamResult::Cancelled
+                } else {
+                    StreamResult::Completed
+                }));
+            }
+            let transport = self.transport.clone();
+            self.send = Some(Box::pin(async move {
+                transport.service.send(&transport.stream_id, &bytes).await
+            }));
+        }
+        // The bytes have left `source`, so the write runs to completion even
+        // when the writer cancels.
+        match self.send.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                self.send = None;
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            Poll::Ready(Err(error)) => {
+                self.send = None;
+                self.transport.fail(stream_plugin_error(error));
+                Poll::Ready(Ok(StreamResult::Dropped))
+            }
+        }
+    }
+}
+
+impl socket::HostWithStore<HostState> for HostData {
+    async fn connect(
+        accessor: &Accessor<HostState, Self>,
+        mut outgoing: StreamReader<u8>,
+    ) -> Result<(StreamReader<u8>, FutureReader<Result<(), types::Error>>), types::Error> {
+        let (transport, cancelled) = match Self::open_transport(accessor).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                accessor.with(|mut access| {
+                    let _ = outgoing.close(&mut access);
+                });
+                return Err(error);
+            }
+        };
+        accessor.with(|mut access| {
+            // Piping disposes of the guest's stream, so it goes first: every
+            // failure after this point only has to close the transport.
+            outgoing
+                .pipe(
+                    &mut access,
+                    SocketSend {
+                        transport: transport.clone(),
+                        send: None,
+                    },
+                )
+                .map_err(|_| {
+                    transport.close();
+                    host_error(types::ErrorCode::ResourceExhausted, "stream pipe failed")
+                })?;
+            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+            let mut incoming = StreamReader::new(
                 &mut access,
                 SocketBytes {
-                    service,
-                    id,
+                    transport: transport.clone(),
                     cancelled,
                     read: None,
-                    completion: Some(tx),
+                    completion: Some(completion_tx),
                 },
             )
             .map_err(|_| {
+                transport.close();
                 host_error(
                     types::ErrorCode::ResourceExhausted,
                     "stream allocation failed",
                 )
             })?;
-            let completion = match FutureReader::new(&mut access, async move {
-                wasmtime::error::Ok(rx.await.unwrap_or_else(|_| {
+            let Ok(completion) = FutureReader::new(&mut access, async move {
+                wasmtime::error::Ok(completion_rx.await.unwrap_or_else(|_| {
                     Err(host_error(types::ErrorCode::Cancelled, "stream dropped"))
                 }))
-            }) {
-                Ok(future) => future,
-                Err(_) => {
-                    let mut stream = stream;
-                    let _ = stream.close(&mut access);
-                    return Err(host_error(
-                        types::ErrorCode::ResourceExhausted,
-                        "future allocation failed",
-                    ));
-                }
+            }) else {
+                transport.close();
+                let _ = incoming.close(&mut access);
+                return Err(host_error(
+                    types::ErrorCode::ResourceExhausted,
+                    "future allocation failed",
+                ));
             };
-            Ok((stream, completion))
+            access.get().transports.push(transport);
+            Ok((incoming, completion))
         })
+    }
+}
+
+impl HostData {
+    /// Connects the granted endpoint under the call's cancellation and
+    /// deadline. Connection establishment is bounded by the grant.
+    async fn open_transport(
+        accessor: &Accessor<HostState, Self>,
+    ) -> Result<(Arc<Transport>, Arc<tokio::sync::Notify>), types::Error> {
+        let (service, grant, interrupt, deadline, cancelled) = accessor.with(|mut access| {
+            let host = access.get();
+            if host.replaying || host.runner.stopping || host.interrupted() {
+                return Err(stream_denied());
+            }
+            let (service, grant) = host.stream_access()?;
+            let grant = StreamGrant {
+                max_timeout_ms: host.connect_budget(&grant)?,
+                ..grant
+            };
+            Ok((
+                service,
+                grant,
+                Arc::clone(host.interrupt_flag()),
+                host.effective_deadline(),
+                host.cancel_notify.clone(),
+            ))
+        })?;
+        let stream_id = cancellable(&interrupt, deadline, service.open(&grant))
+            .await?
+            .map_err(stream_plugin_error)?;
+        let transport = Arc::new(Transport::new(service, stream_id));
+        accessor.with(|mut access| access.get().transports.retain(|t| t.is_open()));
+        Ok((transport, cancelled))
     }
 }
 
@@ -245,13 +368,31 @@ mod tests {
             }
         }
     }
-    #[tokio::test]
-    async fn native_stream_is_lazy_and_exclusive() {
-        let (mut store, _, _) = crate::runner::tests::source().await;
-        assert!(socket::Host::listen(store.data_mut()).await.is_err());
-        let service = Arc::new(crate::tests::SubscriptionFixture::default());
-        store.data_mut().stream = Some(service.clone());
-        store.data_mut().stream_grant = Some(StreamGrant {
+    /// Emits one buffer, then ends the stream.
+    struct Once(Option<Vec<u8>>);
+    impl StreamProducer<HostState> for Once {
+        type Item = u8;
+        type Buffer = VecBuffer<u8>;
+        fn poll_produce<'a>(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: StoreContextMut<'a, HostState>,
+            mut dst: Destination<'a, u8, Self::Buffer>,
+            _: bool,
+        ) -> Poll<wasmtime::Result<StreamResult>> {
+            Poll::Ready(Ok(match self.0.take() {
+                Some(bytes) => {
+                    dst.set_buffer(bytes.into());
+                    StreamResult::Completed
+                }
+                None => StreamResult::Dropped,
+            }))
+        }
+    }
+
+    fn granted(host: &mut HostState, service: &Arc<crate::tests::SubscriptionFixture>) {
+        host.stream = Some(service.clone());
+        host.stream_grant = Some(StreamGrant {
             endpoint: pluribus_core::StreamEndpoint::Unix {
                 path: "/unused".into(),
                 peer_uids: vec![1],
@@ -259,34 +400,123 @@ mod tests {
             max_bytes: 1024,
             max_timeout_ms: 1000,
         });
-        let (read, _write) = socket::Host::listen(store.data_mut()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_is_denied_without_a_grant() {
+        let (mut store, _, _) = crate::runner::tests::source().await;
         store
             .run_concurrent(async |accessor| {
                 let host_access = accessor.with_getter::<HostData>(|h| h);
-                let (stream, mut done) = reader::HostReaderWithStore::read_via_stream(
-                    &host_access,
-                    Resource::new_borrow(read.rep()),
-                )
-                .await
-                .unwrap();
-                assert_eq!(service.reads.load(Ordering::Acquire), 0);
+                let outgoing =
+                    accessor.with(|mut access| StreamReader::new(&mut access, Once(None)).unwrap());
                 assert!(
-                    reader::HostReaderWithStore::read_via_stream(
-                        &host_access,
-                        Resource::new_borrow(read.rep())
-                    )
-                    .await
-                    .is_err()
+                    socket::HostWithStore::connect(&host_access, outgoing)
+                        .await
+                        .is_err()
                 );
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_reads_lazily_forwards_writes_and_closes_once_both_ends_finish() {
+        let (mut store, _, _) = crate::runner::tests::source().await;
+        let service = Arc::new(crate::tests::SubscriptionFixture::default());
+        granted(store.data_mut(), &service);
+        store
+            .run_concurrent(async |accessor| {
+                let host_access = accessor.with_getter::<HostData>(|h| h);
+                let outgoing = accessor.with(|mut access| {
+                    StreamReader::new(&mut access, Once(Some(b"ping".to_vec()))).unwrap()
+                });
+                let (incoming, mut done) = socket::HostWithStore::connect(&host_access, outgoing)
+                    .await
+                    .unwrap();
+                assert_eq!(service.opens.load(Ordering::Acquire), 1);
+                assert_eq!(service.reads.load(Ordering::Acquire), 0, "reads are lazy");
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                accessor.with(|access| stream.pipe(access, FirstBytes(Some(tx))).unwrap());
+                accessor.with(|access| incoming.pipe(access, FirstBytes(Some(tx))).unwrap());
                 assert_eq!(rx.await.unwrap(), vec![1]);
                 assert_eq!(service.reads.load(Ordering::Acquire), 1);
+                service.closed.notified().await;
+                assert_eq!(service.sent.lock().unwrap().as_slice(), [b"ping".to_vec()]);
+                assert_eq!(
+                    service.half_closed.load(Ordering::Acquire),
+                    1,
+                    "ending the outgoing stream half-closes the connection"
+                );
+                assert_eq!(service.closes.load(Ordering::Acquire), 1);
                 done.close_with(accessor).unwrap();
             })
             .await
             .unwrap();
     }
+
+    /// Consumes bytes without ever ending the stream.
+    struct Hold;
+    impl StreamConsumer<HostState> for Hold {
+        type Item = u8;
+        fn poll_consume(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            store: StoreContextMut<HostState>,
+            mut source: Source<'_, u8>,
+            _: bool,
+        ) -> Poll<wasmtime::Result<StreamResult>> {
+            let mut bytes = Vec::with_capacity(32 * 1024);
+            source.read(store, &mut bytes)?;
+            Poll::Ready(Ok(StreamResult::Completed))
+        }
+    }
+    struct Settle(Option<tokio::sync::oneshot::Sender<Result<(), types::Error>>>);
+    impl wasmtime::component::FutureConsumer<HostState> for Settle {
+        type Item = Result<(), types::Error>;
+        fn poll_consume(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            store: StoreContextMut<HostState>,
+            mut source: Source<'_, Self::Item>,
+            _: bool,
+        ) -> Poll<wasmtime::Result<()>> {
+            let mut outcome = Vec::with_capacity(1);
+            source.read(store, &mut outcome)?;
+            if let Some(outcome) = outcome.pop() {
+                let _ = self.0.take().unwrap().send(outcome);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_settles_when_the_peer_ends_while_the_reader_is_held() {
+        let (mut store, _, _) = crate::runner::tests::source().await;
+        let service = Arc::new(crate::tests::SubscriptionFixture::default());
+        service.fail.store(true, Ordering::Release);
+        granted(store.data_mut(), &service);
+        store
+            .run_concurrent(async |accessor| {
+                let host_access = accessor.with_getter::<HostData>(|h| h);
+                let outgoing =
+                    accessor.with(|mut access| StreamReader::new(&mut access, Once(None)).unwrap());
+                let (incoming, done) = socket::HostWithStore::connect(&host_access, outgoing)
+                    .await
+                    .unwrap();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                accessor.with(|access| incoming.pipe(access, Hold).unwrap());
+                accessor.with(|access| done.pipe(access, Settle(Some(tx))).unwrap());
+                let outcome = tokio::time::timeout(Duration::from_secs(2), rx)
+                    .await
+                    .expect("completion settles without dropping the reader")
+                    .unwrap();
+                assert_eq!(outcome.unwrap_err().code, types::ErrorCode::Unavailable);
+                assert_eq!(service.closes.load(Ordering::Acquire), 1);
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn standard_clocks_preserve_units_and_random_reads_are_bounded() {
         let mut host = crate::tests::host(vec![]).await;

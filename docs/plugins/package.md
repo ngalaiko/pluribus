@@ -199,9 +199,10 @@ as identity.
 The component MUST import only callable interfaces listed in `imports`. The manifest MUST list every callable Pluribus import encoded in the component. Type-only WIT dependencies such as `pluribus:plugin/types` are derived from the
 component and omitted from the manifest.
 
-Only the eight host interfaces are accepted: `events`, `state`, `blobs`,
-`reader`, `writer`, `http`, `socket`, `credentials`. An import list is an upper bound, not a
-grant: the core still denies a call the instance has no grant for.
+Only the six Pluribus host interfaces are accepted: `events`, `runtime`,
+`state`, `blobs`, `socket`, `credentials`, alongside the WASI interfaces of the
+world. An import list is an upper bound, not a grant: the core still denies a
+call the instance has no grant for.
 
 Guest toolchains may remove unused world imports. List the imports present in the final component, not every import declared by its source world.
 

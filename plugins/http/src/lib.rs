@@ -1,13 +1,20 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 wit_bindgen::generate!({ generate_all,path:"../../wit",world:"plugin"});
 mod common;
+mod channel {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/socket.rs"));
+}
+use channel::Socket;
 use common::*;
 use exports::pluribus::plugin::lifecycle::{Context, Guest as Lifecycle, Outcome};
 use pluribus::plugin::{
-    events, socket, state,
+    events, state,
     types::{Error, Event, Mutation, StateEntry},
 };
 use serde_json::json;
+
+/// Bytes requested per read on the listener subscription.
+const INPUT_CHUNK: u32 = 32 * 1024;
 struct Http;
 impl Lifecycle for Http {
     async fn run(mut context: Context, config: Vec<u8>) -> Result<(), Error> {
@@ -28,25 +35,16 @@ impl Lifecycle for Http {
             }
 
             let result: Result<bool, Error> = async {
-                let (read, write) = socket::listen()?;
-                let (mut input, completion) = read.read_via_stream().await?;
-                let mut completion = Some(completion);
-                write.send(b"{\"op\":\"subscribe\"}\n")?;
+                let mut input = Socket::connect().await?;
+                input.send(b"{\"op\":\"subscribe\"}\n").await?;
                 loop {
-                    let Some(chunk) = Self::waiting(&mut context, async {
-                        let (_, bytes) = input.read(Vec::with_capacity(32 * 1024)).await;
-                        let closed = bytes.is_empty();
-                        if closed {
-                            completion.take().unwrap().await?;
-                        }
-                        Ok(pluribus::plugin::types::Chunk { bytes, closed })
-                    })
-                    .await?
+                    let Some(chunk) =
+                        Self::waiting(&mut context, input.read(INPUT_CHUNK, None)).await?
                     else {
                         return Ok(true);
                     };
                     if !chunk.bytes.is_empty() {
-                        let out = Self::poll()?;
+                        let out = Self::poll().await?;
                         runtime::commit(&out.events, &out.mutations, None)?;
                     }
                     if chunk.closed {
@@ -104,7 +102,7 @@ impl Lifecycle for Http {
                 response["op"] = json!("respond");
                 response["requestId"] = original["requestId"].clone();
                 // Retrying the event after a transport failure is safe: the listener responds once.
-                exchange(response)?;
+                exchange(response).await?;
             }
         }
         Ok(output)
@@ -121,7 +119,7 @@ impl Lifecycle for Http {
 export!(Http);
 
 impl Http {
-    fn poll() -> Result<SourceOutput, Error> {
+    async fn poll() -> Result<SourceOutput, Error> {
         let mut output = SourceOutput {
             events: vec![],
             mutations: vec![],
@@ -131,7 +129,7 @@ impl Http {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         let session = state::get("listener-session")?.and_then(|b| String::from_utf8(b).ok());
-        let result = exchange(json!({"op":"poll","after":after,"session":session}))?;
+        let result = exchange(json!({"op":"poll","after":after,"session":session})).await?;
         let current = result["session"]
             .as_str()
             .ok_or_else(|| error("missing listener session"))?;

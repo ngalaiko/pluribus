@@ -10,7 +10,7 @@ world = "pluribus:plugin/plugin@2.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
 config_schema = "config.schema.json"
-imports = ["pluribus:plugin/reader@2.0.0", "pluribus:plugin/runtime@2.0.0", "pluribus:plugin/socket@2.0.0", "pluribus:plugin/state@2.0.0", "pluribus:plugin/writer@2.0.0", "wasi:clocks/monotonic-clock@0.3.0"]
+imports = ["pluribus:plugin/runtime@2.0.0", "pluribus:plugin/socket@2.0.0", "pluribus:plugin/state@2.0.0", "wasi:clocks/monotonic-clock@0.3.0"]
 subscribes = []
 emits = ["observation.received", "capability.completed", "capability.failed"]
 

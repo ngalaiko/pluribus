@@ -2562,6 +2562,7 @@ name = "pluribus-plugin-shell"
 version = "1.0.0"
 dependencies = [
  "clap",
+ "futures-util",
  "nix",
  "pluribus-log",
  "pluribus-paths",

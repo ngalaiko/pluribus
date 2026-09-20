@@ -51,8 +51,8 @@ interface types {
     blob(blob-ref),
   }
 
-  /// Bounded read from a blob, an HTTP response stream, or a local socket.
-  /// `closed` means no bytes follow the ones returned.
+  /// Bounded read from a blob. `closed` means no bytes follow the ones
+  /// returned.
   record chunk {
     bytes: list<u8>,
     closed: bool,

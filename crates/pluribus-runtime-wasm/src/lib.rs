@@ -23,11 +23,11 @@ use pluribus_core::{
 use pluribus_plugin_bindings as bindings;
 use pluribus_plugin_package::PluginComponent;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wasmtime::component::{Component, Linker, Resource};
@@ -35,7 +35,7 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use bindings::exports::pluribus::plugin::lifecycle as guest;
 use bindings::pluribus::plugin::{
-    blobs, credentials, events, reader, runtime as execution, socket, state, types, writer,
+    blobs, credentials, events, runtime as execution, socket, state, types,
 };
 
 const MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -915,11 +915,6 @@ fn prepare_call(store: &mut Store<HostState>, limits: &RuntimeLimits) {
     let deadline = Instant::now() + limits.call_timeout;
     store.data_mut().call_deadline = Some(deadline);
     *store.data().io_completion_deadline.lock().unwrap() = None;
-    store.data_mut().stream_deadline = store
-        .data()
-        .stream_grant
-        .as_ref()
-        .map(|grant| Instant::now() + Duration::from_millis(u64::from(grant.max_timeout_ms)));
     store.epoch_deadline_callback(move |store| {
         if store.data().interrupted() {
             return Err(wasmtime::Error::msg("call cancelled"));
@@ -1000,35 +995,72 @@ struct HostState {
     http_grant: Option<HttpGrant>,
     stream: Option<Arc<dyn StreamService>>,
     stream_grant: Option<StreamGrant>,
-    stream_deadline: Option<Instant>,
     call_deadline: Option<Instant>,
     io_completion_deadline: Arc<std::sync::Mutex<Option<Instant>>>,
-    transports: HashMap<u32, Transport>,
+    transports: Vec<Arc<Transport>>,
     wasi_http: wasmtime_wasi_http::WasiHttpCtx,
     wasi_table: wasmtime::component::ResourceTable,
     wasi_hooks: wasi_http::Hooks,
-    readers: HashMap<u32, u32>,
-    streaming_readers: HashSet<u32>,
-    writers: HashMap<u32, u32>,
-    handle_sequence: u32,
     runner: runner::HostRunner,
     emit_call: bool,
 }
 
-/// One connection and the halves the guest still holds. Reader and writer
-/// share it; it closes when the last half goes or the delivery ends.
+/// One connection and the directions still running over it. The incoming
+/// stream and the outgoing stream share it; it closes when both are done,
+/// when either fails, or when the delivery ends.
 struct Transport {
-    kind: TransportKind,
-    halves: u8,
+    service: Arc<dyn StreamService>,
+    stream_id: String,
+    running: AtomicU8,
+    open: AtomicBool,
+    failure: std::sync::Mutex<Option<types::Error>>,
 }
 
-enum TransportKind {
-    Socket { stream_id: String },
-}
+impl Transport {
+    fn new(service: Arc<dyn StreamService>, stream_id: String) -> Self {
+        Self {
+            service,
+            stream_id,
+            running: AtomicU8::new(2),
+            open: AtomicBool::new(true),
+            failure: std::sync::Mutex::new(None),
+        }
+    }
 
-/// A transport resolved without holding a borrow on the registry.
-enum Target {
-    Socket(String),
+    /// Records the first failure and tears the connection down.
+    fn fail(&self, error: types::Error) {
+        if let Ok(mut failure) = self.failure.lock()
+            && failure.is_none()
+        {
+            *failure = Some(error);
+        }
+        self.close();
+    }
+
+    /// The first failure on either direction, or success.
+    fn outcome(&self) -> Result<(), types::Error> {
+        match self.failure.lock() {
+            Ok(failure) => failure.clone().map_or(Ok(()), Err),
+            Err(_) => Err(host_error(types::ErrorCode::Internal, "transport poisoned")),
+        }
+    }
+
+    /// Retires one direction, closing the connection once both are done.
+    fn finish(&self) {
+        if self.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.close();
+        }
+    }
+
+    fn close(&self) {
+        if self.open.swap(false, Ordering::AcqRel) {
+            self.service.close(&self.stream_id);
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for HostState {
@@ -1048,10 +1080,6 @@ impl HostState {
     ) -> Self {
         let state_namespace = StateNamespace::new(delivery.instance_id.clone());
         let visible_blobs = delivery.visible_blobs.iter().cloned().collect();
-        let stream_deadline = granted
-            .stream_grant
-            .as_ref()
-            .map(|grant| Instant::now() + Duration::from_millis(u64::from(grant.max_timeout_ms)));
         Self {
             credentials: granted.credentials,
             model: granted.model,
@@ -1084,17 +1112,12 @@ impl HostState {
             http_grant: granted.http_grant,
             stream: granted.stream,
             stream_grant: granted.stream_grant,
-            stream_deadline,
             call_deadline: None,
             io_completion_deadline: Arc::default(),
-            transports: HashMap::new(),
+            transports: Vec::new(),
             wasi_http: wasmtime_wasi_http::WasiHttpCtx::new(),
             wasi_table: wasi_http::resource_table(),
             wasi_hooks: wasi_http::Hooks,
-            readers: HashMap::new(),
-            streaming_readers: HashSet::new(),
-            writers: HashMap::new(),
-            handle_sequence: 0,
             runner: runner::HostRunner::default(),
             emit_call: false,
         }
@@ -1116,12 +1139,9 @@ impl HostState {
                 }
             });
         }
-        for id in self.transports.keys().copied().collect::<Vec<_>>() {
-            self.close_transport(id);
+        for transport in self.transports.drain(..) {
+            transport.close();
         }
-        self.readers.clear();
-        self.streaming_readers.clear();
-        self.writers.clear();
     }
 
     fn ensure_visible_blob(&self, blob: &BlobRef) -> Result<(), types::Error> {
@@ -1561,152 +1581,9 @@ impl blobs::Host for HostState {
     }
 }
 
-impl socket::Host for HostState {
-    async fn listen(
-        &mut self,
-    ) -> Result<(Resource<reader::Reader>, Resource<writer::Writer>), types::Error> {
-        if !self.runner.active || self.replaying {
-            return Err(stream_denied());
-        }
-        let (service, grant) = self.stream_access()?;
-        let id = self
-            .cancellable(service.listen(&grant))
-            .await?
-            .map_err(stream_plugin_error)?;
-        Ok(self.register_duplex(TransportKind::Socket { stream_id: id }))
-    }
-
-    async fn connect(
-        &mut self,
-    ) -> Result<(Resource<reader::Reader>, Resource<writer::Writer>), types::Error> {
-        let (service, grant) = self.stream_access()?;
-        let deadline = self.stream_deadline.ok_or_else(stream_denied)?;
-        if self.interrupted() {
-            return Err(host_error(types::ErrorCode::Cancelled, "stream cancelled"));
-        }
-        let remaining = self.stream_budget(deadline)?;
-        let grant = StreamGrant {
-            max_timeout_ms: grant.max_timeout_ms.min(remaining),
-            ..grant
-        };
-        let stream_id = self
-            .cancellable(service.open(&grant))
-            .await?
-            .map_err(stream_plugin_error)?;
-        Ok(self.register_duplex(TransportKind::Socket { stream_id }))
-    }
-}
-
-impl reader::Host for HostState {}
-
-impl reader::HostReader for HostState {
-    async fn receive(
-        &mut self,
-        read: Resource<reader::Reader>,
-        max_bytes: u32,
-        timeout_ms: u32,
-    ) -> Result<types::Chunk, types::Error> {
-        if max_bytes == 0 {
-            return Err(host_error(
-                types::ErrorCode::InvalidArgument,
-                "max bytes must be positive",
-            ));
-        }
-        if self.streaming_readers.contains(&read.rep()) {
-            return Err(host_error(
-                types::ErrorCode::Conflict,
-                "reader already streaming",
-            ));
-        }
-        let timeout_ms = timeout_ms.min(self.call_budget()?);
-        let (id, target) = self.read_target(&read)?;
-        match target {
-            Target::Socket(stream_id) => {
-                self.receive_socket(id, &stream_id, max_bytes, timeout_ms)
-                    .await
-            }
-        }
-    }
-
-    async fn drop(&mut self, read: Resource<reader::Reader>) -> wasmtime::Result<()> {
-        self.streaming_readers.remove(&read.rep());
-        if let Some(id) = self.readers.remove(&read.rep()) {
-            self.release_half(id);
-        }
-        Ok(())
-    }
-}
-
-impl writer::Host for HostState {}
-
-impl writer::HostWriter for HostState {
-    async fn send(
-        &mut self,
-        write: Resource<writer::Writer>,
-        bytes: Vec<u8>,
-    ) -> Result<(), types::Error> {
-        let (id, target) = self.write_target(&write)?;
-        match target {
-            Target::Socket(stream_id) => {
-                let (service, _) = self.stream_access()?;
-                self.cancellable(service.send(&stream_id, &bytes))
-                    .await?
-                    .map_err(|error| {
-                        self.close_transport(id);
-                        stream_plugin_error(error)
-                    })
-            }
-        }
-    }
-
-    /// Half-closes: the peer reads EOF while the reader stays usable.
-    async fn drop(&mut self, write: Resource<writer::Writer>) -> wasmtime::Result<()> {
-        let Some(id) = self.writers.remove(&write.rep()) else {
-            return Ok(());
-        };
-        if let Some(Transport {
-            kind: TransportKind::Socket { stream_id },
-            ..
-        }) = self.transports.get(&id)
-        {
-            let stream_id = stream_id.clone();
-            if let Some(service) = self.stream.clone() {
-                service.shutdown_write(&stream_id);
-            }
-        }
-        self.release_half(id);
-        Ok(())
-    }
-}
+impl socket::Host for HostState {}
 
 impl HostState {
-    fn cancellable<T, F: Future<Output = T>>(
-        &self,
-        operation: F,
-    ) -> impl Future<Output = Result<T, types::Error>> + use<T, F> {
-        let cancelled = Arc::clone(self.interrupt_flag());
-        let deadline = self.effective_deadline();
-        async move {
-            tokio::pin!(operation);
-            loop {
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(host_error(types::ErrorCode::Cancelled, "call cancelled"));
-                }
-                if deadline.is_some_and(|d| d <= Instant::now()) {
-                    return Err(host_error(
-                        types::ErrorCode::DeadlineExceeded,
-                        "call deadline exceeded",
-                    ));
-                }
-                tokio::select! {
-                    biased;
-                    result = &mut operation => return Ok(result),
-                    () = tokio::time::sleep(EPOCH_TICK) => {}
-                }
-            }
-        }
-    }
-
     fn http_grant(&self) -> Result<&HttpGrant, types::Error> {
         self.http_grant
             .as_ref()
@@ -1759,19 +1636,16 @@ impl HostState {
         Ok((service, grant))
     }
 
-    /// Milliseconds left before the grant lifetime or the authority deadline.
-    fn stream_budget(&self, deadline: Instant) -> Result<u32, types::Error> {
+    /// Milliseconds a connection may take to establish: the grant's ceiling,
+    /// the authority deadline, and what is left of the call budget.
+    fn connect_budget(&self, grant: &StreamGrant) -> Result<u32, types::Error> {
         let authority_remaining = self.delivery.deadline_at_ms.map_or(u32::MAX, |limit| {
             u32::try_from(limit.saturating_sub(system_time_ms()).max(0)).unwrap_or(u32::MAX)
         });
-        let remaining = u32::try_from(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis(),
-        )
-        .unwrap_or(u32::MAX)
-        .min(authority_remaining)
-        .min(self.call_budget()?);
+        let remaining = grant
+            .max_timeout_ms
+            .min(authority_remaining)
+            .min(self.call_budget()?);
         if remaining == 0 {
             return Err(host_error(
                 types::ErrorCode::DeadlineExceeded,
@@ -1780,106 +1654,29 @@ impl HostState {
         }
         Ok(remaining)
     }
+}
 
-    fn next_handle(&mut self) -> u32 {
-        self.handle_sequence += 1;
-        self.handle_sequence
-    }
-
-    fn register_duplex(
-        &mut self,
-        kind: TransportKind,
-    ) -> (Resource<reader::Reader>, Resource<writer::Writer>) {
-        let id = self.next_handle();
-        self.transports.insert(id, Transport { kind, halves: 2 });
-        let read = self.next_handle();
-        self.readers.insert(read, id);
-        let write = self.next_handle();
-        self.writers.insert(write, id);
-        (Resource::new_own(read), Resource::new_own(write))
-    }
-
-    fn read_target(&self, read: &Resource<reader::Reader>) -> Result<(u32, Target), types::Error> {
-        let id = *self.readers.get(&read.rep()).ok_or_else(closed_channel)?;
-        Ok((id, self.target(id)?))
-    }
-
-    fn write_target(
-        &self,
-        write: &Resource<writer::Writer>,
-    ) -> Result<(u32, Target), types::Error> {
-        let id = *self.writers.get(&write.rep()).ok_or_else(closed_channel)?;
-        Ok((id, self.target(id)?))
-    }
-
-    fn target(&self, id: u32) -> Result<Target, types::Error> {
-        match self.transports.get(&id) {
-            Some(Transport {
-                kind: TransportKind::Socket { stream_id },
-                ..
-            }) => Ok(Target::Socket(stream_id.clone())),
-            None => Err(closed_channel()),
+/// Runs a host operation under the call's cancellation flag and deadline.
+async fn cancellable<T>(
+    cancelled: &AtomicBool,
+    deadline: Option<Instant>,
+    operation: impl Future<Output = T>,
+) -> Result<T, types::Error> {
+    tokio::pin!(operation);
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(host_error(types::ErrorCode::Cancelled, "call cancelled"));
         }
-    }
-
-    /// Drops one half. The transport closes when the last one goes.
-    fn release_half(&mut self, id: u32) {
-        let done = match self.transports.get_mut(&id) {
-            Some(transport) => {
-                transport.halves = transport.halves.saturating_sub(1);
-                transport.halves == 0
-            }
-            None => false,
-        };
-        if done {
-            self.close_transport(id);
+        if deadline.is_some_and(|d| d <= Instant::now()) {
+            return Err(host_error(
+                types::ErrorCode::DeadlineExceeded,
+                "call deadline exceeded",
+            ));
         }
-    }
-
-    /// Closes the transport whatever the guest still holds. Both halves
-    /// then report the channel closed.
-    fn close_transport(&mut self, id: u32) {
-        match self.transports.remove(&id) {
-            Some(Transport {
-                kind: TransportKind::Socket { stream_id },
-                ..
-            }) => {
-                if let Some(service) = &self.stream {
-                    service.close(&stream_id);
-                }
-            }
-            None => {}
-        }
-    }
-
-    async fn receive_socket(
-        &mut self,
-        id: u32,
-        stream_id: &str,
-        max_bytes: u32,
-        timeout_ms: u32,
-    ) -> Result<types::Chunk, types::Error> {
-        let (service, _) = self.stream_access()?;
-        let deadline = self.stream_deadline.ok_or_else(stream_denied)?;
-        let timeout_ms = timeout_ms.min(self.stream_budget(deadline)?);
-        let interrupt = Arc::clone(self.interrupt_flag());
-        match self
-            .cancellable(service.receive(stream_id, max_bytes, timeout_ms, &interrupt))
-            .await?
-        {
-            Ok(page) => {
-                if page.closed {
-                    self.close_transport(id);
-                }
-                Ok(types::Chunk {
-                    bytes: page.bytes,
-                    closed: page.closed,
-                })
-            }
-            Err(error) => {
-                self.close_transport(id);
-                Err(stream_plugin_error(error))
-            }
+        tokio::select! {
+            biased;
+            result = &mut operation => return Ok(result),
+            () = tokio::time::sleep(EPOCH_TICK) => {}
         }
     }
 }

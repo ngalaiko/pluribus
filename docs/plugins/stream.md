@@ -1,54 +1,38 @@
 # Byte channels
 
-Implemented for ABI `pluribus:plugin@2.0.0`. A channel is two resources: a
-`reader` and a `writer`. `socket.connect` returns both halves for one
-configured Unix socket. HTTP uses WASI request/response body streams. Core owns transport
-and peer verification; the plugin owns framing and protocol semantics.
+Implemented for ABI `pluribus:plugin@2.0.0`. `socket.connect` exchanges bytes
+with the one configured Unix socket endpoint granted to an instance. HTTP uses
+WASI request/response body streams. Core owns transport and peer verification;
+the plugin owns framing and protocol semantics.
 
 ## Interface
 
 ```wit
-interface reader {
-  use types.{chunk, error};
-
-  resource reader {
-    read-via-stream: async func() -> result<tuple<stream<u8>, future<result<_, error>>>, error>;
-    receive: func(max-bytes: u32, timeout-ms: u32) -> result<chunk, error>;
-  }
-}
-
-interface writer {
-  use types.{error};
-
-  resource writer {
-    send: func(bytes: list<u8>) -> result<_, error>;
-  }
-}
-
 interface socket {
-  use reader.{reader};
-  use writer.{writer};
   use types.{error};
 
-  connect: func() -> result<tuple<reader, writer>, error>;
+  connect: async func(outgoing: stream<u8>)
+    -> result<tuple<stream<u8>, future<result<_, error>>>, error>;
 }
 ```
 
-`connect` accepts no endpoint: an instance has at most one granted. Both halves
-belong to the active delivery.
+`connect` names no endpoint: an instance has at most one granted. The plugin
+passes the read end of a stream it writes to, and its bytes reach the peer. The
+returned stream carries the peer's bytes. The future resolves after that stream
+ends, `ok` on clean EOF and carrying the transport error if one ended it.
 
-There is no `close`. Dropping a reader ends the transfer. Dropping a writer
-half-closes: the peer reads EOF while the read half stays open, and an endpoint
-MAY treat that as cancellation — the shell executor does. The transport closes
-when both halves are gone, or when the delivery ends. A half whose transport is
-already closed returns `invalid-argument`.
+Closing the outgoing writer half-closes: the peer reads EOF while the incoming
+stream stays open, and an endpoint MAY treat that as cancellation — the shell
+executor does — so hold the writer until the exchange is done. Dropping the
+incoming stream stops reading. The transport closes when both directions are
+finished. A send or read failure closes it.
 
-`receive` returns at most `max-bytes`. A read timeout returns an empty chunk
-with `closed = false`, not a deadline error. EOF returns `closed = true`,
-possibly with final bytes, and closes the transport. A zero `max-bytes` is
-`invalid-argument`. `send` writes the whole buffer or fails; there is no
-host-side write buffer. Bytes are inline; plugins can use `blobs` to store
-content. WASI HTTP request and response bodies use native byte streams.
+Bytes are inline; plugins can use `blobs` to store content.
+
+## Framing
+
+A stream socket gives the peer no write boundaries. Framing is the plugin's
+job: the shell, CLI, and HTTP plugins frame with newline-terminated JSON.
 
 ## Grant
 
@@ -87,18 +71,17 @@ Merge into the runtime configuration:
 | --- | --- |
 | `socket` | Required absolute Unix socket path. |
 | `peer_uids` | Required non-empty list of non-root UIDs allowed to answer the socket. Listing the runtime's own UID gives the endpoint the runtime's authority, so only an endpoint that cannot act with it, such as a terminal bridge, belongs there. |
-| `max_bytes` | Positive combined send/receive budget per stream. Defaults to 16 MiB. |
-| `max_timeout_ms` | Stream lifetime in milliseconds, 1–300000. Defaults to 300000. |
+| `max_bytes` | Positive byte budget combined across both directions of one connection. Defaults to 16 MiB. |
+| `max_timeout_ms` | Bound on connection establishment, in milliseconds, 1–300000. Defaults to 300000. |
 
-Each opened stream receives its own byte budget; this is not a delivery-wide
+Each connection receives its own byte budget; this is not a delivery-wide
 quota. Connecting requires an endpoint grant. The manifest must import
-`pluribus:plugin/socket@2.0.0`, `pluribus:plugin/reader@2.0.0`, and
-`pluribus:plugin/writer@2.0.0`, and request `host.stream` with exactly
+`pluribus:plugin/socket@2.0.0` and request `host.stream` with exactly
 `constraints = { unrestricted = true }`. Describe the endpoint's authority in
-the manifest. `connect`, `receive`, and `send` require a granted endpoint; without one they
-return `permission-denied`, which the plugin turns into a `capability.failed`
-event rather than a trap. A required stream capability without a configured grant causes
-CLI installation to fail.
+the manifest. Without a granted endpoint `connect` returns `permission-denied`,
+which the plugin turns into a `capability.failed` event rather than a trap. A
+required stream capability without a configured grant causes CLI installation
+to fail.
 
 ## Identity and isolation
 
@@ -116,21 +99,23 @@ inspect commands or restrict their filesystem effects.
 
 ## Deadlines and cleanup
 
-At connect, the host caps stream lifetime by the grant, runtime call timeout,
-call deadline, and the delivery's authority deadline. The transport checks expiry before
-operations and during reads. Reads check cancellation every polling iteration
-(with a 10 ms sleep when idle).
+`connect` is denied during replay, and while the instance is stopping or
+cancelled. Establishment is bounded by the grant's `max_timeout_ms`, capped by
+the delivery's authority deadline and by the remaining call budget when the
+call carries one.
 
-Connect is synchronous. Sends check stream expiry before writing and use a
-one-second socket write timeout; they do not poll cancellation or recheck the
-deadline during `write_all`. These limits do not guarantee an exact wall-clock
-cutoff for every operation. Idle streams have no background expiry task.
+Reads have no idle deadline. They end on EOF, transport error, byte-budget
+exhaustion, or cancellation and stop. A plugin wanting a bounded read races the
+stream read against `wasi:clocks/monotonic-clock.wait-for`, the same way it
+reads a WASI HTTP body.
 
-Receive/send transport errors close the handle in the runtime. Delivery cleanup
-closes remaining handles after return or failure. Emergency stop signals
-component cancellation; closing the shell connection makes the executor cancel
-the command. The executor kills the command's process group. Deliberately
-detached processes require operator-provided containment.
+A connection opened inside a host-driven `handle` call closes when that call
+ends. A connection opened by a source loop lives until its streams are dropped
+or the source stops.
+
+Emergency stop signals component cancellation; closing the shell connection
+makes the executor cancel the command. The executor kills the command's process
+group. Deliberately detached processes require operator-provided containment.
 
 ## Audit
 
@@ -140,12 +125,12 @@ authority, activity, correlation, and source event:
 
 | Event | Recorded when |
 | --- | --- |
-| `stream.closed` | The last half drops, receive observes EOF, or a transport error ends the handle. |
+| `stream.closed` | Both directions finish, a direction is dropped, or a transport error ends the connection. |
 
 Access checks and deadline checks in the runtime can fail before transport
-without emitting `stream.closed`. Delivery cleanup closes leftover handles
+without emitting `stream.closed`. Delivery cleanup closes leftover connections
 without terminal stream events. Explicit close ignores audit-write errors. Do
-not assume every opened stream has a matching close event.
+not assume every opened connection has a matching close event.
 
 Transport events contain no command or frame bytes. Capability arguments record
 what was requested, not proof of what a plugin sent to its endpoint.
@@ -156,7 +141,7 @@ what was requested, not proof of what a plugin sent to its endpoint.
 | --- | --- |
 | `crates/pluribus-core/src/stream.rs` | Endpoint, grant, transport trait, errors. |
 | `crates/pluribus-host-stream` | Unix connection, server UID checks, byte/time limits, private data-directory check. |
-| `crates/pluribus-runtime-wasm` | Delivery access, handle ownership, audit events, cleanup. |
+| `crates/pluribus-runtime-wasm` | Delivery access, connection ownership, audit events, cleanup. |
 | `plugins/shell/protocol` | Versioned request/response JSON and validation. |
 | `plugins/shell/client` | Wasm plugin, request encoding, response decoding and size limit. |
 | `plugins/shell/executor` | Client UID checks, newline framing, shell execution and process-group cleanup. |
@@ -183,13 +168,12 @@ The HTTP plugin uses a Unix socket only to communicate with its native listener.
 
 ## Async source I/O
 
-`socket.listen()` opens a readiness-driven connection to the granted endpoint.
-The plugin sends its protocol request, opens `reader.read-via-stream()`, and
-awaits bytes from the returned native stream. After EOF, it awaits the completion
-future to detect transport errors. Each reader opens at most one stream.
-Framing and reconnects belong to the plugin. Connections remain alive across
-source commits and close when their resources are dropped or the source stops.
-Peer checks and byte budgets still apply.
+A source loop connects, writes its protocol request to the outgoing stream, and
+awaits bytes from the returned incoming stream. After EOF it awaits the
+completion future to detect a transport error. Framing and reconnects belong to
+the plugin. Connections stay alive across source commits and close when their
+streams are dropped or the source stops. Peer checks and byte budgets still
+apply.
 
 `wasi:http/client.send(request).await` performs a granted HTTP exchange.
 The host enforces deadlines, destination policy, and credential constraints.

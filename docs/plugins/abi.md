@@ -78,8 +78,8 @@ NOT invent replacement bytes.
 
 ### `chunk`
 
-One `chunk { bytes, closed }` serves blob reads, HTTP response streams, and
-local sockets. `closed` means no bytes follow the ones returned.
+`chunk { bytes, closed }` bounds one blob read. `closed` means no bytes follow
+the ones returned.
 
 ### `error`
 
@@ -216,30 +216,24 @@ The world imports no filesystem, CLI, or general socket APIs. Vendored
 transitive WIT definitions grant no access; the host links only selected
 interfaces. See [WASI security](https://wasi.dev/security).
 
-### `reader` and `writer`
-
-The two halves of a byte channel. `reader.receive` returns at most `max-bytes`
-and may wait up to `timeout-ms`; a timeout returns an empty chunk with
-`closed = false`, not an error. `writer.send` writes the whole buffer or fails;
-there is no host-side write buffer, so the plugin frames by choosing when to
-call it.
-
-Neither half has a `close`. Dropping a reader ends the transfer. Dropping a
-writer half-closes the channel: the peer reads EOF while the read half stays
-open, and an endpoint MAY treat that as cancellation. The transport closes when
-both halves are gone, or when the delivery ends.
-
-For source sockets, `reader.read-via-stream` opens one native `stream<u8>`
-and a completion future. It is exclusive with bounded reads; keep the reader
-resource alive while consuming the stream. HTTP bodies use WASI directly.
-
 ### `socket`
 
-`connect` opens the one Unix socket endpoint granted to this instance and
-returns both halves, sharing one transport and one byte budget. The host owns
-transport, peer-credential verification, and byte and time budgets; the plugin
-owns framing. No credential is injected: an endpoint grant conveys whatever
-authority that endpoint exposes. See [byte channels](stream.md).
+`connect(outgoing)` opens the one Unix socket endpoint granted to this
+instance. The plugin passes the read end of a stream it writes to; bytes
+written reach the peer. The call returns the peer's byte stream and a
+completion future, which resolves after that stream ends and carries the
+transport error if one ended it.
+
+Closing the outgoing writer half-closes: the peer reads EOF while the incoming
+stream stays open, and an endpoint MAY treat that as cancellation. Dropping the
+incoming stream stops reading. The transport closes when both directions are
+finished. Both directions share one byte budget.
+
+Reads have no idle deadline; a plugin bounds one by racing the read against
+`wasi:clocks/monotonic-clock.wait-for`, as it does for HTTP bodies. The host
+owns transport, peer-credential verification, and byte and time budgets; the
+plugin owns framing. No credential is injected: an endpoint grant conveys
+whatever authority that endpoint exposes. See [byte channels](stream.md).
 
 ## Cancellation
 
@@ -249,8 +243,8 @@ cannot observe cancellation is still stopped. Emergency stop does not depend on
 plugin cooperation.
 
 Cancellation reaches the delivery in flight, not the loop that received it: a
-cancelled `handle` fails its host calls with `cancelled`, and `next` returns
-the following delivery. Only shutdown ends the loop, through `stop`. A loop
+cancelled `handle` fails its host calls with `cancelled`, `commit` included, so
+the delivery ends in `reject`, and `next` returns the following delivery. Only shutdown ends the loop, through `stop`. A loop
 waiting between deliveries therefore survives the cancellation of an activity
 it already returned.
 

@@ -332,6 +332,10 @@ impl execution::Host for HostState {
         if !self.runner.active || self.replaying {
             return Err(stream_denied());
         }
+        // A cancelled delivery ends in `reject`; its result is not recorded.
+        if self.runner.has_pending_delivery() && self.interrupted() {
+            return Err(host_error(types::ErrorCode::Cancelled, "call cancelled"));
+        }
         let outcome = self
             .run_commit(&events, &mutations, checkpoint)
             .await
@@ -442,10 +446,6 @@ pub(super) fn resume<T>(accessor: &Accessor<T, HostData>) {
     accessor.with(|mut access| {
         let host = access.get();
         host.call_deadline = Some(Instant::now() + host.runner.timeout);
-        host.stream_deadline = host
-            .stream_grant
-            .as_ref()
-            .map(|g| Instant::now() + Duration::from_millis(u64::from(g.max_timeout_ms)));
     });
 }
 
@@ -792,6 +792,43 @@ pub(super) mod tests {
             .await
             .unwrap();
         assert_eq!(result.await.unwrap().unwrap().checkpoint, sequence);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_delivery_cannot_commit_but_can_be_rejected() {
+        let (mut store, _instance, commands) = source().await;
+        let mut event = proposal("observation.received");
+        event.idempotency_key = Some("input:1".into());
+        execution::Host::commit(store.data_mut(), vec![event], vec![], None)
+            .await
+            .unwrap();
+        let batch = store
+            .data()
+            .event_store
+            .read(&StreamId::new("personal"), 0, 100)
+            .await
+            .unwrap();
+        let sequence = batch[0].sequence;
+        let (reply, result) = oneshot::channel();
+        commands.send(Command::Deliver(batch, reply)).await.unwrap();
+        store
+            .run_concurrent(async |accessor| {
+                execution::HostWithStore::next(&accessor.with_getter::<HostData>(|h| h))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        CancellationHandle::of(store.data()).cancel();
+        let refused = execution::Host::commit(store.data_mut(), vec![], vec![], Some(sequence))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused.code, types::ErrorCode::Cancelled));
+        assert_eq!(store.data().runner.checkpoint.load(Ordering::Acquire), 0);
+        execution::Host::reject(store.data_mut(), refused)
+            .await
+            .unwrap();
+        assert!(result.await.unwrap().is_err());
     }
 
     #[tokio::test]

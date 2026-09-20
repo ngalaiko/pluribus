@@ -305,116 +305,6 @@ async fn a_fresh_cursor_starts_at_zero() {
     assert_eq!(checkpoint, 0);
 }
 
-struct ByteHttp;
-#[async_trait::async_trait]
-impl pluribus_core::HttpService for ByteHttp {
-    async fn send(
-        &self,
-        _: &HttpGrant,
-        _: &HttpRequest,
-    ) -> Result<pluribus_core::HttpResponse, HttpError> {
-        unreachable!()
-    }
-}
-#[async_trait::async_trait]
-impl HttpStreamService for ByteHttp {
-    async fn open_stream(
-        &self,
-        _: &HttpGrant,
-        protocol: HttpStreamProtocol,
-        _: &HttpRequest,
-    ) -> Result<String, HttpError> {
-        assert_eq!(format!("{protocol:?}"), "Bytes");
-        Ok("bytes".into())
-    }
-    async fn receive(
-        &self,
-        _: &HttpGrant,
-        _: &str,
-        _: u32,
-        _: u32,
-    ) -> Result<pluribus_core::HttpFramePage, HttpError> {
-        Ok(pluribus_core::HttpFramePage {
-            frames: vec![pluribus_core::HttpFrame {
-                kind: "bytes".into(),
-                data: b"data: hello\n\n".to_vec(),
-            }],
-            closed: true,
-        })
-    }
-    async fn send_frame(
-        &self,
-        _: &HttpGrant,
-        _: &str,
-        _: &pluribus_core::HttpFrame,
-    ) -> Result<(), HttpError> {
-        Err(HttpError::Unsupported(
-            "SSE streams are receive-only".into(),
-        ))
-    }
-    fn close_stream(&self, _: &HttpGrant, _: &str) {}
-}
-/// Records nothing; the halves' bookkeeping is what these tests check.
-struct NullStream;
-#[async_trait::async_trait]
-impl StreamService for NullStream {
-    async fn open(&self, _: &StreamGrant) -> Result<String, StreamError> {
-        Ok("socket".into())
-    }
-    async fn receive(
-        &self,
-        _: &str,
-        _: u32,
-        _: u32,
-        _: &AtomicBool,
-    ) -> Result<pluribus_core::StreamPage, StreamError> {
-        Ok(pluribus_core::StreamPage {
-            bytes: vec![],
-            closed: false,
-        })
-    }
-    async fn send(&self, _: &str, _: &[u8]) -> Result<(), StreamError> {
-        Ok(())
-    }
-    fn shutdown_write(&self, _: &str) {}
-    fn close(&self, _: &str) {}
-}
-async fn byte_host() -> HostState {
-    let mut host = host(vec![]).await;
-    host.http = Some(Arc::new(ByteHttp));
-    host.http_grant = Some(HttpGrant {
-        component: PrincipalRef::new(CorePrincipalKind::Component, "shell-1"),
-        origins: vec!["https://example.com".into()],
-        methods: vec!["GET".into()],
-        allow_http: false,
-        allow_private_network: false,
-        max_request_bytes: 1000,
-        max_response_bytes: 1000,
-        max_redirects: 0,
-        max_timeout_ms: 1000,
-    });
-    host
-}
-#[tokio::test]
-async fn dropping_one_half_keeps_the_transport_for_the_other() {
-    let mut host = byte_host().await;
-    host.stream = Some(Arc::new(NullStream));
-    host.stream_grant = Some(StreamGrant {
-        endpoint: pluribus_core::StreamEndpoint::Unix {
-            path: "/run/endpoint.sock".into(),
-            peer_uids: vec![1002],
-        },
-        max_bytes: 1024,
-        max_timeout_ms: 1000,
-    });
-    host.stream_deadline = Some(Instant::now() + Duration::from_secs(1));
-    let (read, write) = socket::Host::connect(&mut host).await.unwrap();
-    writer::HostWriter::drop(&mut host, write).await.unwrap();
-    assert_eq!(host.transports.len(), 1, "the reader still holds it");
-    reader::HostReader::drop(&mut host, read).await.unwrap();
-    assert!(host.transports.is_empty(), "the last half closes it");
-}
-
 #[tokio::test]
 async fn event_get_cannot_read_another_agent_stream() {
     let mut host = host(vec!["memory.remembered".into()]).await;
@@ -835,16 +725,16 @@ async fn credential_exports_are_scoped_without_raw_record_access() {
 #[derive(Default)]
 pub(super) struct SubscriptionFixture {
     pub(super) fail: AtomicBool,
-    opens: AtomicU64,
+    pub(super) opens: AtomicU64,
     pub(super) reads: AtomicU64,
-    closed: tokio::sync::Notify,
+    pub(super) sent: std::sync::Mutex<Vec<Vec<u8>>>,
+    pub(super) half_closed: AtomicU64,
+    pub(super) closes: AtomicU64,
+    pub(super) closed: tokio::sync::Notify,
 }
 #[async_trait::async_trait]
 impl StreamService for SubscriptionFixture {
     async fn open(&self, _: &StreamGrant) -> Result<String, StreamError> {
-        unreachable!()
-    }
-    async fn listen(&self, _: &StreamGrant) -> Result<String, StreamError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
         Ok("input".into())
     }
@@ -858,20 +748,15 @@ impl StreamService for SubscriptionFixture {
             closed: false,
         })
     }
-    async fn receive(
-        &self,
-        _: &str,
-        _: u32,
-        _: u32,
-        _: &AtomicBool,
-    ) -> Result<pluribus_core::StreamPage, StreamError> {
-        unreachable!()
-    }
-    async fn send(&self, _: &str, _: &[u8]) -> Result<(), StreamError> {
+    async fn send(&self, _: &str, bytes: &[u8]) -> Result<(), StreamError> {
+        self.sent.lock().unwrap().push(bytes.to_vec());
         Ok(())
     }
-    fn shutdown_write(&self, _: &str) {}
+    fn shutdown_write(&self, _: &str) {
+        self.half_closed.fetch_add(1, Ordering::SeqCst);
+    }
     fn close(&self, _: &str) {
+        self.closes.fetch_add(1, Ordering::SeqCst);
         self.closed.notify_one();
     }
 }
@@ -880,25 +765,21 @@ impl StreamService for SubscriptionFixture {
 struct CliSubscriptionFixture {
     idle: AtomicBool,
     sequence: AtomicU64,
-    frames: std::sync::Mutex<HashMap<String, VecDeque<Vec<u8>>>>,
+    frames: std::sync::Mutex<std::collections::HashMap<String, VecDeque<Vec<u8>>>>,
     offsets: std::sync::Mutex<Vec<u64>>,
 }
 #[async_trait::async_trait]
 impl StreamService for CliSubscriptionFixture {
     async fn open(&self, _: &StreamGrant) -> Result<String, StreamError> {
-        Ok("reply".into())
-    }
-    async fn listen(&self, _: &StreamGrant) -> Result<String, StreamError> {
         Ok(format!(
             "input-{}",
             self.sequence.fetch_add(1, Ordering::SeqCst)
         ))
     }
     async fn send(&self, id: &str, bytes: &[u8]) -> Result<(), StreamError> {
-        if id == "reply" {
+        let Ok(request) = serde_json::from_slice::<Value>(bytes) else {
             return Ok(());
-        }
-        let request: Value = serde_json::from_slice(bytes).unwrap();
+        };
         let after = request["after"].as_u64().unwrap();
         self.offsets.lock().unwrap().push(after);
         let frame = if after == 0 {
@@ -930,18 +811,6 @@ impl StreamService for CliSubscriptionFixture {
             });
         }
         std::future::pending().await
-    }
-    async fn receive(
-        &self,
-        _: &str,
-        _: u32,
-        _: u32,
-        _: &AtomicBool,
-    ) -> Result<pluribus_core::StreamPage, StreamError> {
-        Ok(pluribus_core::StreamPage {
-            bytes: b"{\"status\":\"delivered\"}\n".to_vec(),
-            closed: false,
-        })
     }
     fn shutdown_write(&self, _: &str) {}
     fn close(&self, id: &str) {

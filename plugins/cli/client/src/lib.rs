@@ -4,12 +4,10 @@
 
 wit_bindgen::generate!({ generate_all, path: "../../wit", world: "plugin" });
 
+use channel::Socket;
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
-use pluribus::plugin::reader::Reader;
-use pluribus::plugin::socket;
 use pluribus::plugin::state;
 use pluribus::plugin::types::{Error, ErrorCode, Event, Mutation, Payload, Proposal, StateEntry};
-use pluribus::plugin::writer::Writer;
 use protocol::{MAX_RESPONSE, Message, Request, Response, VERSION};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -17,10 +15,18 @@ use std::cell::RefCell;
 
 /// Bytes requested per read. The bridge caps its own response.
 const READ_CHUNK: u32 = 64 * 1024;
+/// Bytes requested per read on the input subscription.
+const INPUT_CHUNK: u32 = 32 * 1024;
+/// Slack over the bridge's own timeout before the client gives up.
+const RESPONSE_GRACE_MS: u32 = 5_000;
 const CAPABILITY: &str = "cli.reply";
 /// Key holding the last delivered input. State is a rebuildable projection: an
 /// empty namespace replays whatever the bridge still holds.
 const CURSOR_KEY: &str = "input/cursor";
+
+mod channel {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/socket.rs"));
+}
 
 struct Cli;
 
@@ -76,20 +82,13 @@ impl Guest for Cli {
             }
             INPUT.with_borrow_mut(Vec::clear);
             let result: Result<bool, Error> = async {
-                let (read, write) = socket::listen()?;
-                let (mut input, completion) = read.read_via_stream().await?;
-                let mut completion = Some(completion);
-                write.send(&poll_request(&configuration()?, cursor()?)?)?;
+                let mut input = Socket::connect().await?;
+                input
+                    .send(&poll_request(&configuration()?, cursor()?)?)
+                    .await?;
                 loop {
-                    let Some(chunk) = Self::waiting(&mut context, async {
-                        let (_, bytes) = input.read(Vec::with_capacity(32 * 1024)).await;
-                        let closed = bytes.is_empty();
-                        if closed {
-                            completion.take().unwrap().await?;
-                        }
-                        Ok(pluribus::plugin::types::Chunk { bytes, closed })
-                    })
-                    .await?
+                    let Some(chunk) =
+                        Self::waiting(&mut context, input.read(INPUT_CHUNK, None)).await?
                     else {
                         return Ok(true);
                     };
@@ -137,7 +136,7 @@ impl Guest for Cli {
                 if request.get("capability").and_then(Value::as_str) != Some(CAPABILITY) {
                     continue;
                 }
-                proposals.push(dispatch(event, &request));
+                proposals.push(dispatch(event, &request).await);
             }
         }
 
@@ -173,15 +172,16 @@ thread_local! {
     static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-fn dispatch(event: &Event, request: &Value) -> Proposal {
-    let outcome = reply(request).and_then(|()| {
-        proposal(
+async fn dispatch(event: &Event, request: &Value) -> Proposal {
+    let outcome = match reply(request).await {
+        Ok(()) => proposal(
             "capability.completed",
             "dev.pluribus.cli.result.v1",
             &json!({"requestEventId": event.event_id, "output": true}),
             Some(event.event_id.clone()),
-        )
-    });
+        ),
+        Err(error) => Err(error),
+    };
     outcome.unwrap_or_else(|error| {
         proposal(
             "capability.failed",
@@ -197,7 +197,7 @@ fn dispatch(event: &Event, request: &Value) -> Proposal {
     })
 }
 
-fn reply(request: &Value) -> Result<(), Error> {
+async fn reply(request: &Value) -> Result<(), Error> {
     let arguments = request
         .get("arguments")
         .cloned()
@@ -215,7 +215,7 @@ fn reply(request: &Value) -> Result<(), Error> {
         conversation_id,
         text,
     };
-    match exchange(&request, 30_000)? {
+    match exchange(&request, 30_000).await? {
         Response::Delivered => Ok(()),
         Response::Messages { .. } => Err(invalid("bridge answered a reply with input")),
         Response::Unavailable { message } => Err(unavailable(message)),
@@ -223,19 +223,24 @@ fn reply(request: &Value) -> Result<(), Error> {
 }
 
 /// One newline-terminated request and one response per connection.
-fn exchange(request: &Request, timeout_ms: u32) -> Result<Response, Error> {
+async fn exchange(request: &Request, timeout_ms: u32) -> Result<Response, Error> {
     request.validate().map_err(invalid)?;
     let mut bytes = serde_json::to_vec(request).map_err(|_| internal("cannot encode request"))?;
     bytes.push(b'\n');
-    let (read, write) = socket::connect()?;
-    send(&read, &write, &bytes, timeout_ms)
+    let mut channel = Socket::connect().await?;
+    send(&mut channel, &bytes, timeout_ms).await
 }
 
-fn send(read: &Reader, write: &Writer, request: &[u8], timeout_ms: u32) -> Result<Response, Error> {
-    write.send(request)?;
+async fn send(channel: &mut Socket, request: &[u8], timeout_ms: u32) -> Result<Response, Error> {
+    channel.send(request).await?;
     let mut bytes = Vec::new();
     loop {
-        let chunk = read.receive(READ_CHUNK, timeout_ms.saturating_add(5_000))?;
+        let chunk = channel
+            .read(
+                READ_CHUNK,
+                Some(timeout_ms.saturating_add(RESPONSE_GRACE_MS)),
+            )
+            .await?;
         bytes.extend_from_slice(&chunk.bytes);
         if bytes.len() > MAX_RESPONSE {
             return Err(failure(
@@ -248,6 +253,12 @@ fn send(read: &Reader, write: &Writer, request: &[u8], timeout_ms: u32) -> Resul
         }
         if chunk.closed {
             return Err(unavailable("bridge disconnected"));
+        }
+        if chunk.bytes.is_empty() {
+            return Err(failure(
+                ErrorCode::DeadlineExceeded,
+                "bridge did not respond",
+            ));
         }
     }
     serde_json::from_slice(&bytes)

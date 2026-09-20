@@ -1970,12 +1970,10 @@ impl pluribus_core::StreamService for CancellableExecutor {
     async fn send(&self, _: &str, _: &[u8]) -> Result<(), pluribus_core::StreamError> {
         Ok(())
     }
-    async fn receive(
+    async fn next(
         &self,
         id: &str,
         _: u32,
-        _: u32,
-        _: &std::sync::atomic::AtomicBool,
     ) -> Result<pluribus_core::StreamPage, pluribus_core::StreamError> {
         if id == "0" {
             self.entered.notify_one();

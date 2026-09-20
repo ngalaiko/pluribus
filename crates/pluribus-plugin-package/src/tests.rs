@@ -48,8 +48,6 @@ const IMPORTS: &[&str] = &[
     "pluribus:plugin/events@2.0.0",
     "pluribus:plugin/state@2.0.0",
     "pluribus:plugin/blobs@2.0.0",
-    "pluribus:plugin/reader@2.0.0",
-    "pluribus:plugin/writer@2.0.0",
     "wasi:http/types@0.3.0",
     "wasi:http/client@0.3.0",
     "wasi:clocks/system-clock@0.3.0",

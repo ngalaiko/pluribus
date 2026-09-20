@@ -9,19 +9,18 @@ use std::net::Shutdown;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 
-const TICK: Duration = Duration::from_millis(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// One connection. `remaining` is the grant's byte budget, shared by both
+/// directions.
 struct Stream {
     socket: AsyncFd<UnixStream>,
     remaining: Mutex<u64>,
     writes: tokio::sync::Mutex<()>,
-    deadline: Option<Instant>,
 }
 
 /// Connects granted endpoints and enforces their ceilings.
@@ -43,11 +42,19 @@ impl LocalStreamService {
         })
     }
 
-    async fn open_channel(
-        &self,
-        grant: &StreamGrant,
-        subscription: bool,
-    ) -> Result<String, StreamError> {
+    fn get(&self, id: &str) -> Result<Arc<Stream>, StreamError> {
+        self.streams
+            .lock()
+            .map_err(|_| poisoned())?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| unavailable("unknown stream"))
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamService for LocalStreamService {
+    async fn open(&self, grant: &StreamGrant) -> Result<String, StreamError> {
         let StreamEndpoint::Unix { path, peer_uids } = &grant.endpoint;
         validate_peers(peer_uids).map_err(unavailable)?;
         if !path.is_absolute() {
@@ -70,39 +77,9 @@ impl LocalStreamService {
                 socket: AsyncFd::new(socket).map_err(unavailable)?,
                 remaining: Mutex::new(grant.max_bytes),
                 writes: tokio::sync::Mutex::new(()),
-                deadline: (!subscription).then(|| Instant::now() + timeout),
             }),
         );
         Ok(id)
-    }
-
-    fn get(&self, id: &str) -> Result<Arc<Stream>, StreamError> {
-        let stream = self
-            .streams
-            .lock()
-            .map_err(|_| poisoned())?
-            .get(id)
-            .cloned()
-            .ok_or_else(|| unavailable("unknown stream"))?;
-        if stream
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.close(id);
-            return Err(StreamError::DeadlineExceeded);
-        }
-        Ok(stream)
-    }
-}
-
-#[async_trait::async_trait]
-impl StreamService for LocalStreamService {
-    async fn open(&self, grant: &StreamGrant) -> Result<String, StreamError> {
-        self.open_channel(grant, false).await
-    }
-
-    async fn listen(&self, grant: &StreamGrant) -> Result<String, StreamError> {
-        self.open_channel(grant, true).await
     }
 
     async fn next(&self, id: &str, max_bytes: u32) -> Result<StreamPage, StreamError> {
@@ -133,81 +110,9 @@ impl StreamService for LocalStreamService {
         }
     }
 
-    async fn receive(
-        &self,
-        id: &str,
-        max_bytes: u32,
-        timeout_ms: u32,
-        cancelled: &AtomicBool,
-    ) -> Result<StreamPage, StreamError> {
-        let stream = self.get(id)?;
-        let until = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
-        loop {
-            if cancelled.load(Ordering::Acquire) {
-                return Err(StreamError::Cancelled);
-            }
-            if stream
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                self.close(id);
-                return Err(StreamError::DeadlineExceeded);
-            }
-            // The budget lock covers only the nonblocking syscall.
-            let result = {
-                let mut remaining = stream.remaining.lock().map_err(|_| poisoned())?;
-                let limit = usize::try_from(*remaining)
-                    .unwrap_or(usize::MAX)
-                    .min(max_bytes as usize);
-                if limit == 0 {
-                    self.close(id);
-                    return Err(StreamError::LimitExceeded);
-                }
-                let mut bytes = vec![0; limit];
-                match stream.socket.get_ref().read(&mut bytes) {
-                    Ok(n) => {
-                        *remaining -= n as u64;
-                        bytes.truncate(n);
-                        Some(Ok(StreamPage {
-                            bytes,
-                            closed: n == 0,
-                        }))
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => None,
-                    Err(e) => Some(Err(unavailable(e))),
-                }
-            };
-            if let Some(result) = result {
-                if result.is_err() {
-                    self.close(id);
-                }
-                return result;
-            }
-            if Instant::now() >= until {
-                return Ok(StreamPage {
-                    bytes: Vec::new(),
-                    closed: false,
-                });
-            }
-            let wake = stream
-                .deadline
-                .map_or(until, |deadline| until.min(deadline))
-                .min(Instant::now() + TICK);
-            tokio::select! {
-                ready = stream.socket.readable() => { ready.map_err(unavailable)?.clear_ready(); }
-                () = tokio::time::sleep_until(wake.into()) => {}
-            }
-        }
-    }
-
     async fn send(&self, id: &str, bytes: &[u8]) -> Result<(), StreamError> {
         let stream = self.get(id)?;
-        let until = stream
-            .deadline
-            .map_or(Instant::now() + WRITE_TIMEOUT, |deadline| {
-                deadline.min(Instant::now() + WRITE_TIMEOUT)
-            });
+        let until = Instant::now() + WRITE_TIMEOUT;
         let _writer = tokio::time::timeout_at(until.into(), stream.writes.lock())
             .await
             .map_err(|_| StreamError::DeadlineExceeded)?;

@@ -91,40 +91,6 @@ interface blobs {
     -> result<chunk, error>;
 }
 
-/// Read half of a byte channel. The interface that opens a channel
-/// authorizes it; this one only moves bytes.
-///
-/// Dropping the reader ends the transfer.
-interface reader {
-  use types.{chunk, error};
-
-  resource reader {
-    /// Opens a native byte stream. Completion carries transport errors.
-    /// Available on readiness-driven socket readers; keep the reader alive
-    /// until the stream is consumed or dropped. Open at most once.
-    read-via-stream: async func() -> result<tuple<stream<u8>, future<result<_, error>>>, error>;
-
-    /// Bounded read during a request delivery. Timeout returns an empty chunk.
-    receive: func(max-bytes: u32, timeout-ms: u32) -> result<chunk, error>;
-  }
-}
-
-/// Write half of a byte channel.
-///
-/// Dropping the writer half-closes the channel: the peer reads EOF while
-/// the read half stays open. An endpoint MAY treat that as cancellation,
-/// as the shell executor does, so hold the writer until the exchange is
-/// done. There is no host-side write buffer; each `send` is one write, so
-/// the plugin decides framing by choosing when to call it.
-interface writer {
-  use types.{error};
-
-  resource writer {
-    /// Writes the whole buffer or fails.
-    send: func(bytes: list<u8>) -> result<_, error>;
-  }
-}
-
 /// Byte channel to the one Unix socket endpoint granted to this instance.
 ///
 /// The host owns transport, peer-credential verification, and byte and
@@ -132,18 +98,23 @@ interface writer {
 /// injected; an endpoint grant conveys whatever authority that endpoint
 /// exposes.
 interface socket {
-  use reader.{reader};
-  use writer.{writer};
   use types.{error};
 
-  /// Connects the granted endpoint, returning both halves. They share one
-  /// transport and one byte budget; it closes when both are dropped.
-  /// Denied outside a request delivery.
-  connect: func() -> result<tuple<reader, writer>, error>;
-
-  /// Opens a readiness-driven connection. The plugin owns requests and reconnects.
-  listen: func() -> result<tuple<reader, writer>, error>;
-
+  /// Connects the granted endpoint.
+  ///
+  /// Bytes written to `outgoing` reach the peer. Closing its writer
+  /// half-closes the channel: the peer reads EOF while the incoming
+  /// stream stays open, and an endpoint MAY treat that as cancellation,
+  /// as the shell executor does, so hold the writer until the exchange is
+  /// done.
+  ///
+  /// The returned stream carries the peer's bytes. The future resolves
+  /// after it ends, carrying the transport error if one ended it. The
+  /// transport closes when both directions are done or dropped.
+  ///
+  /// Denied during replay. Both directions share one byte budget.
+  connect: async func(outgoing: stream<u8>)
+    -> result<tuple<stream<u8>, future<result<_, error>>>, error>;
 }
 
 /// Explicitly granted access to a plugin's own credential records.

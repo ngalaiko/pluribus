@@ -7,17 +7,18 @@ mod protocol;
 
 wit_bindgen::generate!({ generate_all, path: "../../wit", world: "plugin" });
 
+use channel::Socket;
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
-use pluribus::plugin::reader::Reader;
+use pluribus::plugin::credentials;
 use pluribus::plugin::types::{Error, ErrorCode, Event, Payload, Proposal};
-use pluribus::plugin::writer::Writer;
-use pluribus::plugin::{credentials, socket};
 use protocol::{MAX_RESPONSE, MAX_TIMEOUT_MS, Request, Response, VERSION};
 use serde::Deserialize;
 use serde_json::json;
 
 /// Bytes requested per read. The executor caps its own output.
 const READ_CHUNK: u32 = 64 * 1024;
+/// Slack over the command timeout before the client gives up on a response.
+const RESPONSE_GRACE_MS: u32 = 5_000;
 const CAPABILITY: &str = "shell.execute";
 
 thread_local! {
@@ -39,6 +40,10 @@ fn default_timeout() -> u32 {
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+
+mod channel {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/socket.rs"));
+}
 
 fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     let config: serde_json::Value = serde_json::from_slice(&config)
@@ -79,8 +84,9 @@ impl Guest for Shell {
             if request.get("capability").and_then(|value| value.as_str()) != Some(CAPABILITY) {
                 continue;
             }
-            let terminal =
-                run(&context, event, &request).and_then(|response| complete(event, response));
+            let terminal = run(&context, event, &request)
+                .await
+                .and_then(|response| complete(event, response));
             proposals.push(match terminal {
                 Ok(completed) => completed,
                 Err(error) => proposal(
@@ -112,7 +118,11 @@ impl Guest for Shell {
 ///
 /// Provenance comes from the delivered event, so the executor records the
 /// durable event that authorized the command rather than a transient call id.
-fn run(context: &Context, event: &Event, payload: &serde_json::Value) -> Result<Response, Error> {
+async fn run(
+    context: &Context,
+    event: &Event,
+    payload: &serde_json::Value,
+) -> Result<Response, Error> {
     let arguments: Arguments = serde_json::from_value(
         payload
             .get("arguments")
@@ -173,22 +183,26 @@ fn run(context: &Context, event: &Event, payload: &serde_json::Value) -> Result<
     bytes.push(b'\n');
 
     let _ = context;
-    let (read, write) = socket::connect()?;
-    // `write` stays alive across the read: the executor reads a half-close
-    // as a cancellation, and dropping both ends the command.
-    exchange(&read, &write, &bytes, request.timeout_ms)
+    // The channel stays open across the read: the executor reads a half-close
+    // as a cancellation, and dropping it ends the command.
+    let mut channel = Socket::connect().await?;
+    exchange(&mut channel, &bytes, request.timeout_ms).await
 }
 
-fn exchange(
-    read: &Reader,
-    write: &Writer,
+async fn exchange(
+    channel: &mut Socket,
     request: &[u8],
     timeout_ms: u32,
 ) -> Result<Response, Error> {
-    write.send(request)?;
+    channel.send(request).await?;
     let mut bytes = Vec::new();
     loop {
-        let chunk = read.receive(READ_CHUNK, timeout_ms)?;
+        let chunk = channel
+            .read(
+                READ_CHUNK,
+                Some(timeout_ms.saturating_add(RESPONSE_GRACE_MS)),
+            )
+            .await?;
         bytes.extend_from_slice(&chunk.bytes);
         if bytes.len() > MAX_RESPONSE {
             return Err(failure(
@@ -201,6 +215,12 @@ fn exchange(
         }
         if chunk.closed {
             return Err(failure(ErrorCode::Unavailable, "executor disconnected"));
+        }
+        if chunk.bytes.is_empty() {
+            return Err(failure(
+                ErrorCode::DeadlineExceeded,
+                "executor did not respond",
+            ));
         }
     }
     serde_json::from_slice(&bytes)

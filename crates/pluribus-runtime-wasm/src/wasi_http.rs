@@ -49,17 +49,7 @@ impl WasiHttpView for HostState {
 
 pub(super) fn add_to_linker(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
     macro_rules! link { ($($m:ident),*) => { $( $m::add_to_linker::<_, HostData>(linker, |h| h)?; )* }; }
-    link!(
-        blobs,
-        credentials,
-        events,
-        reader,
-        execution,
-        socket,
-        state,
-        types,
-        writer
-    );
+    link!(blobs, credentials, events, execution, socket, state, types);
     use bindings::wasi::{
         clocks::{monotonic_clock, system_clock, types as clock_types},
         random::random,

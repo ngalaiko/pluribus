@@ -27,8 +27,33 @@ fn one_world_with_run_and_event_delivery() {
     assert_eq!(worlds, 1, "the ABI defines exactly one world");
     assert_eq!(exports, 1, "a plugin exports only lifecycle");
     assert_eq!(
-        imports, 15,
+        imports, 13,
         "Pluribus contracts plus WASI HTTP, clocks, and randomness"
+    );
+}
+
+#[test]
+fn socket_exposes_only_connect() {
+    let mut resolve = wit_parser::Resolve::default();
+    let (package, _) = resolve
+        .push_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../wit"))
+        .unwrap();
+    let socket = resolve.packages[package].interfaces["socket"];
+    let functions: Vec<_> = resolve.interfaces[socket].functions.values().collect();
+    assert_eq!(functions.len(), 1, "socket exposes one function");
+    let connect = functions[0];
+    assert_eq!(connect.item_name(), "connect");
+    assert!(matches!(
+        connect.kind,
+        wit_parser::FunctionKind::AsyncFreestanding
+    ));
+    assert_eq!(
+        connect
+            .params
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["outgoing"]
     );
 }
 

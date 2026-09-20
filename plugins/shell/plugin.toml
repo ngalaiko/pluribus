@@ -11,7 +11,7 @@ config_schema = "config.schema.json"
 world = "pluribus:plugin/plugin@2.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
-imports = ["pluribus:plugin/runtime@2.0.0", "pluribus:plugin/credentials@2.0.0", "pluribus:plugin/reader@2.0.0", "pluribus:plugin/socket@2.0.0", "pluribus:plugin/writer@2.0.0"]
+imports = ["pluribus:plugin/runtime@2.0.0", "pluribus:plugin/credentials@2.0.0", "pluribus:plugin/socket@2.0.0", "wasi:clocks/monotonic-clock@0.3.0"]
 emits = ["capability.completed", "capability.failed"]
 [[components.main.provides]]
 capability = "shell.execute"

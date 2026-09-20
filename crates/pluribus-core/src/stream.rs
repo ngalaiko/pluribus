@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 
 /// An endpoint a component reaches through an explicit grant.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,46 +39,20 @@ pub enum StreamError {
 /// protocol spoken over the stream.
 #[async_trait::async_trait]
 pub trait StreamService: Send + Sync {
-    /// Connects and authenticates the peer.
+    /// Connects and authenticates the peer. The grant's timeout bounds
+    /// establishment; the connection itself has no idle deadline.
     ///
     /// # Errors
     /// Returns connection, authentication, or limit failures.
     async fn open(&self, grant: &StreamGrant) -> Result<String, StreamError>;
 
-    /// Opens a readiness-driven connection. The timeout bounds connection establishment;
-    /// idle reads have no deadline. The byte budget still bounds each connection.
-    ///
-    /// # Errors
-    /// Returns connection, grant, or unsupported-transport failures.
-    async fn listen(&self, _grant: &StreamGrant) -> Result<String, StreamError> {
-        Err(StreamError::Unavailable(
-            "readiness-driven I/O unsupported".into(),
-        ))
-    }
-
     /// Waits for bytes without polling. Dropping the future cancels the read;
-    /// the caller must close its connection on teardown.
+    /// the caller must close its connection on teardown. Both directions
+    /// draw on the grant's one byte budget.
     ///
     /// # Errors
-    /// Returns transport, byte-budget, or unsupported-operation failures.
-    async fn next(&self, _stream_id: &str, _max_bytes: u32) -> Result<StreamPage, StreamError> {
-        Err(StreamError::Unavailable(
-            "readiness-driven I/O unsupported".into(),
-        ))
-    }
-
-    /// Reads until bytes arrive, the peer closes, the timeout elapses, or the
-    /// call is cancelled.
-    ///
-    /// # Errors
-    /// Returns cancellation, deadline, limit, or transport failures.
-    async fn receive(
-        &self,
-        stream_id: &str,
-        max_bytes: u32,
-        timeout_ms: u32,
-        cancelled: &AtomicBool,
-    ) -> Result<StreamPage, StreamError>;
+    /// Returns transport or byte-budget failures.
+    async fn next(&self, stream_id: &str, max_bytes: u32) -> Result<StreamPage, StreamError>;
 
     /// Writes the whole buffer.
     ///

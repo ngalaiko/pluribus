@@ -1,8 +1,8 @@
-use crate::pluribus::plugin::{
-    socket,
-    types::{Error, ErrorCode, Event, Payload, Proposal},
-};
+use crate::pluribus::plugin::types::{Error, ErrorCode, Event, Payload, Proposal};
 use serde_json::Value;
+
+/// Bound on one listener response.
+const RESPONSE_TIMEOUT_MS: u32 = 2000;
 pub fn error(message: &str) -> Error {
     Error {
         code: ErrorCode::Unavailable,
@@ -26,14 +26,15 @@ pub fn proposal(kind: &str, value: Value, cause: Option<String>) -> Proposal {
         causation_id: cause,
     }
 }
-pub fn exchange(value: Value) -> Result<Value, Error> {
-    let (read, write) = socket::connect()?;
+pub async fn exchange(value: Value) -> Result<Value, Error> {
+    let mut channel = crate::Socket::connect().await?;
     let mut bytes = serde_json::to_vec(&value).unwrap();
     bytes.push(b'\n');
-    write.send(&bytes)?;
+    channel.send(&bytes).await?;
     let mut bytes = Vec::new();
     loop {
-        let chunk = read.receive(64 * 1024, 2000)?;
+        let chunk = channel.read(64 * 1024, Some(RESPONSE_TIMEOUT_MS)).await?;
+        let empty = chunk.bytes.is_empty();
         bytes.extend(chunk.bytes);
         if bytes.len() > 40 * 1024 * 1024 {
             return Err(error("native response exceeds limit"));
@@ -43,6 +44,9 @@ pub fn exchange(value: Value) -> Result<Value, Error> {
         }
         if chunk.closed {
             return Err(error("native peer disconnected"));
+        }
+        if empty {
+            return Err(error("native peer did not respond"));
         }
     }
     let v: Value = serde_json::from_slice(&bytes).map_err(|_| error("invalid native response"))?;

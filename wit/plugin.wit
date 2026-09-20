@@ -54,8 +54,6 @@ world plugin {
   import events;
   import state;
   import blobs;
-  import reader;
-  import writer;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
   import socket;
