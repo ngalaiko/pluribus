@@ -13,6 +13,9 @@ use rsa::{Pkcs1v15Sign, RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs8::Decode
 use serde_json::{Value, json};
 use sha2_10::{Digest, Sha256};
 
+const REFRESH_MARGIN_MS: i64 = 360_000;
+const WEBHOOK_SECRET_TTL_MS: i64 = 600_000;
+
 pub fn load(config: &Config) -> Result<(Option<Vec<u8>>, Value), Error> {
     let bytes = credentials::get(&config.credentials.app)?;
     let value = bytes
@@ -103,23 +106,131 @@ fn api(method: &str, path: &str, token: Option<&str>) -> Result<Value, Error> {
     }
     serde_json::from_slice(&response.body).map_err(|_| error("invalid GitHub response"))
 }
-fn installation(config: &Config, app: &Value, now: i64) -> Result<Value, Error> {
-    let value = api(
-        "GET",
-        &format!("/users/{}/installation", config.owner),
-        Some(&jwt(app, now)?),
-    )?;
-    if value["account"]["type"] != "User"
-        || !value["account"]["login"]
+fn installation_matches(value: &Value, owner: &str, app_id: u64) -> bool {
+    value["app_id"].as_u64() == Some(app_id)
+        && value["suspended_at"].is_null()
+        && matches!(
+            value["account"]["type"].as_str(),
+            Some("User" | "Organization")
+        )
+        && value["account"]["login"]
             .as_str()
-            .is_some_and(|s| s.eq_ignore_ascii_case(&config.owner))
-        || value["repository_selection"] != "all"
-        || !value["suspended_at"].is_null()
-        || value["app_id"] != app["id"]
-    {
-        return Err(error("App must be installed on all personal repositories"));
+            .is_some_and(|login| login.eq_ignore_ascii_case(owner))
+}
+
+fn installation(config: &Config, app: &Value, now: i64) -> Result<Value, Error> {
+    let app_id = app["id"].as_u64().ok_or_else(|| error("invalid App ID"))?;
+    let token = jwt(app, now)?;
+    for page in 1..=100 {
+        let value = api(
+            "GET",
+            &format!("/app/installations?per_page=100&page={page}"),
+            Some(&token),
+        )?;
+        let installations = value
+            .as_array()
+            .ok_or_else(|| error("invalid GitHub installations response"))?;
+        if let Some(install) = installations
+            .iter()
+            .find(|value| installation_matches(value, &config.owner, app_id))
+        {
+            return Ok(install.clone());
+        }
+        if installations.len() < 100 {
+            break;
+        }
     }
-    Ok(value)
+    Err(error("App is not installed for the configured owner"))
+}
+
+fn token_expiry(token: &Value) -> Result<i64, Error> {
+    Ok(time::OffsetDateTime::parse(
+        token["expires_at"].as_str().unwrap_or(""),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| error("invalid token expiry"))?
+    .unix_timestamp()
+        * 1000)
+}
+
+fn make_exports(app: &Value, token: &Value, now: i64) -> Result<Value, Error> {
+    let expires = token_expiry(token)?;
+    let value = token["token"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| error("missing installation token"))?;
+    let secret = app["webhook_secret"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| error("missing webhook secret"))?;
+    if expires <= now + REFRESH_MARGIN_MS {
+        return Err(error("installation token expires too soon"));
+    }
+    Ok(json!({
+        "installation-token": {"value": value, "expires_at_ms": expires},
+        "webhook-secret": {"value": secret, "expires_at_ms": now + WEBHOOK_SECRET_TTL_MS}
+    }))
+}
+
+fn cached_exports(app: &Value, exports: &Value, now: i64) -> Result<Option<Value>, Error> {
+    let token = &exports["installation-token"];
+    let token_value = token["value"].as_str().filter(|value| !value.is_empty());
+    let token_expiry = token["expires_at_ms"].as_i64().unwrap_or(0);
+    if token_value.is_none() || token_expiry <= now + REFRESH_MARGIN_MS {
+        return Ok(None);
+    }
+    let secret = app["webhook_secret"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| error("missing webhook secret"))?;
+    let current_secret = &exports["webhook-secret"];
+    if current_secret["value"].as_str() == Some(secret)
+        && current_secret["expires_at_ms"]
+            .as_i64()
+            .is_some_and(|expires| expires > now + REFRESH_MARGIN_MS)
+    {
+        return Ok(Some(exports.clone()));
+    }
+    Ok(Some(json!({
+        "installation-token": {"value": token_value.unwrap(), "expires_at_ms": token_expiry},
+        "webhook-secret": {"value": secret, "expires_at_ms": now + WEBHOOK_SECRET_TTL_MS}
+    })))
+}
+
+fn cache_matches_installation(doc: &Value, installation_id: u64) -> bool {
+    doc["installation_id"].as_u64() == Some(installation_id)
+}
+
+fn clear_installation(doc: &mut Value) {
+    doc["installation_id"] = Value::Null;
+    doc["exports"] = json!({});
+}
+
+fn repository_response_matches(repository_id: u64, repository: &Value) -> bool {
+    repository["id"].as_u64() == Some(repository_id)
+}
+
+pub fn authorize_repository(repository_id: u64, token: &str) -> Result<bool, Error> {
+    for page in 1..=1000 {
+        let value = api(
+            "GET",
+            &format!("/installation/repositories?per_page=100&page={page}"),
+            Some(token),
+        )?;
+        let repositories = value["repositories"]
+            .as_array()
+            .ok_or_else(|| error("invalid GitHub repositories response"))?;
+        if repositories
+            .iter()
+            .any(|repository| repository_response_matches(repository_id, repository))
+        {
+            return Ok(true);
+        }
+        if repositories.len() < 100 {
+            return Ok(false);
+        }
+    }
+    Err(error("GitHub repositories pagination exceeded limit"))
 }
 pub fn refresh(config: &Config, now: i64) -> Result<(), Error> {
     let (previous, mut doc) = load(config)?;
@@ -128,43 +239,25 @@ pub fn refresh(config: &Config, now: i64) -> Result<(), Error> {
     }
     let result = (|| {
         let install = installation(config, &doc["app"], now)?;
-        doc["installation_id"] = install["id"].clone();
-        if doc["exports"]["installation-token"]["expires_at_ms"]
-            .as_i64()
-            .unwrap_or(0)
-            > now + 360000
-        {
+        let installation_id = install["id"]
+            .as_u64()
+            .ok_or_else(|| error("invalid installation"))?;
+        let cache_matches = cache_matches_installation(&doc, installation_id);
+        doc["installation_id"] = json!(installation_id);
+        if cache_matches && let Some(exports) = cached_exports(&doc["app"], &doc["exports"], now)? {
+            doc["exports"] = exports;
             return Ok(());
         }
         let token = api(
             "POST",
-            &format!(
-                "/app/installations/{}/access_tokens",
-                install["id"]
-                    .as_u64()
-                    .ok_or_else(|| error("invalid installation"))?
-            ),
+            &format!("/app/installations/{}/access_tokens", installation_id),
             Some(&jwt(&doc["app"], now)?),
         )?;
-        let expires = time::OffsetDateTime::parse(
-            token["expires_at"].as_str().unwrap_or(""),
-            &time::format_description::well_known::Rfc3339,
-        )
-        .map_err(|_| error("invalid token expiry"))?
-        .unix_timestamp()
-            * 1000;
-        let value = token["token"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| error("missing installation token"))?;
-        if expires <= now + 360000 {
-            return Err(error("installation token expires too soon"));
-        }
-        doc["exports"] = json!({"installation-token":{"value":value,"expires_at_ms":expires}});
+        doc["exports"] = make_exports(&doc["app"], &token, now)?;
         Ok(())
     })();
     if result.is_err() {
-        doc["exports"] = json!({});
+        clear_installation(&mut doc);
     }
     save(config, previous.as_deref(), &doc)?;
     result
@@ -217,16 +310,6 @@ pub fn enroll(config: &Config, now: i64, enrollment_id: &str) -> Result<String, 
     }
     let result = app_from_input(&doc["enrollment"]["input"], now, |token| {
         api("GET", "/app", Some(token))
-    })
-    .and_then(|app| {
-        if app["owner"]["type"] != "User"
-            || !app["owner"]["login"]
-                .as_str()
-                .is_some_and(|owner| owner.eq_ignore_ascii_case(&config.owner))
-        {
-            return Err(error("App owner mismatch"));
-        }
-        Ok(app)
     });
     doc.as_object_mut()
         .ok_or_else(|| error("invalid credential record"))?
@@ -269,6 +352,16 @@ mod tests {
         assert_eq!(app["id"], 7);
         assert_eq!(app["slug"], "fixture");
         assert_eq!(app["webhook_secret"], "fixture-secret");
+        let other_owner = json!({
+            "app_id":"7",
+            "private_key":include_str!("../tests/fixtures/test-app.pem"),
+            "webhook_secret":"fixture-secret"
+        });
+        let app = app_from_input(&other_owner, 1_000_000, |_| {
+            Ok(json!({"id":7,"slug":"fixture","owner":{"type":"User","login":"publisher"}}))
+        })
+        .unwrap();
+        assert_eq!(app["owner"]["login"], "publisher");
         assert!(app_from_input(&input, 1_000_000, |_| Ok(json!({"id":8,"slug":"other"}))).is_err());
         let mut bad = input;
         bad["private_key"] = json!("invalid-secret-key");
@@ -315,5 +408,83 @@ mod tests {
                 &URL_SAFE_NO_PAD.decode(parts[2]).unwrap(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn exports_include_a_renewable_webhook_secret() {
+        let app = json!({"webhook_secret":"fixture-secret"});
+        let token = json!({"token":"ghs_fixture","expires_at":"1970-01-01T00:30:00Z"});
+        let exports = make_exports(&app, &token, 1_000_000).unwrap();
+        assert_eq!(exports["installation-token"]["value"], "ghs_fixture");
+        assert_eq!(exports["installation-token"]["expires_at_ms"], 1_800_000);
+        assert_eq!(exports["webhook-secret"]["value"], "fixture-secret");
+        assert_eq!(exports["webhook-secret"]["expires_at_ms"], 1_600_000);
+    }
+
+    #[test]
+    fn cached_token_backfills_missing_webhook_secret_export() {
+        let app = json!({"webhook_secret":"fixture-secret"});
+        let current = json!({
+            "installation-token":{"value":"ghs_fixture","expires_at_ms":1_800_000}
+        });
+        let exports = cached_exports(&app, &current, 1_000_000).unwrap().unwrap();
+        assert_eq!(exports["webhook-secret"]["value"], "fixture-secret");
+    }
+
+    #[test]
+    fn cached_token_at_refresh_margin_is_not_reused() {
+        let app = json!({"webhook_secret":"fixture-secret"});
+        let current = json!({
+            "installation-token":{"value":"ghs_fixture","expires_at_ms":1_360_000},
+            "webhook-secret":{"value":"fixture-secret","expires_at_ms":1_800_000}
+        });
+        assert!(cached_exports(&app, &current, 1_000_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn inaccessible_installation_clears_id_and_exports() {
+        let mut doc = json!({
+            "installation_id":9,
+            "exports":{"installation-token":{"value":"ghs_fixture"},"webhook-secret":{"value":"secret"}}
+        });
+        clear_installation(&mut doc);
+        assert!(doc["installation_id"].is_null());
+        assert_eq!(doc["exports"], json!({}));
+    }
+
+    #[test]
+    fn cached_exports_are_bound_to_the_current_installation() {
+        let doc = json!({"installation_id":9});
+        assert!(cache_matches_installation(&doc, 9));
+        assert!(!cache_matches_installation(&doc, 10));
+    }
+
+    #[test]
+    fn installation_selection_accepts_users_orgs_and_selected_repositories() {
+        assert!(installation_matches(
+            &json!({"id":1,"app_id":7,"account":{"login":"me","type":"User"},"repository_selection":"all","suspended_at":null}),
+            "me",
+            7
+        ));
+        assert!(installation_matches(
+            &json!({"id":2,"app_id":7,"account":{"login":"acme","type":"Organization"},"repository_selection":"selected","suspended_at":null}),
+            "acme",
+            7
+        ));
+        assert!(!installation_matches(
+            &json!({"id":3,"app_id":8,"account":{"login":"acme","type":"Organization"},"repository_selection":"selected","suspended_at":null}),
+            "acme",
+            7
+        ));
+    }
+
+    #[test]
+    fn repository_authorization_requires_the_requested_id() {
+        assert!(repository_response_matches(42, &json!({"id":42})));
+        assert!(!repository_response_matches(42, &json!({"id":43})));
+        assert!(!repository_response_matches(
+            42,
+            &json!({"full_name":"acme/repo"})
+        ));
     }
 }

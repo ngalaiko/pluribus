@@ -205,18 +205,53 @@ fn normalize(
     if !auth::verify(secret, &sig, &bytes) {
         return Ok((401, None));
     }
-    let verified = json!({"appId":doc["app"]["id"],"installationId":doc["installation_id"]});
     let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
         return Ok((400, None));
     };
+    let app_lifecycle = kind == "installation" || kind.starts_with("installation_");
+    let mut repository_authorized = false;
+    if !app_lifecycle && body["repository"].is_object() {
+        let Some(repository_id) = body["repository"]["id"].as_u64().filter(|id| *id > 0) else {
+            return Ok((403, None));
+        };
+        let Some(token) = doc["exports"]["installation-token"]["value"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+        else {
+            return Ok((503, None));
+        };
+        if doc["installation_id"].as_u64().is_none()
+            || doc["exports"]["installation-token"]["expires_at_ms"]
+                .as_i64()
+                .is_none_or(|expires| expires <= now_ms() + 30_000)
+        {
+            return Ok((503, None));
+        }
+        match auth::authorize_repository(repository_id, token) {
+            Ok(true) => repository_authorized = true,
+            Ok(false) => return Ok((403, None)),
+            Err(_) => return Ok((503, None)),
+        }
+    }
+    let verified = json!({
+        "appId":doc["app"]["id"],
+        "installationId":doc["installation_id"],
+        "repositoryAuthorized":repository_authorized
+    });
     if !admitted(&body, &kind, &config.owner, &verified) {
         return Ok((403, None));
     }
-    if kind.starts_with("installation") {
+    if app_lifecycle {
+        if body["installation"]["id"].as_u64().is_none_or(|id| id == 0) {
+            return Ok((403, None));
+        }
         if matches!(body["action"].as_str(), Some("deleted" | "suspend")) {
             doc["installation_id"] = Value::Null;
             doc["exports"] = json!({});
         } else {
+            if doc["installation_id"] != body["installation"]["id"] {
+                doc["exports"] = json!({});
+            }
             doc["installation_id"] = body["installation"]["id"].clone();
         }
         auth::save(config, previous.as_deref(), &doc)?;
@@ -278,18 +313,57 @@ fn admitted(body: &Value, kind: &str, owner: &str, verified: &Value) -> bool {
         v["login"]
             .as_str()
             .is_some_and(|s| s.eq_ignore_ascii_case(owner))
-            && v["type"] == "User"
+            && matches!(v["type"].as_str(), Some("User" | "Organization"))
+    };
+    let repository_matches = || {
+        if body["repository"]["id"].as_u64().is_none_or(|id| id == 0) {
+            return false;
+        }
+        verified["repositoryAuthorized"] == true
+            && owns(&body["repository"]["owner"])
+            && match body.get("installation") {
+                None | Some(Value::Null) => true,
+                Some(Value::Object(installation)) => match installation.get("id") {
+                    None => true,
+                    Some(id) => verified["installationId"].as_u64() == id.as_u64(),
+                },
+                Some(_) => false,
+            }
     };
     if kind == "ping" {
-        return body["hook"].is_object() && body["hook_id"].as_u64().is_some();
+        if !body["hook"].is_object() || body["hook_id"].as_u64().is_none() {
+            return false;
+        }
+        return if body["repository"].is_object() {
+            repository_matches()
+        } else {
+            let app_id = body["app_id"]
+                .as_u64()
+                .or_else(|| body["hook"]["app_id"].as_u64())
+                .or_else(|| body["installation"]["app_id"].as_u64());
+            let app_hook = body["hook"]["type"] == "App";
+            let app_id_matches = app_id.map_or(app_hook, |id| {
+                app_hook && verified["appId"].as_u64() == Some(id)
+            });
+            let installation_matches = match body.get("installation") {
+                None | Some(Value::Null) => true,
+                Some(Value::Object(installation)) => {
+                    let account_matches = installation.get("account").is_none_or(&owns);
+                    let id_matches = installation
+                        .get("id")
+                        .is_none_or(|id| verified["installationId"].as_u64() == id.as_u64());
+                    account_matches && id_matches
+                }
+                Some(_) => false,
+            };
+            app_id_matches && installation_matches
+        };
     }
-    if kind.starts_with("installation") {
+    if kind == "installation" || kind.starts_with("installation_") {
         return owns(&body["installation"]["account"])
             && body["installation"]["app_id"] == verified["appId"];
     }
-    owns(&body["repository"]["owner"])
-        && verified["installationId"].as_u64().is_some()
-        && body["installation"]["id"] == verified["installationId"]
+    repository_matches()
 }
 #[cfg(test)]
 mod tests {
@@ -301,13 +375,53 @@ mod tests {
     }
     #[test]
     fn wrong_owner_and_installation_are_rejected() {
-        let v = json!({"appId":7,"installationId":9});
-        let mut b =
-            json!({"repository":{"owner":{"login":"me","type":"User"}},"installation":{"id":9}});
+        let v = json!({"appId":7,"installationId":9,"repositoryAuthorized":true});
+        let mut b = json!({"repository":{"id":42,"owner":{"login":"me","type":"User"}},"installation":{"id":9}});
         assert!(admitted(&b, "push", "me", &v));
         b["installation"]["id"] = json!(10);
         assert!(!admitted(&b, "push", "me", &v));
         assert!(!admitted(&b, "push", "other", &v));
+    }
+
+    #[test]
+    fn repository_hooks_use_authorized_repository_without_installation() {
+        let v = json!({"appId":7,"installationId":9,"repositoryAuthorized":true});
+        let b = json!({"repository":{"id":42,"owner":{"login":"org","type":"Organization"}}});
+        assert!(admitted(&b, "push", "org", &v));
+    }
+
+    #[test]
+    fn repository_hooks_reject_unknown_repository() {
+        let v = json!({"appId":7,"installationId":9,"repositoryAuthorized":false});
+        let b = json!({"repository":{"id":43,"owner":{"login":"org","type":"Organization"}}});
+        assert!(!admitted(&b, "push", "org", &v));
+    }
+
+    #[test]
+    fn app_lifecycle_hooks_require_app_and_installation_account() {
+        let v = json!({"appId":7,"installationId":9,"repositoryAuthorized":false});
+        let b =
+            json!({"installation":{"app_id":7,"account":{"login":"org","type":"Organization"}}});
+        assert!(admitted(&b, "installation", "org", &v));
+        let mut wrong = b.clone();
+        wrong["installation"]["app_id"] = json!(8);
+        assert!(!admitted(&wrong, "installation", "org", &v));
+    }
+
+    #[test]
+    fn pings_are_scoped_to_app_or_repository() {
+        let v = json!({"appId":7,"installationId":9,"repositoryAuthorized":true});
+        let app = json!({"installation":{"id":9,"account":{"login":"org","type":"Organization"}},"hook":{"type":"App"},"hook_id":1});
+        assert!(admitted(&app, "ping", "org", &v));
+        let app_without_installation = json!({"hook":{"type":"App"},"hook_id":1});
+        assert!(admitted(&app_without_installation, "ping", "org", &v));
+        let repo = json!({"repository":{"id":42,"owner":{"login":"org","type":"Organization"}},"hook":{},"hook_id":1});
+        assert!(admitted(&repo, "ping", "org", &v));
+        let mut malformed = repo.clone();
+        malformed["installation"] = json!("invalid");
+        assert!(!admitted(&malformed, "ping", "org", &v));
+        let unknown = json!({"hook":{},"hook_id":1});
+        assert!(!admitted(&unknown, "ping", "org", &v));
     }
 }
 export!(Github);

@@ -17,7 +17,7 @@ emits = ["observation.received", "http.response.requested", "timer.set", "creden
 [[components.receive.requested_capabilities]]
 name = "net.http"
 required = true
-reason = "Register the App and refresh installation tokens"
+reason = "Validate the App, refresh installation tokens, and check repository access"
 constraints = { origins = ["https://api.github.com"], methods = ["GET", "POST"] }
 
 [[credentials]]
@@ -25,7 +25,7 @@ components = ["receive"]
 id = "app"
 access = true
 display_name = "GitHub App"
-description = "Enroll a private GitHub App for personal repositories"
+description = "Enroll a GitHub App for a user or organization installation"
 input_schema = "credential.input.json"
 flow_schema = "pluribus:credential/plugin@1"
 flow = "app.flow.json"

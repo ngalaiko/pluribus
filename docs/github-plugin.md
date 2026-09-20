@@ -19,8 +19,19 @@ Enrollment:
 enrollment reference → GitHub Wasm validates App → installation approval URL.
 
 Shell authentication:
-GitHub Wasm refreshes an installation token → core credential storage →
-shell Wasm resolves `GH_TOKEN` → executor socket → command environment → `gh`.
+GitHub Wasm refreshes an installation token and exposes the webhook secret →
+core credential storage → shell Wasm resolves `GH_TOKEN` and
+`GITHUB_WEBHOOK_SECRET` → executor socket → command environment → `gh`.
+
+Repository setup uses the same `/events` URL as App deliveries. `gh` lists
+hooks with `--paginate`, updates the hook whose URL matches the configured
+receiver, or creates it. It sends `GITHUB_WEBHOOK_SECRET` through stdin via
+`config[secret]=@-`; the value must not appear in arguments, output, or logs.
+The installation token needs repository hooks write access. User and
+organization installations are supported, including selected repositories.
+After each upsert, ping the hook and verify its delivery. Check existing App
+subscriptions first because overlapping event subscriptions can duplicate
+deliveries.
 
 See [GitHub](../plugins/github/README.md), [HTTP](../plugins/http/README.md),
 and [credentials](plugins/credentials.md) for configuration and contracts.

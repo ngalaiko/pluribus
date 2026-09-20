@@ -31,3 +31,4 @@ reqwest.workspace = true
 pluribus-core = { path = "../../crates/pluribus-core" }
 pluribus-host-stream = { path = "../../crates/pluribus-host-stream" }
 tempfile.workspace = true
+async-trait.workspace = true
