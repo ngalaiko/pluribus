@@ -1079,7 +1079,81 @@ async fn packaged_history_filters_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn packaged_missing_checkpoint_reports_session_loss_before_executing_source() {
+async fn packaged_history_search_recovers_old_evidence_and_exhausts_pages() {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(
+            AtomicU64::new(1),
+            Arc::new(AtomicI64::new(1_700_000_000_000)),
+        ))
+        .await
+        .unwrap(),
+    );
+    let mut expected = Vec::new();
+    for index in 0..12 {
+        let conversation = if index % 2 == 0 {
+            "chat:1"
+        } else {
+            "chat:other"
+        };
+        let event = append(&store, "test.history", &json!({
+            "conversationId":conversation,"message":{"text":format!("deployment decision {index}")}
+        })).await;
+        if index % 2 == 0 {
+            expected.push(event.sequence);
+        }
+    }
+    expected.reverse();
+    let mut agent = persistent_agent(&store).await;
+    observation(
+        &store,
+        json!({"message":{"text":"Recover earlier deployment decisions"}}),
+    )
+    .await;
+    drive(&mut agent, 1).await;
+    scripted(&store, &model_requests(&store).await[0], json!([
+        {"kind":"tool-call","name":"js","call_id":"search","arguments":{"code":
+            r"
+            for (const args of [{query:'x'.repeat(4097)}, {query:''}, {query:'x',limit:0}, {query:'x',before:-1}, {query:'x',recordedFromMs:2,recordedToMs:1}]) {
+                let rejected=false;
+                try { await history.search(args); } catch { rejected=true; }
+                if (!rejected) throw Error('invalid search accepted');
+            }
+            const found=[]; let before;
+            for (let pageNumber=0; pageNumber<10; pageNumber++) {
+                const page=await history.search({query:'deployment',conversationId:'chat:1',eventTypes:['test.history'],limit:2,...(before===undefined?{}:{before})});
+                found.push(...page.events.map(event=>event.sequence));
+                if (page.nextBefore===null) return {found,exhausted:true};
+                if (page.nextBefore===before) throw Error('search cursor did not advance');
+                before=page.nextBefore;
+            }
+            throw Error('search did not exhaust');
+            "
+        }}
+    ])).await;
+    drive(&mut agent, 1).await;
+    let events = store
+        .read(&StreamId::new("personal"), 0, 10000)
+        .await
+        .unwrap();
+    let done = events
+        .iter()
+        .find(|event| event.request.event_type == "code.completed");
+    assert!(
+        done.is_some(),
+        "history.search must finish with a terminal cursor"
+    );
+    assert_eq!(
+        payload(done.unwrap())["value"],
+        json!({"found":expected,"exhausted":true})
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event.request.event_type.as_str(),
+        "code.failed" | "component.failed"
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packaged_automatic_checkpoint_restores_state_after_restart() {
     let store = Arc::new(
         SqliteEventStore::open_in_memory(Metadata(
             AtomicU64::new(1),
@@ -1106,23 +1180,71 @@ async fn packaged_missing_checkpoint_reports_session_loss_before_executing_sourc
         json!([{"kind":"tool-call","name":"js","call_id":"restore","arguments":{"code":"return state.n;"}}]),
     ).await;
     drive(&mut agent, 1).await;
-    assert!(
-        store
-            .read(&StreamId::new("personal"), 0, 10000)
-            .await
-            .unwrap()
+    let events = store
+        .read(&StreamId::new("personal"), 0, 10000)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
             .iter()
-            .any(|e| e.request.event_type == "code.failed"
-                && payload(e)["reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.contains("session was lost")))
+            .filter(|e| e.request.event_type == "code.completed" && payload(e)["value"] == 42)
+            .count(),
+        2,
+        "state must survive restart without an explicit checkpoint"
     );
+    assert!(!events.iter().any(|e| e.request.event_type == "code.failed"));
 }
 
 fn yield_control(arguments: Value) -> Value {
     let mut content = json!([{"kind":"tool-call","name":"yield","call_id":"decision"}]);
     content[0]["arguments"] = arguments;
     content
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packaged_unsaved_state_prevents_execution_after_restart() {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(
+            AtomicU64::new(1),
+            Arc::new(AtomicI64::new(1_700_000_000_000)),
+        ))
+        .await
+        .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    observation(&store, json!({})).await;
+    drive(&mut agent, 1).await;
+    scripted(&store, &model_requests(&store).await[0], json!([
+        {"kind":"tool-call","name":"js","call_id":"save","arguments":{"code":"state.n=1; return 1;"}}
+    ])).await;
+    drive(&mut agent, 1).await;
+    scripted(&store, &model_requests(&store).await.pop().unwrap(), json!([
+        {"kind":"tool-call","name":"js","call_id":"invalidate","arguments":{"code":"state.n=2; state.callback=()=>42; return 42;"}}
+    ])).await;
+    drive(&mut agent, 1).await;
+    let next = model_requests(&store).await.pop().unwrap();
+    drop(agent);
+    let mut agent = persistent_agent(&store).await;
+    scripted(&store, &next, json!([
+        {"kind":"tool-call","name":"js","call_id":"restore","arguments":{"code":"await capabilities.invoke('system.echo',{text:'must not run'}); return 42;"}}
+    ])).await;
+    drive(&mut agent, 1).await;
+    let events = store
+        .read(&StreamId::new("personal"), 0, 10000)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|e| {
+        e.request.event_type == "code.failed"
+            && payload(e)["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("session was lost"))
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.request.event_type == "capability.requested"
+                && payload(e)["capability"] == "system.echo")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

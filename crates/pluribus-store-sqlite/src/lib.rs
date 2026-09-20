@@ -124,6 +124,16 @@ const DELIVERY_SCHEMA: &str = "
         ON events(stream_id, recorded_at_ms, sequence);
 ";
 
+const EVENT_SEARCH_SCHEMA: &str = "
+    CREATE VIRTUAL TABLE event_search USING fts5(
+        event_id UNINDEXED,
+        stream_id UNINDEXED,
+        event_type,
+        payload_text,
+        tokenize = 'unicode61'
+    );
+";
+
 const CREDENTIAL_SCHEMA: &str = "
     CREATE TABLE http_credentials (
         handle TEXT PRIMARY KEY CHECK (handle <> ''),
@@ -252,7 +262,7 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
             let version: i64 = connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(storage)?;
-            if version != 9 {
+            if !(9..=10).contains(&version) {
                 return Err(storage("unsupported snapshot schema version"));
             }
             for query in [
@@ -267,6 +277,11 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                 "SELECT sequence,handle,outcome FROM credential_lifecycle LIMIT 0",
             ] {
                 connection.prepare(query).map_err(storage)?;
+            }
+            if version >= 10 {
+                connection
+                    .prepare("SELECT event_id,stream_id FROM event_search LIMIT 0")
+                    .map_err(storage)?;
             }
             let result: String = connection
                 .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -400,7 +415,7 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                     "BEGIN IMMEDIATE; {DELIVERY_SCHEMA} PRAGMA user_version=6; COMMIT;"
                 ))
                 .map_err(storage)?,
-            6..=9 => {}
+            6..=10 => {}
             version => {
                 return Err(AppendError::Storage(format!(
                     "unsupported SQLite schema version: {version}"
@@ -425,6 +440,18 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                 connection.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE plugin_credentials (handle TEXT NOT NULL, provider TEXT NOT NULL, value BLOB NOT NULL, PRIMARY KEY(handle,provider));
                 PRAGMA user_version=9; COMMIT;").map_err(storage)?;
+            }
+            if version < 10 {
+                connection.execute_batch(&format!("BEGIN IMMEDIATE;
+                {EVENT_SEARCH_SCHEMA}
+                INSERT INTO event_search (event_id, stream_id, event_type, payload_text)
+                    SELECT event_id, stream_id, event_type,
+                        CASE WHEN payload_kind = 0
+                                  AND event_type NOT IN ('cognition.checkpoint', 'cognition.job-updated')
+                             THEN substr(CAST(payload_json AS TEXT), 1, 8192)
+                             ELSE '' END
+                    FROM events;
+                PRAGMA user_version=10; COMMIT;")).map_err(storage)?;
             }
             Ok(())
         };
@@ -1138,6 +1165,13 @@ impl<M: EventMetadataSource + 'static> EventStore for SqliteEventStore<M> {
                 conditions.push("sequence > ?".to_owned());
                 binds.push(Value::Integer(after));
             }
+            if let Some(before) = query.before_sequence {
+                let Ok(before) = i64::try_from(before) else {
+                    return Ok(Vec::new());
+                };
+                conditions.push("sequence < ?".to_owned());
+                binds.push(Value::Integer(before));
+            }
             if !query.event_types.is_empty() {
                 let placeholders = vec!["?"; query.event_types.len()].join(", ");
                 conditions.push(format!("event_type IN ({placeholders})"));
@@ -1161,12 +1195,27 @@ impl<M: EventMetadataSource + 'static> EventStore for SqliteEventStore<M> {
                 conditions.push("recorded_at_ms <= ?".to_owned());
                 binds.push(Value::Integer(to));
             }
+            if let Some(text) = &query.text_query {
+                let Some(text) = literal_search_query(text) else {
+                    return Ok(Vec::new());
+                };
+                conditions.push(
+                    "event_id IN (SELECT event_id FROM event_search WHERE event_search MATCH ?)"
+                        .to_owned(),
+                );
+                binds.push(Value::Text(text));
+            }
             binds.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
 
+            let order = if query.descending {
+                "sequence DESC"
+            } else {
+                "sequence ASC"
+            };
             let sql = format!(
                 "SELECT {EVENT_COLUMNS} FROM events
              WHERE {}
-             ORDER BY sequence ASC
+             ORDER BY {order}
              LIMIT ?",
                 conditions.join(" AND ")
             );
@@ -1380,6 +1429,19 @@ fn insert_event(
             ],
         )
         .map_err(storage)?;
+    let payload_text = searchable_payload_text(request);
+    transaction
+        .execute(
+            "INSERT INTO event_search (event_id, stream_id, event_type, payload_text)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                event_id.as_str(),
+                request.stream_id.as_str(),
+                request.event_type,
+                payload_text
+            ],
+        )
+        .map_err(storage)?;
     transaction
         .execute(
             "UPDATE streams SET next_sequence = ?2 WHERE stream_id = ?1",
@@ -1387,6 +1449,19 @@ fn insert_event(
         )
         .map_err(storage)?;
     Ok(())
+}
+
+fn searchable_payload_text(request: &AppendRequest) -> String {
+    if matches!(
+        request.event_type.as_str(),
+        "cognition.checkpoint" | "cognition.job-updated"
+    ) {
+        return String::new();
+    }
+    let EventPayload::CanonicalJson(bytes) = &request.payload else {
+        return String::new();
+    };
+    String::from_utf8_lossy(bytes).chars().take(8192).collect()
 }
 
 type EncodedPayload<'a> = (
@@ -1408,6 +1483,28 @@ fn encode_payload(payload: &EventPayload) -> EncodedPayload<'_> {
             Some(&blob.media_type),
         ),
     }
+}
+
+fn literal_search_query(input: &str) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for character in input.chars() {
+        if character.is_alphanumeric() || character == '_' {
+            token.push(character);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    (!tokens.is_empty()).then(|| {
+        tokens
+            .into_iter()
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    })
 }
 
 fn decode_event(row: &Row<'_>) -> rusqlite::Result<CommittedEvent> {
@@ -2171,6 +2268,121 @@ mod tests {
         assert!(out_of_range.is_empty());
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn query_searches_payload_text_and_pages_newest_first() {
+        let store = SqliteEventStore::open_in_memory(Metadata::new("event", 1))
+            .await
+            .unwrap();
+        let mut first = request("personal", None);
+        first.payload = EventPayload::CanonicalJson(br#"{"message":"older match"}"#.to_vec());
+        store.append(first).await.unwrap();
+        let mut second = request("personal", None);
+        second.payload = EventPayload::CanonicalJson(br#"{"message":"newer match"}"#.to_vec());
+        store.append(second).await.unwrap();
+        let mut unrelated = request("personal", None);
+        unrelated.payload = EventPayload::CanonicalJson(br#"{"message":"other"}"#.to_vec());
+        store.append(unrelated).await.unwrap();
+
+        let newest = store
+            .query(
+                &StreamId::new("personal"),
+                &EventQuery {
+                    text_query: Some("match".into()),
+                    descending: true,
+                    ..EventQuery::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].sequence, 2);
+
+        let older = store
+            .query(
+                &StreamId::new("personal"),
+                &EventQuery {
+                    text_query: Some("match".into()),
+                    descending: true,
+                    before_sequence: Some(newest[0].sequence),
+                    ..EventQuery::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(older.iter().map(|e| e.sequence).collect::<Vec<_>>(), [1]);
+    }
+
+    #[tokio::test]
+    async fn query_search_treats_fts_syntax_as_literal_text() {
+        let store = SqliteEventStore::open_in_memory(Metadata::new("event", 1))
+            .await
+            .unwrap();
+        let mut event = request("personal", None);
+        event.payload = EventPayload::CanonicalJson(br#"{"message":"a+b"}"#.to_vec());
+        store.append(event).await.unwrap();
+        let result = store
+            .query(
+                &StreamId::new("personal"),
+                &EventQuery {
+                    text_query: Some("a+b OR NOT (broken)".into()),
+                    ..EventQuery::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_nine_search_migration_matches_new_event_projection() {
+        let path = temporary_database_path("history-search-migration");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "{EVENT_SCHEMA} {STATE_SCHEMA} {CREDENTIAL_SCHEMA} {DELIVERY_SCHEMA}
+                 INSERT INTO streams VALUES ('personal', 0, 2);
+                 INSERT INTO events VALUES
+                 ('pluribus.event/1', 'old-event', 'personal', 0, 1, 123, NULL,
+                  'observation.received', 'test/1', 0,
+                  X'7B226D657373616765223A2276C3A46C6B6F6D6D656E227D', NULL, NULL, NULL,
+                  0, 'telegram', NULL, NULL, NULL, NULL, NULL);
+                 PRAGMA user_version=9;"
+            ))
+            .unwrap();
+        drop(connection);
+
+        let store = SqliteEventStore::open(&path, Metadata::new("event", 2))
+            .await
+            .unwrap();
+        let mut fresh = request("personal", None);
+        fresh.payload =
+            EventPayload::CanonicalJson(r#"{"message":"välkommen"}"#.as_bytes().to_vec());
+        store.append(fresh).await.unwrap();
+        let matches = store
+            .query(
+                &StreamId::new("personal"),
+                &EventQuery {
+                    text_query: Some("välkommen".into()),
+                    ..EventQuery::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        drop(store);
+        remove_database(&path);
     }
 
     #[tokio::test]
@@ -3315,7 +3527,7 @@ mod tests {
                     .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)))
                 .await
                 .unwrap(),
-            9
+            10
         );
         drop(store);
         remove_database(&path);
@@ -3325,7 +3537,7 @@ mod tests {
     async fn unknown_schema_version_is_rejected() {
         let path = temporary_database_path("future-schema");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 10).unwrap();
+        connection.pragma_update(None, "user_version", 11).unwrap();
         drop(connection);
 
         let result = SqliteEventStore::open(&path, Metadata::new("event", 1)).await;
@@ -3333,7 +3545,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(AppendError::Storage(message))
-                if message == "unsupported SQLite schema version: 10"
+                if message == "unsupported SQLite schema version: 11"
         ));
         remove_database(&path);
     }

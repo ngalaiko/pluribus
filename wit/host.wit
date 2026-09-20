@@ -1,4 +1,4 @@
-package pluribus:plugin@2.0.0;
+package pluribus:plugin@3.0.0;
 
 /// The coordination contract. Every decision, request, and result is an
 /// event. Plugins do not call each other; they answer request events and
@@ -6,8 +6,8 @@ package pluribus:plugin@2.0.0;
 interface events {
   use types.{error, event, proposal};
 
-  /// Filter over the current agent stream. An empty or absent field does
-  /// not constrain.
+  /// Filter over the current agent stream. Absent optional fields and empty
+  /// event-types do not constrain. Empty text-query matches nothing.
   record filter {
     after-sequence: option<u64>,
     event-types: list<string>,
@@ -15,6 +15,10 @@ interface events {
     activity-id: option<string>,
     recorded-from-ms: option<s64>,
     recorded-to-ms: option<s64>,
+    text-query: option<string>,
+    before-sequence: option<u64>,
+    conversation-id: option<string>,
+    descending: bool,
   }
 
   record page {
@@ -40,8 +44,9 @@ interface events {
 
   get: func(event-id: string) -> result<event, error>;
 
-  /// Returns matching events in ascending sequence order. Visibility and
-  /// grants may withhold events or their payloads.
+  /// Returns matching events in sequence order, descending when requested.
+  /// Optional text search uses the source index. Visibility and grants may
+  /// withhold events or their payloads.
   query: func(filter: filter, limit: u32) -> result<page, error>;
 }
 

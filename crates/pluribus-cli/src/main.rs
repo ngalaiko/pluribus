@@ -410,6 +410,7 @@ async fn enroll(
                         activity_id: None,
                         recorded_from_ms: None,
                         recorded_to_ms: None,
+                        ..pluribus_core::EventQuery::default()
                     },
                     100,
                 )

@@ -1,4 +1,4 @@
-package pluribus:plugin@2.0.0;
+package pluribus:plugin@3.0.0;
 
 /// Values shared by the host imports and the plugin export.
 interface types {

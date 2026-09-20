@@ -1,4 +1,4 @@
-package pluribus:plugin@2.0.0;
+package pluribus:plugin@3.0.0;
 
 /// Shared lifecycle for all component roles, described by their manifests.
 interface lifecycle {
@@ -61,4 +61,3 @@ world plugin {
 
   export lifecycle;
 }
-

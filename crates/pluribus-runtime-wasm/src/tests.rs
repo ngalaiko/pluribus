@@ -640,6 +640,153 @@ async fn http_request_reads_are_confined_to_consumer_and_listener() {
 }
 
 #[tokio::test]
+async fn history_search_filters_conversation_before_limit() {
+    let mut host = host(vec![
+        "observation.received".into(),
+        "http.request.received".into(),
+    ])
+    .await;
+    for (key, conversation) in [("a", "chat:a"), ("b", "chat:b")] {
+        let mut event = proposal("observation.received");
+        event.payload = types::Payload::Json(
+            serde_json::to_vec(&serde_json::json!({
+                "conversationId": conversation,
+                "message": {"text": "deploy"},
+            }))
+            .unwrap(),
+        );
+        event.idempotency_key = Some(key.into());
+        events::Host::append(&mut host, event).await.unwrap();
+    }
+    let mut private = proposal("http.request.received");
+    private.payload = types::Payload::Json(
+        serde_json::to_vec(&serde_json::json!({
+            "consumer": "other/instance",
+            "conversationId": "chat:a",
+            "body": "deploy",
+        }))
+        .unwrap(),
+    );
+    private.idempotency_key = Some("private".into());
+    let private_sequence = host
+        .event_store
+        .append(AppendRequest {
+            stream_id: StreamId::new("personal"),
+            stream_kind: StreamKind::Agent,
+            observed_at_ms: None,
+            event_type: "http.request.received".into(),
+            payload_schema: "test/1".into(),
+            payload: EventPayload::CanonicalJson(match private.payload {
+                types::Payload::Json(bytes) => bytes,
+                types::Payload::Blob(_) => unreachable!(),
+            }),
+            actor: PrincipalRef::new(CorePrincipalKind::Component, "other/instance"),
+            authority_id: Some(AuthorityId::new("authority-1")),
+            activity_id: Some("activity-1".into()),
+            correlation_id: Some("correlation-1".into()),
+            causation_id: None,
+            deduplication_key: private.idempotency_key,
+        })
+        .await
+        .unwrap()
+        .sequence;
+    let page = events::Host::query(
+        &mut host,
+        events::Filter {
+            text_query: Some("deploy".into()),
+            after_sequence: None,
+            before_sequence: None,
+            event_types: Vec::new(),
+            conversation_id: Some("chat:a".into()),
+            correlation_id: None,
+            activity_id: None,
+            recorded_from_ms: None,
+            recorded_to_ms: None,
+            descending: true,
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert_ne!(page.events[0].sequence, private_sequence);
+
+    let empty = events::Host::query(
+        &mut host,
+        events::Filter {
+            text_query: Some("deploy".into()),
+            after_sequence: None,
+            before_sequence: None,
+            event_types: Vec::new(),
+            conversation_id: Some("chat:missing".into()),
+            correlation_id: None,
+            activity_id: None,
+            recorded_from_ms: None,
+            recorded_to_ms: None,
+            descending: true,
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.next_sequence, Some(1));
+}
+
+#[tokio::test]
+async fn history_search_zero_limit_is_empty() {
+    let mut host = host(vec!["observation.received".into()]).await;
+    let mut event = proposal("observation.received");
+    event.payload = types::Payload::Json(br#"{"message":"deploy"}"#.to_vec());
+    event.idempotency_key = Some("zero-limit".into());
+    events::Host::append(&mut host, event).await.unwrap();
+    let page = events::Host::query(
+        &mut host,
+        events::Filter {
+            text_query: Some("deploy".into()),
+            after_sequence: None,
+            before_sequence: None,
+            event_types: Vec::new(),
+            conversation_id: None,
+            correlation_id: None,
+            activity_id: None,
+            recorded_from_ms: None,
+            recorded_to_ms: None,
+            descending: true,
+        },
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(page.events.is_empty());
+    assert_eq!(page.next_sequence, None);
+}
+
+#[tokio::test]
+async fn history_search_rejects_oversized_query() {
+    let mut host = host(vec![]).await;
+    let error = events::Host::query(
+        &mut host,
+        events::Filter {
+            text_query: Some("x".repeat(4097)),
+            after_sequence: None,
+            before_sequence: None,
+            event_types: Vec::new(),
+            conversation_id: None,
+            correlation_id: None,
+            activity_id: None,
+            recorded_from_ms: None,
+            recorded_to_ms: None,
+            descending: true,
+        },
+        1,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, types::ErrorCode::InvalidArgument);
+}
+
+#[tokio::test]
 async fn a_delivered_event_reveals_the_blobs_its_payload_names() {
     async fn stored(store: &Arc<dyn BlobStore>, bytes: &[u8]) -> BlobRef {
         let upload = store

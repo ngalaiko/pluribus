@@ -99,11 +99,23 @@ impl Environment {
         if checkpoint["version"] != 1 || !checkpoint["state"].is_object() {
             return Err("unsupported working checkpoint".into());
         }
+        let mode = match checkpoint.get("mode") {
+            None => "explicit",
+            Some(Value::String(mode)) if mode == "automatic" || mode == "explicit" => mode.as_str(),
+            _ => return Err("unsupported working checkpoint mode".into()),
+        };
         let encoded = serde_json::to_string(&checkpoint["state"]).map_err(|e| e.to_string())?;
         if encoded.len() > 32 * 1024 {
             return Err("checkpoint exceeds 32 KiB".into());
         }
         self.set_data("state", &checkpoint["state"])?;
+        let mut bridge = checkpoint.clone();
+        bridge
+            .as_object_mut()
+            .expect("checkpoint state was checked as an object")
+            .insert("mode".into(), Value::String(mode.into()));
+        self.set_data("__checkpoint", &bridge)?;
+        self.eval("globalThis.__restoreCheckpoint(__checkpoint); delete globalThis.__checkpoint;")?;
         self.eval("globalThis.context.recovered = true;")?;
         self.recovered = true;
         Ok(())
@@ -316,6 +328,7 @@ mod component {
                     "requestEventId": event.event_id, "sessionId": session_id(event),
                     "value": status.get("value"),
                     "checkpoint": status.get("checkpoint"),
+                    "warnings": status.get("warnings"),
                     "log": status.get("log"),
                 }),
                 Some(event.event_id.clone()),
@@ -417,6 +430,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_checkpoint_keeps_the_utf8_size_limit() {
+        let mut env = Environment::new("{}").unwrap();
+        let result = value(
+            env.step(
+                "__start",
+                "checkpoint({text: 'é'.repeat(20000)}); return 1;",
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(result["status"], "error");
+        assert!(result["error"].as_str().unwrap().contains("32 KiB"));
+    }
+
+    #[test]
     fn a_fresh_environment_restores_values_without_replaying_source() {
         let mut first = Environment::new("{}").unwrap();
         let done = value(
@@ -435,6 +463,7 @@ mod tests {
             restored["value"],
             serde_json::json!({"n":7,"recovered":true})
         );
+        assert_eq!(restored["checkpoint"]["mode"], "explicit");
         assert!(second.step("__resume", r#"{"id":1,"value":null}"#).is_err());
     }
 
@@ -466,6 +495,164 @@ mod tests {
         );
         assert_eq!(done["checkpoint"]["version"], 1);
         assert_eq!(done["checkpoint"]["state"]["answer"], 42);
+        assert_eq!(done["checkpoint"]["mode"], "explicit");
+    }
+
+    #[test]
+    fn explicit_checkpoint_remains_authoritative_across_cells() {
+        let mut env = Environment::new("{}").unwrap();
+        let first = value(
+            env.step("__start", "checkpoint({selected: 7}); return 1;")
+                .unwrap(),
+        );
+        assert_eq!(first["checkpoint"]["state"]["selected"], 7);
+        assert_eq!(first["checkpoint"]["mode"], "explicit");
+
+        let second = value(env.step("__start", "state.other = 9; return 2;").unwrap());
+        assert_eq!(second["status"], "done");
+        assert_eq!(
+            second["checkpoint"]["state"],
+            serde_json::json!({"selected": 7})
+        );
+        assert_eq!(second["checkpoint"]["mode"], "explicit");
+
+        let mut restored = Environment::new("{}").unwrap();
+        restored.restore(&first["checkpoint"]).unwrap();
+        let after_restart = value(
+            restored
+                .step("__start", "state.other = 9; return 2;")
+                .unwrap(),
+        );
+        assert_eq!(
+            after_restart["checkpoint"]["state"],
+            serde_json::json!({"selected": 7})
+        );
+        assert_eq!(after_restart["checkpoint"]["mode"], "explicit");
+    }
+
+    #[test]
+    fn successful_cells_automatically_checkpoint_state() {
+        let mut env = Environment::new("{}").unwrap();
+        let done = value(
+            env.step("__start", "state.answer = 42; return 'ok';")
+                .unwrap(),
+        );
+
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["value"], "ok");
+        assert_eq!(done["checkpoint"]["version"], 1);
+        assert_eq!(done["checkpoint"]["state"]["answer"], 42);
+        assert_eq!(done["checkpoint"]["mode"], "automatic");
+        assert_eq!(done["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn automatic_checkpoint_restores_state_without_replaying_source() {
+        let mut first = Environment::new("{}").unwrap();
+        let done = value(
+            first
+                .step("__start", "state.n = (state.n ?? 0) + 1; return state.n;")
+                .unwrap(),
+        );
+        assert_eq!(done["checkpoint"]["mode"], "automatic");
+        let mut second = Environment::new("{}").unwrap();
+        second.restore(&done["checkpoint"]).unwrap();
+
+        let restored = value(second.step("__start", "return state.n;").unwrap());
+        assert_eq!(restored["value"], 1);
+        assert_eq!(restored["checkpoint"]["mode"], "automatic");
+    }
+
+    #[test]
+    fn invalid_automatic_state_warns_without_failing_completed_cell() {
+        let mut env = Environment::new("{}").unwrap();
+        let done = value(
+            env.step(
+                "__start",
+                "state.answer = 42; state.bad = undefined; return state.answer;",
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["value"], 42);
+        assert!(done["checkpoint"].is_null());
+        assert_eq!(done["warnings"].as_array().unwrap().len(), 1);
+        assert!(
+            done["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("unsupported")
+        );
+    }
+
+    #[test]
+    fn automatic_checkpoint_counts_utf8_bytes() {
+        let mut env = Environment::new("{}").unwrap();
+        let done = value(
+            env.step("__start", "state.text = 'é'.repeat(20000); return 1;")
+                .unwrap(),
+        );
+
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["value"], 1);
+        assert!(done["checkpoint"].is_null());
+        assert!(done["warnings"][0].as_str().unwrap().contains("32 KiB"));
+    }
+
+    #[test]
+    fn automatic_checkpoint_rejects_cycles_and_nonfinite_values() {
+        for source in [
+            "state.self = state; return 1;",
+            "state.nan = NaN; return 1;",
+            "state.infinity = Infinity; return 1;",
+            "state.fn = () => 1; return 1;",
+            "state.symbol = Symbol('x'); return 1;",
+        ] {
+            let mut env = Environment::new("{}").unwrap();
+            let done = value(env.step("__start", source).unwrap());
+            assert_eq!(done["status"], "done", "{source}");
+            assert_eq!(done["value"], 1, "{source}");
+            assert!(done["checkpoint"].is_null(), "{source}");
+            assert_eq!(done["warnings"].as_array().unwrap().len(), 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn automatic_checkpoint_duplicates_shared_values_without_calling_them_cycles() {
+        let mut env = Environment::new("{}").unwrap();
+        let done = value(
+            env.step(
+                "__start",
+                "const item = {answer: 42}; state.first = item; state.second = item; return 1;",
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(done["status"], "done");
+        assert_eq!(
+            done["checkpoint"]["state"]["first"],
+            serde_json::json!({"answer": 42})
+        );
+        assert_eq!(
+            done["checkpoint"]["state"]["second"],
+            serde_json::json!({"answer": 42})
+        );
+    }
+
+    #[test]
+    fn automatic_checkpoint_preserves_an_own_proto_key_as_data() {
+        let mut env = Environment::new("{}").unwrap();
+        let done = value(
+            env.step(
+                "__start",
+                "Object.defineProperty(state, '__proto__', {value: {injected: true}, enumerable: true}); return 1;",
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["checkpoint"]["state"]["__proto__"]["injected"], true);
     }
 
     #[test]
@@ -525,6 +712,29 @@ mod tests {
             assert_eq!(done["value"]["output"]["id"], "record:1");
         }
     }
+
+    #[test]
+    fn history_search_facade_yields_to_the_host() {
+        let mut env = Environment::new("{}").unwrap();
+        let request = value(
+            env.step(
+                "__start",
+                "return await history.search({query: 'deployment'});",
+            )
+            .unwrap(),
+        );
+        assert_eq!(request["method"], "history.search");
+        assert_eq!(request["args"]["query"], "deployment");
+        let done = value(
+            env.step(
+                "__resume",
+                &serde_json::json!({"id":request["id"],"value":{"events":[]}}).to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(done["value"]["events"], serde_json::json!([]));
+    }
+
     #[test]
     fn large_results_are_previewed_without_discarding_working_state() {
         let mut env = Environment::new("{}").unwrap();

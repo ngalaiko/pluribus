@@ -261,6 +261,10 @@ fn normalize(
     loop {
         let page = events::query(
             &events::Filter {
+                text_query: None,
+                before_sequence: None,
+                conversation_id: None,
+                descending: false,
                 after_sequence: after,
                 event_types: vec!["observation.received".into()],
                 correlation_id: None,

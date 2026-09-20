@@ -2,7 +2,7 @@
 
 ## WIT package
 
-The ABI package is `pluribus:plugin@2.0.0` in [`wit/`](../../wit):
+The ABI package is `pluribus:plugin@3.0.0` in [`wit/`](../../wit):
 
 - [`types.wit`](../../wit/types.wit): shared values;
 - [`host.wit`](../../wit/host.wit): host imports;
@@ -130,8 +130,14 @@ as events.
 idempotency key is required. Use it only for non-terminal progress; terminal
 results belong in `outcome`. See [Events](events.md).
 
-`get(event-id)` reads one event. `query(filter, limit)` reads matching events
-in ascending sequence order, served from an index.
+`get(event-id)` reads one event. `query(filter, limit)` is the single query
+operation, served from an index. Its metadata filters include sequence, event
+type, conversation, correlation, activity, and time bounds. Optional `text-query`
+uses full-text search. `descending` selects newest-first sequence order; otherwise
+results are ascending. Continue with the returned sequence as an exclusive bound.
+
+ABI 3 expands the query filter. Upgrade the host and rebuild all plugins together;
+ABI 2 components are rejected before activation.
 
 ### `state`
 
@@ -261,7 +267,7 @@ can be reconstructed from.
 
 ## Limits
 
-These are ABI `2.0.0` hard maxima. A deployment may configure lower limits.
+These are ABI `3.0.0` hard maxima. A deployment may configure lower limits.
 
 | Item | Maximum |
 | --- | ---: |

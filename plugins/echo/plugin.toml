@@ -1,4 +1,4 @@
-abi = "pluribus:plugin@2.0.0"
+abi = "pluribus:plugin@3.0.0"
 manifest_version = 1
 id = "dev.pluribus.echo"
 name = "Echo"
@@ -7,10 +7,10 @@ license = "MIT OR Apache-2.0"
 
 [component]
 config_schema = "config.schema.json"
-world = "pluribus:plugin/plugin@2.0.0"
+world = "pluribus:plugin/plugin@3.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
-imports = ["pluribus:plugin/runtime@2.0.0", "pluribus:plugin/events@2.0.0", "pluribus:plugin/state@2.0.0"]
+imports = ["pluribus:plugin/runtime@3.0.0", "pluribus:plugin/events@3.0.0", "pluribus:plugin/state@3.0.0"]
 subscribes = ["http.request.received"]
 emits = ["capability.output", "capability.completed", "capability.failed", "http.response.requested"]
 

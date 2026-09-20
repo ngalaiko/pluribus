@@ -519,6 +519,164 @@ struct RejectCommit {
     reject: std::sync::atomic::AtomicBool,
     remaining: AtomicU64,
 }
+
+async fn install_memory_reasoning(agent: &mut TestAgent) {
+    let package = PluginPackage::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/rlm"),
+    )
+    .unwrap();
+    for (id, component) in [("rlm", "cognition"), ("repl", "repl")] {
+        let mut d = delivery();
+        d.instance_id = id.into();
+        agent
+            .install_component(
+                package.component(component).unwrap(),
+                &json!({}),
+                d,
+                PluginServices {
+                    model: Some("test".into()),
+                    ..PluginServices::default()
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+}
+
+async fn memory_turn(
+    agent: &mut TestAgent,
+    store: &Arc<SqliteEventStore<Metadata>>,
+    text: &str,
+    code: Option<&str>,
+) -> Vec<CommittedEvent> {
+    let origin = store
+        .append(AppendRequest {
+            stream_id: StreamId::new("personal"),
+            stream_kind: StreamKind::Agent,
+            observed_at_ms: None,
+            event_type: "observation.received".into(),
+            payload_schema: "pluribus.observation/1".into(),
+            payload: EventPayload::CanonicalJson(
+                serde_json::to_vec(&json!({
+                    "provider":"telegram", "externalSenderId":"7", "conversationId":"chat:7",
+                    "message":{"chat":{"id":7},"text":text}
+                }))
+                .unwrap(),
+            ),
+            actor: PrincipalRef::new(PrincipalKind::Component, "telegram-1"),
+            authority_id: Some(AuthorityId::new("authority-1")),
+            activity_id: None,
+            correlation_id: None,
+            causation_id: None,
+            deduplication_key: None,
+        })
+        .await
+        .unwrap();
+    let mut answered = std::collections::HashSet::new();
+    let mut code = code;
+    for _ in 0..200 {
+        agent.tick_wait(1_700_000_000_000).await.unwrap();
+        let events = store
+            .read(&StreamId::new("personal"), origin.sequence, 10000)
+            .await
+            .unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e.request.event_type.as_str(),
+                "code.failed" | "cognition.failed"
+            )),
+            "conversation turn failed: {text}"
+        );
+        if events.iter().any(|e| {
+            e.request.event_type == "cognition.completed"
+                && payload(e)["root"] == origin.event_id.as_str()
+        }) {
+            return events;
+        }
+        for event in events
+            .iter()
+            .filter(|e| e.request.event_type == "model.requested")
+        {
+            if !answered.insert(event.event_id.clone()) {
+                continue;
+            }
+            let content = if let Some(source) = code.take() {
+                json!([{"kind":"tool-call","call_id":"cell","name":"js","arguments":{"code":source}}])
+            } else {
+                json!([{"kind":"tool-call","call_id":"done","name":"yield","arguments":{"action":"complete","reply":null}}])
+            };
+            let mut result = event.request.clone();
+            result.event_type = "model.completed".into();
+            result.causation_id = Some(event.event_id.clone());
+            result.deduplication_key = None;
+            result.payload = EventPayload::CanonicalJson(serde_json::to_vec(&json!({
+                "call_id":payload(event)["call_id"],"message":{"role":"assistant","content":content}
+            })).unwrap());
+            store.append(result).await.unwrap();
+        }
+    }
+    panic!("conversation turn did not finish: {text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sourced_memory_survives_distractors_correction_and_restart() {
+    let (mut agent, store) = build(CAPS).await;
+    install_memory_reasoning(&mut agent).await;
+    memory_turn(&mut agent, &store, "Remember: use staging for deployment", Some(
+        "return (await capabilities.invoke('memory.remember',{operationId:context.observationEventId,scope:'project:p',kind:'procedure',content:'Use staging for deployment',sources:[context.observationEventId],basis:'explicit'})).output;"
+    )).await;
+    for index in 0..8 {
+        memory_turn(
+            &mut agent,
+            &store,
+            &format!("Unrelated question {index}"),
+            None,
+        )
+        .await;
+    }
+    let recalled = memory_turn(&mut agent, &store, "Which environment should releases target?", Some(
+        "const found=(await capabilities.invoke('memory.recall',{scope:'project:p',query:'deployment'})).output; if(found.records.length!==1 || found.records[0].record.content!=='Use staging for deployment') throw Error('lost preference'); return 'staging verified';"
+    )).await;
+    let first = recalled
+        .iter()
+        .find(|e| e.request.event_type == "model.requested")
+        .unwrap();
+    let turn: Value = serde_json::from_str(
+        payload(first)["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        turn["recentConversation"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    assert!(
+        turn["recentConversation"]["availableCount"]
+            .as_u64()
+            .unwrap()
+            > 6
+    );
+    memory_turn(&mut agent, &store, "Correction: use production for deployment", Some(
+        "const prior=(await capabilities.invoke('memory.recall',{scope:'project:p',query:'deployment'})).output.records[0].record; return (await capabilities.invoke('memory.supersede',{operationId:context.observationEventId,expectedId:prior.id,scope:'project:p',kind:'procedure',content:'Use production for deployment',sources:[context.observationEventId],basis:'explicit'})).output;"
+    )).await;
+    drop(agent);
+    let mut agent = build_on(&store, CAPS).await;
+    install_memory_reasoning(&mut agent).await;
+    let events = memory_turn(&mut agent, &store, "Where should I release?", Some(
+        "const found=(await capabilities.invoke('memory.recall',{scope:'project:p',query:'deployment'})).output; if(found.records.length!==1 || found.records[0].record.content!=='Use production for deployment') throw Error('stale preference'); return 'production verified';"
+    )).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.request.event_type == "code.completed"
+                && payload(e)["value"] == "production verified")
+    );
+}
 #[async_trait::async_trait]
 impl DeliveryStore for RejectCommit {
     async fn checkpoint(

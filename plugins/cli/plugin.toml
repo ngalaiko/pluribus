@@ -1,4 +1,4 @@
-abi = "pluribus:plugin@2.0.0"
+abi = "pluribus:plugin@3.0.0"
 manifest_version = 1
 id = "dev.pluribus.cli"
 name = "CLI"
@@ -6,11 +6,11 @@ config_schema = "config.schema.json"
 license = "MIT OR Apache-2.0"
 
 [components.main]
-world = "pluribus:plugin/plugin@2.0.0"
+world = "pluribus:plugin/plugin@3.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
 config_schema = "config.schema.json"
-imports = ["pluribus:plugin/runtime@2.0.0", "pluribus:plugin/socket@2.0.0", "pluribus:plugin/state@2.0.0", "wasi:clocks/monotonic-clock@0.3.0"]
+imports = ["pluribus:plugin/runtime@3.0.0", "pluribus:plugin/socket@3.0.0", "pluribus:plugin/state@3.0.0", "wasi:clocks/monotonic-clock@0.3.0"]
 subscribes = []
 emits = ["observation.received", "capability.completed", "capability.failed"]
 

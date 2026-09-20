@@ -40,6 +40,11 @@ idempotency classification and key, deadline, cancellation status, and terminal
 result. Attempts are `queued`, `running`, `completed`, `failed`, `cancelled`, or
 `unknown`. An uncertain external outcome is never inferred to be a clean failure.
 
+Activity results over 1 KiB are represented by their source event ID in job
+snapshots. Small receipts remain inline. References preserve `code` and `outcome`
+markers needed for reconciliation; full outputs remain in the event log. This
+bounds repeated result copies in job updates, task context, and checkpoints.
+
 ## Intake and observation association
 
 Core runs each provider in an async task, with one lifecycle call per instance.

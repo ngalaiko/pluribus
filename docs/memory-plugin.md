@@ -25,7 +25,7 @@ reject multiple providers for the same memory capability within an agent.
 
 ## Package
 
-Use the existing `pluribus:plugin@2.0.0` world and lifecycle. Import only `events`
+Use the existing `pluribus:plugin@3.0.0` world and lifecycle. Import only `events`
 and `state`; no HTTP, sockets, credentials, or filesystem access.
 
 Provide `memory.recall`, `memory.get`, `memory.remember`, `memory.supersede`, and

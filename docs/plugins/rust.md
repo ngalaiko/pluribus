@@ -60,11 +60,11 @@ declare its own:
 package dev-example:battery@0.1.0;
 
 world battery {
-  import pluribus:plugin/runtime@2.0.0;
-  import pluribus:plugin/events@2.0.0;
+  import pluribus:plugin/runtime@3.0.0;
+  import pluribus:plugin/events@3.0.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
-  export pluribus:plugin/lifecycle@2.0.0;
+  export pluribus:plugin/lifecycle@3.0.0;
 }
 ```
 

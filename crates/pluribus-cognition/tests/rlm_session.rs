@@ -126,7 +126,7 @@ async fn a_cell_yields_a_request_then_resumes_with_its_result() {
     );
     assert_eq!(
         package.component("repl").unwrap().manifest().imports,
-        ["pluribus:plugin/runtime@2.0.0"],
+        ["pluribus:plugin/runtime@3.0.0"],
         "the interpreter imports only lifecycle coordination"
     );
 

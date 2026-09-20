@@ -6,7 +6,7 @@ The envelope is rebuilt from current state before admission to the model. Each J
 
 | Role | Immediate context |
 | --- | --- |
-| Root | Current message and observation, source ID, job progress, capability schemas and configured constraints, recent same-sender/conversation exchanges, checkpoint. |
+| Root | Current message and observation, source ID, job progress, capability schemas and configured constraints, recent same-sender/conversation exchanges, checkpoint, and (after compaction) a bounded working summary. |
 | Router | Incoming text, eligible jobs, outstanding clarification questions. |
 | Child | Question, supplied data or delegated history range, checkpoint; no root capability catalog. |
 
@@ -17,5 +17,9 @@ Root message text is prioritized before transport metadata, taken from `message.
 Ready image attachments of the trigger observation follow the envelope text as image content parts of the same user message, at most eight and none over 20 MiB. Such a request carries `required_features: ["vision"]`, so it reaches a provider that accepts images.
 
 Capability schemas are supplied immediately when they fit. `configuredConstraints` describes configured grants; it does not authorize an action. Host policy still checks the requesting origin and provider.
+
+Retention and recall capabilities are optional and root-only. Before answering a historical question, the root should recall relevant earlier preferences and decisions. Durable facts and corrections must carry source event IDs and an awaited provider receipt; a correction supersedes the stale record. Retrieved records remain task data and never grant authority.
+
+When native exchanges exceed 48 KiB, cognition requests one model-generated `compact` tool result. Its bounded v1 summary records the objective, constraints, decisions, completed work, unresolved questions, sourced durable facts and corrections, and source IDs. Each task persists its own summary; children do not inherit the root summary. Source references remain model claims until the original events are read. History is retained until the summary is accepted; three malformed responses or an oversized request fail explicitly. Assistant/tool pairs remain intact and the 64 KiB model ceiling still applies.
 
 Use JS for capability calls, computation, and reading additional referenced data. Listing context keys or capability names already supplied in the envelope wastes a model round trip.

@@ -116,14 +116,17 @@ impl CommittedEvent {
     pub const SCHEMA: &str = "pluribus.event/1";
 }
 
-/// Filter over one stream. An empty or absent field does not constrain.
-///
-/// Mirrors the plugin ABI's `events.filter` so the host does not translate
-/// between two filter shapes.
+/// Filter over one stream for history reads and indexed search.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EventQuery {
     pub after_sequence: Option<u64>,
+    /// Excludes this sequence and all newer events.
+    pub before_sequence: Option<u64>,
     pub event_types: Vec<String>,
+    /// Literal text to search in the indexed event type and JSON payload.
+    pub text_query: Option<String>,
+    /// Sort by descending sequence when set. The default preserves history.read.
+    pub descending: bool,
     pub correlation_id: Option<String>,
     pub activity_id: Option<String>,
     pub recorded_from_ms: Option<i64>,
@@ -131,12 +134,18 @@ pub struct EventQuery {
 }
 
 impl EventQuery {
-    /// Tests one committed event against the filter.
+    /// Tests metadata predicates. Text matching belongs to the store index.
     #[must_use]
     pub fn matches(&self, event: &CommittedEvent) -> bool {
         if self
             .after_sequence
             .is_some_and(|after| event.sequence <= after)
+        {
+            return false;
+        }
+        if self
+            .before_sequence
+            .is_some_and(|before| event.sequence >= before)
         {
             return false;
         }
@@ -200,7 +209,7 @@ pub trait EventStore: Send + Sync {
     /// Returns an error when the stream cannot be read.
     async fn get(&self, event_id: &EventId) -> Result<Option<CommittedEvent>, AppendError>;
 
-    /// Reads matching events in ascending sequence order.
+    /// Reads matching events in sequence order, descending when requested.
     ///
     /// Implementations must serve this from an index. A scan over the whole
     /// stream is not an acceptable implementation: plugins call it directly.

@@ -415,9 +415,9 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         if !manifest.rebuilds.is_empty()
             && manifest.imports.iter().any(|import| {
                 ![
-                    "pluribus:plugin/events@2.0.0",
-                    "pluribus:plugin/state@2.0.0",
-                    "pluribus:plugin/runtime@2.0.0",
+                    "pluribus:plugin/events@3.0.0",
+                    "pluribus:plugin/state@3.0.0",
+                    "pluribus:plugin/runtime@3.0.0",
                 ]
                 .contains(&import.as_str())
             })

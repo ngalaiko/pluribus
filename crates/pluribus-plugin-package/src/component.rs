@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use wit_parser::decoding::{DecodedWasm, decode};
 use wit_parser::{Resolve, WorldItem};
 
-const ABI_PACKAGE: &str = "pluribus:plugin@2.0.0";
-const LIFECYCLE_EXPORT: &str = "pluribus:plugin/lifecycle@2.0.0";
+const ABI_PACKAGE: &str = "pluribus:plugin@3.0.0";
+const LIFECYCLE_EXPORT: &str = "pluribus:plugin/lifecycle@3.0.0";
 
 pub(crate) fn validate_component(
     abi: &str,
@@ -19,7 +19,7 @@ pub(crate) fn validate_component(
         ));
     };
     let world = &resolve.worlds[world_id];
-    if abi != ABI_PACKAGE || manifest.world != "pluribus:plugin/plugin@2.0.0" {
+    if abi != ABI_PACKAGE || manifest.world != "pluribus:plugin/plugin@3.0.0" {
         return Err(PackageError::new(format!(
             "unsupported plugin ABI/world: {abi}/{}",
             manifest.world

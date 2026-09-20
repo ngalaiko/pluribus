@@ -1,4 +1,4 @@
-abi = "pluribus:plugin@2.0.0"
+abi = "pluribus:plugin@3.0.0"
 manifest_version = 1
 id = "dev.pluribus.rlm"
 name = "RLM cognition"
@@ -10,20 +10,20 @@ repl = {}
 
 [components.cognition]
 requires = ["repl"]
-world = "pluribus:plugin/plugin@2.0.0"
+world = "pluribus:plugin/plugin@3.0.0"
 component = "components/cognition.wasm"
 digest = "sha256:dev"
-imports = ["pluribus:plugin/runtime@2.0.0", "pluribus:plugin/events@2.0.0", "pluribus:plugin/state@2.0.0"]
+imports = ["pluribus:plugin/runtime@3.0.0", "pluribus:plugin/events@3.0.0", "pluribus:plugin/state@3.0.0"]
 config_schema = "config.schema.json"
 subscribes = ["*", "cognition.checkpoint"]
 rebuilds = ["cognition.checkpoint"]
 emits = ["cognition.job-updated", "cognition.observation-associated", "timer.set", "timer.cancel", "cognition.checkpoint", "cognition.cancel-requested", "code.close-requested", "model.requested", "code.evaluate-requested", "code.resumed", "capability.requested", "cognition.completed", "cognition.failed"]
 
 [components.repl]
-world = "pluribus:plugin/plugin@2.0.0"
+world = "pluribus:plugin/plugin@3.0.0"
 component = "components/repl.wasm"
 digest = "sha256:dev"
-imports = ["pluribus:plugin/runtime@2.0.0", ]
+imports = ["pluribus:plugin/runtime@3.0.0", ]
 config_schema = "config.schema.json"
 subscribes = ["code.close-requested", "code.evaluate-requested", "code.resumed"]
 emits = ["code.closed", "code.yielded", "code.completed", "code.failed"]

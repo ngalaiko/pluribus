@@ -1,6 +1,6 @@
 # Plugin author specification
 
-Status: draft for ABI `pluribus:plugin@2.0.0`
+Status: draft for ABI `pluribus:plugin@3.0.0`
 
 This is the public contract between Pluribus and plugin authors. A plugin is a
 WebAssembly Component plus a manifest and configuration schema. The runtime
@@ -74,7 +74,7 @@ behavior. The core decides permission.
 
 ## ABI scope
 
-ABI `2.0.0` defines:
+ABI `3.0.0` defines:
 
 - one world, `plugin`;
 - one export, `lifecycle`, with `run`, `handle`, and `stop`;
@@ -83,7 +83,7 @@ ABI `2.0.0` defines:
 - the event vocabulary a plugin may consume and emit;
 - the manifest fields that declare what a plugin offers.
 
-ABI `2.0.0` uses native WIT `async`, `stream`, and `future` types.
+ABI `3.0.0` uses native WIT `async`, `stream`, and `future` types.
 The host runs setup through `run`, commits startup output at `runtime.ready`,
 replays state through `handle`, then activates the loop.
 

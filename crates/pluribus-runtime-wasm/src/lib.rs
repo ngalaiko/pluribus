@@ -48,7 +48,7 @@ const MAX_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_PAGE: u32 = 1000;
 const MAX_OUTCOME_EVENTS: usize = 1000;
 
-const ABI_WORLD: &str = "pluribus:plugin/plugin@2.0.0";
+const ABI_WORLD: &str = "pluribus:plugin/plugin@3.0.0";
 
 /// Ceilings on one call. Compute is bounded by wall clock, not by an
 /// instruction count: epoch interruption stops the same runaway loops that
@@ -1406,18 +1406,49 @@ impl events::Host for HostState {
         filter: events::Filter,
         limit: u32,
     ) -> Result<events::Page, types::Error> {
+        if filter
+            .text_query
+            .as_ref()
+            .is_some_and(|query| query.len() > 4096)
+        {
+            return Err(host_error(
+                types::ErrorCode::InvalidArgument,
+                "search text is too long",
+            ));
+        }
+        if limit == 0 {
+            return Ok(events::Page {
+                events: Vec::new(),
+                next_sequence: None,
+            });
+        }
         let query = EventQuery {
             after_sequence: filter.after_sequence,
+            before_sequence: filter.before_sequence,
             event_types: filter.event_types,
+            text_query: filter.text_query.clone(),
+            descending: filter.descending,
             correlation_id: filter.correlation_id,
             activity_id: filter.activity_id,
             recorded_from_ms: filter.recorded_from_ms,
             recorded_to_ms: filter.recorded_to_ms,
         };
+        let searching = filter.text_query.is_some()
+            || filter.before_sequence.is_some()
+            || filter.conversation_id.is_some()
+            || filter.descending;
         let store = self.event_store.clone();
         let stream = StreamId::new(self.delivery.agent.id.clone());
         let events = store
-            .query(&stream, &query, limit.min(MAX_EVENT_PAGE) as usize)
+            .query(
+                &stream,
+                &query,
+                if searching {
+                    MAX_EVENT_PAGE as usize
+                } else {
+                    limit.min(MAX_EVENT_PAGE) as usize
+                },
+            )
             .await
             .map_err(|error| {
                 host_error(
@@ -1425,19 +1456,59 @@ impl events::Host for HostState {
                     &format!("cannot query: {error}"),
                 )
             })?;
-        let next_sequence = events.last().map(|event| {
-            self.progress.notify_one();
-            event.sequence
-        });
-        Ok(events::Page {
-            events: events
+        let requested = limit.min(MAX_EVENT_PAGE) as usize;
+        let selected = if searching {
+            let mut selected = Vec::with_capacity(requested);
+            for event in &events {
+                if !http_request_visible(event, &self.delivery.instance_id)
+                    || !filter.conversation_id.as_deref().is_none_or(|wanted| {
+                        event_conversation_id(event).as_deref() == Some(wanted)
+                    })
+                {
+                    continue;
+                }
+                selected.push(event);
+                if selected.len() == requested {
+                    break;
+                }
+            }
+            selected
+        } else {
+            events
                 .iter()
                 .filter(|event| http_request_visible(event, &self.delivery.instance_id))
-                .map(wit_event)
-                .collect(),
+                .take(requested)
+                .collect()
+        };
+        let next_sequence = (requested > 0)
+            .then(|| {
+                if searching {
+                    selected.last().copied().or_else(|| events.last())
+                } else {
+                    events.last()
+                }
+            })
+            .flatten()
+            .map(|event| {
+                self.progress.notify_one();
+                event.sequence
+            });
+        Ok(events::Page {
+            events: selected.into_iter().map(wit_event).collect(),
             next_sequence,
         })
     }
+}
+
+fn event_conversation_id(event: &CommittedEvent) -> Option<String> {
+    let EventPayload::CanonicalJson(bytes) = &event.request.payload else {
+        return None;
+    };
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    value["conversationId"]
+        .as_str()
+        .or_else(|| value["arguments"]["conversationId"].as_str())
+        .map(str::to_owned)
 }
 
 impl state::Host for HostState {

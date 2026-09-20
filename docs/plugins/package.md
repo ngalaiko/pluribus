@@ -31,7 +31,7 @@ A single-component manifest uses:
 
 ```toml
 manifest_version = 1
-abi = "pluribus:plugin@2.0.0"
+abi = "pluribus:plugin@3.0.0"
 id = "dev.example.echo"
 name = "Echo"
 config_schema = "config.schema.json"
@@ -40,7 +40,7 @@ config_schema = "config.schema.json"
 label = "Echo"
 
 [component]
-world = "pluribus:plugin/plugin@2.0.0"
+world = "pluribus:plugin/plugin@3.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
 imports = []
@@ -56,7 +56,7 @@ A multi-component manifest uses:
 
 ```toml
 manifest_version = 1
-abi = "pluribus:plugin@2.0.0"
+abi = "pluribus:plugin@3.0.0"
 id = "dev.example.telegram"
 name = "Telegram"
 config_schema = "config.schema.json"
@@ -72,10 +72,10 @@ flow_schema = "pluribus:credential/static-http@1"
 flow = "flows/bot-token.json"
 
 [components.receive]
-world = "pluribus:plugin/plugin@2.0.0"
+world = "pluribus:plugin/plugin@3.0.0"
 component = "components/receive.wasm"
 digest = "sha256:dev"
-imports = ["pluribus:plugin/state@2.0.0", "pluribus:plugin/blobs@2.0.0", "wasi:http/types@0.3.0", "wasi:http/client@0.3.0", "pluribus:plugin/credentials@2.0.0"]
+imports = ["pluribus:plugin/state@3.0.0", "pluribus:plugin/blobs@3.0.0", "wasi:http/types@0.3.0", "wasi:http/client@0.3.0", "pluribus:plugin/credentials@3.0.0"]
 config_schema = "config.schema.json"
 subscribes = []
 emits = ["observation.received"]
@@ -87,10 +87,10 @@ reason = "Poll Telegram updates"
 constraints = { origins = ["https://api.telegram.org"], methods = ["GET", "POST"] }
 
 [components.send]
-world = "pluribus:plugin/plugin@2.0.0"
+world = "pluribus:plugin/plugin@3.0.0"
 component = "components/send.wasm"
 digest = "sha256:dev"
-imports = ["pluribus:plugin/blobs@2.0.0", "wasi:http/types@0.3.0", "wasi:http/client@0.3.0", "pluribus:plugin/credentials@2.0.0"]
+imports = ["pluribus:plugin/blobs@3.0.0", "wasi:http/types@0.3.0", "wasi:http/client@0.3.0", "pluribus:plugin/credentials@3.0.0"]
 config_schema = "config.schema.json"
 emits = ["capability.completed", "capability.failed"]
 
@@ -176,7 +176,7 @@ core type.
 ## Declaring what a plugin does
 
 Each component uses the `plugin` world and exports only
-`pluribus:plugin/lifecycle@2.0.0`, including async `run`; other exports are rejected. There is no role list, because there are no role interfaces: what a
+`pluribus:plugin/lifecycle@3.0.0`, including async `run`; other exports are rejected. There is no role list, because there are no role interfaces: what a
 component does is `provides`, `model_provider`, `subscribes` and `emits`.
 
 Each component declares its capabilities, model services, event subscriptions,

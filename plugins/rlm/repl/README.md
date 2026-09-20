@@ -23,10 +23,16 @@ Parents and children use separate sessions. Up to 128 sessions can be resident.
 The interpreter bounds loops and output; core supplies memory and
 wall-clock ceilings. Date and randomness are deterministic, not cryptographic.
 
-The heap survives deliveries within the instance. `checkpoint({named: values})`
-exports up to 32 KiB of JSON working values at a completed cell boundary. A fresh
-realm restores those values into `state` and sets `context.recovered` to true.
-Larger data needs blob/history references. Missing sessions cannot resume
+The heap survives deliveries within the instance. Every successful cell
+automatically exports up to 32 KiB of JSON `state` at its completion boundary.
+`checkpoint({named: values})` remains available for an explicit subset and keeps
+the version 1 format; once called, that explicit snapshot remains authoritative
+for later cells. New version 1 snapshots carry `mode: "automatic"` or
+`mode: "explicit"`; older snapshots without the field use explicit behavior. A
+fresh realm restores the latest snapshot into `state`
+and sets `context.recovered` to true. State that is invalid JSON or exceeds the
+UTF-8 byte limit leaves the cell successful and adds a warning to its result;
+larger data needs blob/history references. Missing sessions cannot resume
 suspended cells; core reports interruption without replaying admitted source.
 
 The `repl` component of the rlm package, not a plugin of its own: it ships inside

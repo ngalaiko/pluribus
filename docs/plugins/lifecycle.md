@@ -136,7 +136,7 @@ Four versions are independent:
 - plugin version;
 - plugin-owned payload and state formats.
 
-ABI `2.0.0` requires an exact match. The host may support several ABI versions side by side later.
+ABI `3.0.0` requires an exact match. The host may support several ABI versions side by side later.
 
 Minor versions may add a standard world; patch versions may clarify behavior or fix documentation. Neither changes an existing interface type; that requires a new major ABI package version.
 

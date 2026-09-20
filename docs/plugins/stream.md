@@ -1,6 +1,6 @@
 # Byte channels
 
-Implemented for ABI `pluribus:plugin@2.0.0`. `socket.connect` exchanges bytes
+Implemented for ABI `pluribus:plugin@3.0.0`. `socket.connect` exchanges bytes
 with the one configured Unix socket endpoint granted to an instance. HTTP uses
 WASI request/response body streams. Core owns transport and peer verification;
 the plugin owns framing and protocol semantics.
@@ -76,7 +76,7 @@ Merge into the runtime configuration:
 
 Each connection receives its own byte budget; this is not a delivery-wide
 quota. Connecting requires an endpoint grant. The manifest must import
-`pluribus:plugin/socket@2.0.0` and request `host.stream` with exactly
+`pluribus:plugin/socket@3.0.0` and request `host.stream` with exactly
 `constraints = { unrestricted = true }`. Describe the endpoint's authority in
 the manifest. Without a granted endpoint `connect` returns `permission-denied`,
 which the plugin turns into a `capability.failed` event rather than a trap. A

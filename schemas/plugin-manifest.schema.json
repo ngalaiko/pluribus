@@ -13,7 +13,7 @@
   ],
   "properties": {
     "abi": {
-      "const": "pluribus:plugin@2.0.0"
+      "const": "pluribus:plugin@3.0.0"
     },
     "manifest_version": {
       "const": 1
@@ -260,17 +260,17 @@
           "uniqueItems": true,
           "items": {
             "enum": [
-              "pluribus:plugin/events@2.0.0",
-                "pluribus:plugin/runtime@2.0.0",
-              "pluribus:plugin/state@2.0.0",
-              "pluribus:plugin/blobs@2.0.0",
+              "pluribus:plugin/events@3.0.0",
+                "pluribus:plugin/runtime@3.0.0",
+              "pluribus:plugin/state@3.0.0",
+              "pluribus:plugin/blobs@3.0.0",
               "wasi:http/types@0.3.0",
                 "wasi:http/client@0.3.0",
                 "wasi:clocks/system-clock@0.3.0",
                 "wasi:clocks/monotonic-clock@0.3.0",
                 "wasi:random/random@0.3.0",
-              "pluribus:plugin/socket@2.0.0",
-              "pluribus:plugin/credentials@2.0.0"
+              "pluribus:plugin/socket@3.0.0",
+              "pluribus:plugin/credentials@3.0.0"
             ]
           }
         },

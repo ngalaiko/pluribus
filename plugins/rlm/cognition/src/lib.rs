@@ -1,4 +1,5 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod compaction;
 mod engine;
 mod jobs;
 mod storage;
@@ -170,6 +171,10 @@ mod component {
                                 activity_id: None,
                                 recorded_from_ms: None,
                                 recorded_to_ms: None,
+                                text_query: None,
+                                before_sequence: None,
+                                conversation_id: None,
+                                descending: false,
                             },
                             limit as u32,
                         )?;
@@ -204,6 +209,195 @@ mod component {
                             session,
                             &value["id"],
                             Ok(json!({"events":rows,"after":after})),
+                            &event.event_id,
+                        ));
+                    } else {
+                        drafts.push(resume(
+                            session,
+                            &value["id"],
+                            Err("history access is not granted".into()),
+                            &event.event_id,
+                        ));
+                    }
+                }
+                if !resumed
+                    && event.event_type == "code.yielded"
+                    && value["method"] == "history.search"
+                {
+                    let session = value["sessionId"].as_str().unwrap_or("");
+                    if let Some(window) = engine.history_window(&config, session) {
+                        let args = &value["args"];
+                        let Some(text) = args["query"].as_str() else {
+                            drafts.push(resume(
+                                session,
+                                &value["id"],
+                                Err("history.search requires a string query".into()),
+                                &event.event_id,
+                            ));
+                            continue;
+                        };
+                        if text.trim().is_empty() || text.len() > 4096 {
+                            drafts.push(resume(
+                                session,
+                                &value["id"],
+                                Err("history.search requires a nonempty query of at most 4096 bytes".into()),
+                                &event.event_id,
+                            ));
+                            continue;
+                        }
+                        if ["conversationId", "correlationId", "activityId"]
+                            .iter()
+                            .any(|name| args.get(*name).is_some_and(|value| !value.is_string()))
+                        {
+                            drafts.push(resume(
+                                session,
+                                &value["id"],
+                                Err(
+                                    "conversationId, correlationId, and activityId must be strings"
+                                        .into(),
+                                ),
+                                &event.event_id,
+                            ));
+                            continue;
+                        }
+                        let event_types: Vec<String> = match args.get("eventTypes") {
+                            Some(filter) => match serde_json::from_value(filter.clone()) {
+                                Ok(types) => types,
+                                Err(_) => {
+                                    drafts.push(resume(
+                                        session,
+                                        &value["id"],
+                                        Err("eventTypes must be an array of strings".into()),
+                                        &event.event_id,
+                                    ));
+                                    continue;
+                                }
+                            },
+                            None => vec![],
+                        };
+                        let parse_time = |name: &str| -> Result<Option<i64>, String> {
+                            match args.get(name) {
+                                None => Ok(None),
+                                Some(value) => value
+                                    .as_i64()
+                                    .map(Some)
+                                    .ok_or_else(|| format!("{name} must be an integer")),
+                            }
+                        };
+                        let parse_u64 = |name: &str| -> Result<Option<u64>, String> {
+                            match args.get(name) {
+                                None => Ok(None),
+                                Some(value) => value
+                                    .as_u64()
+                                    .map(Some)
+                                    .ok_or_else(|| format!("{name} must be a nonnegative integer")),
+                            }
+                        };
+                        let (recorded_from_ms, recorded_to_ms) =
+                            match (parse_time("recordedFromMs"), parse_time("recordedToMs")) {
+                                (Ok(from), Ok(to)) => (from, to),
+                                (Err(error), _) | (_, Err(error)) => {
+                                    drafts.push(resume(
+                                        session,
+                                        &value["id"],
+                                        Err(error.into()),
+                                        &event.event_id,
+                                    ));
+                                    continue;
+                                }
+                            };
+                        if recorded_from_ms
+                            .zip(recorded_to_ms)
+                            .is_some_and(|(from, to)| from > to)
+                        {
+                            drafts.push(resume(
+                                session,
+                                &value["id"],
+                                Err("recordedFromMs must not exceed recordedToMs".into()),
+                                &event.event_id,
+                            ));
+                            continue;
+                        }
+                        let (requested_before, requested_limit) =
+                            match (parse_u64("before"), parse_u64("limit")) {
+                                (Ok(before), Ok(limit)) => (before, limit),
+                                (Err(error), _) | (_, Err(error)) => {
+                                    drafts.push(resume(
+                                        session,
+                                        &value["id"],
+                                        Err(error.into()),
+                                        &event.event_id,
+                                    ));
+                                    continue;
+                                }
+                            };
+                        if requested_limit == Some(0) {
+                            drafts.push(resume(
+                                session,
+                                &value["id"],
+                                Err("limit must be greater than zero".into()),
+                                &event.event_id,
+                            ));
+                            continue;
+                        }
+                        let upper = window.after.saturating_add(u64::from(window.limit));
+                        let before = requested_before
+                            .unwrap_or(upper.saturating_add(1))
+                            .min(upper.saturating_add(1));
+                        let lower = window.after;
+                        let limit = requested_limit
+                            .unwrap_or(20)
+                            .min(100)
+                            .min(u64::from(window.limit));
+                        let page = events::query(
+                            &events::Filter {
+                                text_query: Some(text.to_owned()),
+                                after_sequence: Some(lower),
+                                before_sequence: Some(before),
+                                event_types,
+                                conversation_id: args["conversationId"].as_str().map(str::to_owned),
+                                correlation_id: args["correlationId"].as_str().map(str::to_owned),
+                                activity_id: args["activityId"].as_str().map(str::to_owned),
+                                recorded_from_ms,
+                                recorded_to_ms,
+                                descending: true,
+                            },
+                            limit as u32,
+                        )?;
+                        let mut rows = vec![];
+                        let mut size = 0;
+                        let mut after = page.next_sequence;
+                        let mut error = None;
+                        for item in page.events {
+                            let excerpt = match item.payload {
+                                Payload::Json(bytes) => String::from_utf8_lossy(&bytes)
+                                    .chars()
+                                    .take(1024)
+                                    .collect::<String>(),
+                                Payload::Blob(_) => String::new(),
+                            };
+                            let row = json!({"eventId":item.event_id,"sequence":item.sequence,"type":item.event_type,"actorId":item.actor.id,"recordedAtMs":item.recorded_at_ms,"causationId":item.causation_id,"excerpt":excerpt});
+                            let bytes = row.to_string().len();
+                            if rows.is_empty() && bytes > 63 * 1024 {
+                                error = Some(
+                                    "history.search event metadata exceeds the page limit".into(),
+                                );
+                                break;
+                            }
+                            if size + bytes > 63 * 1024 {
+                                break;
+                            }
+                            size += bytes;
+                            after = Some(item.sequence);
+                            rows.push(row);
+                        }
+                        drafts.push(resume(
+                            session,
+                            &value["id"],
+                            match error {
+                                Some(error) => Err(error),
+                                None => Ok(json!({"events":rows,"nextBefore":after})),
+                            },
                             &event.event_id,
                         ));
                     } else {
