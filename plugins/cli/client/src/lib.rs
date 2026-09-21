@@ -2,7 +2,8 @@
 
 //! A terminal connector. Subscribed bridge input produces observations.
 
-wit_bindgen::generate!({ generate_all, path: "../../wit", world: "plugin" });
+use pluribus_plugin_sdk::export;
+pub use pluribus_plugin_sdk::{exports, pluribus, wasi};
 
 use channel::Socket;
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
@@ -24,9 +25,7 @@ const CAPABILITY: &str = "cli.reply";
 /// empty namespace replays whatever the bridge still holds.
 const CURSOR_KEY: &str = "input/cursor";
 
-mod channel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/socket.rs"));
-}
+use pluribus_plugin_sdk::socket as channel;
 
 struct Cli;
 
@@ -82,7 +81,7 @@ impl Guest for Cli {
             }
             INPUT.with_borrow_mut(Vec::clear);
             let result: Result<bool, Error> = async {
-                let mut input = Socket::connect().await?;
+                let mut input = Socket::connect("default").await?;
                 input
                     .send(&poll_request(&configuration()?, cursor()?)?)
                     .await?;
@@ -227,7 +226,7 @@ async fn exchange(request: &Request, timeout_ms: u32) -> Result<Response, Error>
     request.validate().map_err(invalid)?;
     let mut bytes = serde_json::to_vec(request).map_err(|_| internal("cannot encode request"))?;
     bytes.push(b'\n');
-    let mut channel = Socket::connect().await?;
+    let mut channel = Socket::connect("default").await?;
     send(&mut channel, &bytes, timeout_ms).await
 }
 

@@ -1,6 +1,6 @@
 use pluribus_core::{
-    CapabilityName, ConstraintSet, Grant, HttpGrant, PrincipalKind, PrincipalRef, StreamEndpoint,
-    StreamGrant,
+    CapabilityName, ConstraintSet, Grant, HttpGrant, PrincipalKind, PrincipalRef, StartTls,
+    StreamEndpoint, StreamGrant,
 };
 use pluribus_runtime_wasm::RuntimeLimits;
 use serde::{Deserialize, Serialize};
@@ -26,10 +26,6 @@ pub struct PluginInstance {
     pub overrides: BTreeMap<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access: Option<Value>,
-    #[serde(skip)]
-    pub enrollment_origins: Vec<String>,
-    #[serde(rename = "enrollment_origins", skip_serializing_if = "Option::is_none")]
-    pub enrollment_overrides: Option<Vec<String>>,
 }
 
 fn empty_object(value: &Value) -> bool {
@@ -53,8 +49,6 @@ impl<'de> Deserialize<'de> for PluginInstance {
             components: BTreeMap<String, Value>,
             #[serde(default)]
             access: Option<Value>,
-            #[serde(default)]
-            enrollment_origins: Option<Vec<String>>,
         }
         let input = Input::deserialize(deserializer)?;
         let components = input
@@ -75,8 +69,6 @@ impl<'de> Deserialize<'de> for PluginInstance {
             components,
             overrides: input.components,
             access: input.access,
-            enrollment_origins: input.enrollment_origins.clone().unwrap_or_default(),
-            enrollment_overrides: input.enrollment_origins,
         })
     }
 }
@@ -86,8 +78,10 @@ impl<'de> Deserialize<'de> for PluginInstance {
 pub struct ComponentAccess {
     #[serde(default)]
     pub http: HttpAccess,
-    #[serde(default)]
-    pub stream: Option<StreamAccess>,
+    /// Endpoints this component may reach, by the name `socket.connect`
+    /// selects them with. A component asking for one endpoint gets one entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stream: BTreeMap<String, StreamAccess>,
     #[serde(default)]
     pub limits: Option<InstanceLimits>,
 }
@@ -121,13 +115,54 @@ impl InstanceLimits {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamAccess {
-    pub socket: PathBuf,
+    /// A local endpoint: absolute socket path, plus the accounts allowed to
+    /// answer it. Mutually exclusive with `tls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
     /// Accounts allowed to answer the socket. See `StreamEndpoint`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peer_uids: Vec<u32>,
+    /// A remote endpoint, authenticated by its certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsAccess>,
     #[serde(default = "default_stream_bytes")]
     pub max_bytes: u64,
     #[serde(default = "default_stream_timeout_ms")]
     pub max_timeout_ms: u32,
+    /// Connections one instance may hold open at once. Unbounded unless the
+    /// grant sets a ceiling: a local endpoint's concurrency is the plugin's
+    /// business, and capping it by default would throttle existing ones.
+    #[serde(default = "default_stream_connections")]
+    pub max_connections: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsAccess {
+    pub hostname: String,
+    pub port: u16,
+    /// Permits a loopback or private-network endpoint, as the HTTP grant does.
+    #[serde(default)]
+    pub allow_private_network: bool,
+    /// Names a plaintext preamble the host speaks before the handshake, for
+    /// an endpoint that upgrades rather than answering in TLS. The guest is
+    /// handed an encrypted connection either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starttls: Option<StartTlsAccess>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartTlsAccess {
+    Smtp,
+}
+
+impl From<StartTlsAccess> for StartTls {
+    fn from(value: StartTlsAccess) -> Self {
+        match value {
+            StartTlsAccess::Smtp => Self::Smtp,
+        }
+    }
 }
 
 fn default_stream_bytes() -> u64 {
@@ -138,16 +173,77 @@ fn default_stream_timeout_ms() -> u32 {
     300_000
 }
 
+const fn default_stream_connections() -> u32 {
+    u32::MAX
+}
+
 impl StreamAccess {
-    pub fn grant(&self) -> StreamGrant {
-        StreamGrant {
-            endpoint: StreamEndpoint::Unix {
-                path: self.socket.clone(),
+    /// # Errors
+    /// Returns an error unless exactly one endpoint kind is configured.
+    pub fn grant(&self) -> Result<StreamGrant, String> {
+        let endpoint = match (&self.socket, &self.tls) {
+            (Some(path), None) => StreamEndpoint::Unix {
+                path: path.clone(),
                 peer_uids: self.peer_uids.clone(),
             },
+            (None, Some(tls)) => {
+                if !self.peer_uids.is_empty() {
+                    return Err("peer_uids belongs to a socket endpoint, not a TLS one".into());
+                }
+                StreamEndpoint::Tls {
+                    hostname: tls.hostname.clone(),
+                    port: tls.port,
+                    allow_private_network: tls.allow_private_network,
+                    starttls: tls.starttls.map(Into::into),
+                }
+            }
+            (None, None) => return Err("stream access configures no endpoint".into()),
+            (Some(_), Some(_)) => {
+                return Err("stream access configures both a socket and a TLS endpoint".into());
+            }
+        };
+        Ok(StreamGrant {
+            endpoint,
             max_bytes: self.max_bytes,
             max_timeout_ms: self.max_timeout_ms,
+            max_connections: self.max_connections,
+        })
+    }
+
+    /// Whether this endpoint is a local socket, which needs a private runtime
+    /// directory the transport checks before connecting.
+    #[must_use]
+    pub const fn is_local(&self) -> bool {
+        self.socket.is_some()
+    }
+
+    /// # Errors
+    /// Returns an error for a malformed endpoint or a limit of zero.
+    pub fn validate(&self) -> Result<(), String> {
+        let grant = self.grant()?;
+        match &grant.endpoint {
+            StreamEndpoint::Unix { path, peer_uids } => {
+                if !path.is_absolute() || peer_uids.is_empty() || peer_uids.contains(&0) {
+                    return Err(
+                        "endpoint requires an absolute socket and non-root peer UIDs".into(),
+                    );
+                }
+            }
+            StreamEndpoint::Tls { hostname, port, .. } => {
+                if *port == 0 || hostname.is_empty() || hostname.parse::<std::net::IpAddr>().is_ok()
+                {
+                    return Err("TLS endpoint requires a hostname and a port".into());
+                }
+            }
         }
+        if self.max_bytes == 0
+            || self.max_connections == 0
+            || self.max_timeout_ms == 0
+            || self.max_timeout_ms > 300_000
+        {
+            return Err("endpoint requires positive limits within the ceiling".into());
+        }
+        Ok(())
     }
 }
 
@@ -287,17 +383,13 @@ impl Config {
                 {
                     return Err(format!("invalid HTTP limits for instance {id}"));
                 }
-                if let Some(stream) = &access.stream
-                    && (!stream.socket.is_absolute()
-                        || stream.peer_uids.is_empty()
-                        || stream.peer_uids.contains(&0)
-                        || stream.max_bytes == 0
-                        || stream.max_timeout_ms == 0
-                        || stream.max_timeout_ms > 300_000)
-                {
-                    return Err(format!(
-                        "instance {id} requires an absolute endpoint socket, non-root peer UIDs, and positive limits"
-                    ));
+                for (endpoint, stream) in &access.stream {
+                    if endpoint.is_empty() || endpoint.chars().any(char::is_whitespace) {
+                        return Err(format!("invalid endpoint name: {endpoint}"));
+                    }
+                    stream
+                        .validate()
+                        .map_err(|error| format!("instance {id} endpoint {endpoint}: {error}"))?;
                 }
             }
         }
@@ -456,6 +548,72 @@ mod tests {
         assert!(config.component("telegram/missing").is_err());
     }
 
+    fn stream(value: Value) -> StreamAccess {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn an_endpoint_is_either_local_or_remote_never_both_or_neither() {
+        let tls = json!({"tls":{"hostname":"imap.mail.me.com","port":993}});
+        let unix = json!({"socket":"/run/p/e.sock","peer_uids":[1001]});
+        assert!(stream(tls.clone()).grant().is_ok());
+        assert!(stream(unix.clone()).grant().is_ok());
+        assert!(stream(json!({})).grant().is_err());
+        let mut both = tls.clone();
+        both["socket"] = json!("/run/p/e.sock");
+        assert!(stream(both).grant().is_err());
+        // peer UIDs mean nothing to a certificate, so they are not silently ignored.
+        let mut confused = tls;
+        confused["peer_uids"] = json!([1001]);
+        assert!(stream(confused).grant().is_err());
+    }
+
+    #[test]
+    fn a_tls_endpoint_needs_a_name_a_port_and_a_connection() {
+        assert!(
+            stream(json!({"tls":{"hostname":"imap.mail.me.com","port":993}}))
+                .validate()
+                .is_ok()
+        );
+        for endpoint in [
+            json!({"tls":{"hostname":"imap.mail.me.com","port":0}}),
+            json!({"tls":{"hostname":"","port":993}}),
+            // An address cannot be verified against a certificate name.
+            json!({"tls":{"hostname":"17.253.144.10","port":993}}),
+            json!({"tls":{"hostname":"imap.mail.me.com","port":993},"max_connections":0}),
+            json!({"tls":{"hostname":"imap.mail.me.com","port":993},"max_timeout_ms":300001}),
+        ] {
+            assert!(
+                stream(endpoint.clone()).validate().is_err(),
+                "{endpoint} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_endpoint_keeps_its_defaults_and_its_peer_rules() {
+        let access = stream(json!({"socket":"/run/p/e.sock","peer_uids":[1001]}));
+        assert_eq!(access.max_bytes, 16 * 1024 * 1024);
+        // A local endpoint is not capped unless the grant says so.
+        assert_eq!(access.max_connections, u32::MAX);
+        assert!(access.is_local());
+        assert!(
+            stream(json!({"socket":"relative.sock","peer_uids":[1001]}))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            stream(json!({"socket":"/run/p/e.sock","peer_uids":[0]}))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            stream(json!({"socket":"/run/p/e.sock"}))
+                .validate()
+                .is_err()
+        );
+    }
+
     #[test]
     fn package_access_fields_are_rejected() {
         let mut value = serde_json::to_value(crate::fixtures::config()).unwrap();
@@ -546,7 +704,6 @@ mod tests {
         let grant = instance.components["main"].http.grant("example/main");
         assert!(grant.origins.is_empty());
         assert!(grant.methods.is_empty());
-        assert!(instance.enrollment_origins.is_empty());
         assert!(!grant.allow_http && !grant.allow_private_network);
         assert_eq!(grant.max_redirects, 0);
         assert_eq!(

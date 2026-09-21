@@ -12,8 +12,8 @@ use pluribus_core::{
 };
 use pluribus_plugin_package::PluginPackage;
 use pluribus_runtime_wasm::{
-    Delivery, PluginServices, Principal, PrincipalKind as RuntimePrincipalKind, Runtime,
-    RuntimeLimits,
+    CredentialAccess, Delivery, PluginServices, Principal, PrincipalKind as RuntimePrincipalKind,
+    Runtime, RuntimeLimits,
 };
 use pluribus_store_sqlite::SqliteEventStore;
 use serde_json::{Value, json};
@@ -118,6 +118,27 @@ fn payload(event: &CommittedEvent) -> Value {
         panic!("expected JSON")
     };
     serde_json::from_slice(bytes).unwrap()
+}
+
+/// The sealed record the packaged `OpenRouter` component reads for its key.
+async fn openrouter_credentials() -> CredentialAccess {
+    use pluribus_core::PluginCredentialStore as _;
+    let store = Arc::new(pluribus_core::InMemoryCredentialStore::default());
+    store
+        .replace_plugin_credential(
+            &pluribus_core::SecretHandle::new("test"),
+            "dev.pluribus.openrouter",
+            None,
+            br#"{"api_key":"test"}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+    CredentialAccess {
+        store,
+        provider: "dev.pluribus.openrouter".into(),
+        handles: std::collections::HashSet::from(["test".to_owned()]),
+        exports: std::collections::BTreeMap::new(),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -439,6 +460,7 @@ async fn blocked_provider(stopping: bool) {
             "openrouter",
             json!({"credentials": {"api-key": "test"},"models":["test"]}),
             PluginServices {
+                credentials: Some(openrouter_credentials().await),
                 http: Some(http),
                 http_grant: Some(pluribus_core::HttpGrant {
                     component: PrincipalRef::new(PrincipalKind::Component, "provider"),
@@ -2670,15 +2692,22 @@ async fn install_cancellable_shell(
                 visible_blobs: vec![],
             },
             PluginServices {
-                stream: Some(executor.clone()),
-                stream_grant: Some(pluribus_core::StreamGrant {
-                    endpoint: pluribus_core::StreamEndpoint::Unix {
-                        path: "/tmp/executor.sock".into(),
-                        peer_uids: vec![0],
+                streams: [(
+                    "default".to_owned(),
+                    pluribus_runtime_wasm::GrantedStream {
+                        service: executor.clone(),
+                        grant: pluribus_core::StreamGrant {
+                            endpoint: pluribus_core::StreamEndpoint::Unix {
+                                path: "/tmp/executor.sock".into(),
+                                peer_uids: vec![0],
+                            },
+                            max_bytes: 65536,
+                            max_timeout_ms: 30000,
+                            max_connections: u32::MAX,
+                        },
                     },
-                    max_bytes: 65536,
-                    max_timeout_ms: 30000,
-                }),
+                )]
+                .into(),
                 ..Default::default()
             },
             &[],
@@ -2907,6 +2936,7 @@ async fn a_photo_observation_reaches_the_provider_as_an_image_part() {
             "openrouter",
             json!({"credentials": {"api-key": "test"},"models":["test"]}),
             PluginServices {
+                credentials: Some(openrouter_credentials().await),
                 http: Some(http.clone()),
                 http_grant: Some(pluribus_core::HttpGrant {
                     component: PrincipalRef::new(PrincipalKind::Component, "provider"),

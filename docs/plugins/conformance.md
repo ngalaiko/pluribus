@@ -87,13 +87,13 @@ The repository validates its WIT package with `wit-parser` in [`crates/pluribus-
 ## Credential checks
 
 - Descriptors are deterministic and contain no secret values.
-- Input and flow schemas validate before any network request.
-- Unknown fields, flow schemas, template parts, and response references fail closed.
-- Enrollment and injection origins fit effective grants.
+- Input and flow schemas validate before the record is sealed or staged.
+- Unknown fields and flow schemas fail closed.
+- Every origin a plugin reaches while rotating a secret fits its effective grant.
 - Secret input is hidden and absent from configuration, state, events, logs, and errors.
 - Failed replacement preserves the prior credential.
-- Concurrent refresh sends one request and accepts refresh-token rotation.
-- Revocation removes local secret material without loading it into the component.
+- Concurrent rotation resolves through compare-and-swap.
+- Revocation removes local secret material.
 
 ## Event sink checks
 

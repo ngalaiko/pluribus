@@ -8,10 +8,11 @@ license = "MIT OR Apache-2.0"
 [[credentials]]
 components = ["receive", "send"]
 id = "bot-token"
+access = true
 display_name = "Telegram bot token"
 description = "Authenticate one Telegram bot."
 input_schema = "schemas/credential.input.json"
-flow_schema = "pluribus:credential/static-http@1"
+flow_schema = "pluribus:credential/static-plugin@1"
 flow = "flows/bot-token.json"
 
 

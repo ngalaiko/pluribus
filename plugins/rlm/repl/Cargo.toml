@@ -9,9 +9,9 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+pluribus-plugin-sdk.workspace = true
 boa_engine = { workspace = true }
 serde_json = { workspace = true }
-wit-bindgen = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { workspace = true }

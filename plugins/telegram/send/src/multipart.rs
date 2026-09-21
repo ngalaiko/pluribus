@@ -1,9 +1,7 @@
 //! Uploading media to Telegram as multipart form data.
 
 use serde::Deserialize;
-use telegram::api::{
-    CHUNK_BYTES, CREDENTIAL_MARKER, ORIGIN, TelegramResponse, decode_response, internal, write,
-};
+use telegram::api::{CHUNK_BYTES, ORIGIN, TelegramResponse, decode_response, internal, write};
 use telegram::http::{self, Header, Request};
 use telegram::pluribus::plugin::blobs;
 use telegram::pluribus::plugin::types::{BlobRef, Error};
@@ -32,7 +30,7 @@ pub fn call(
     method: &str,
     fields: &[(String, String)],
     files: &[(String, String, BlobRef)],
-    credential: &str,
+    token: &str,
 ) -> Result<TelegramResponse, Error> {
     let boundary = "pluribus-telegram-boundary-7d9f1a";
     let upload = blobs::open_write("multipart/form-data", None)?;
@@ -81,13 +79,12 @@ pub fn call(
     let body = blobs::finish(&upload)?;
     let response = http::send(&Request {
         method: "POST".into(),
-        url: format!("{ORIGIN}/{CREDENTIAL_MARKER}/{method}"),
+        url: format!("{ORIGIN}/bot{token}/{method}"),
         headers: vec![Header {
             name: "content-type".into(),
             value: format!("multipart/form-data; boundary={boundary}").into_bytes(),
         }],
         body: Some(body),
-        credential: Some(credential.into()),
         timeout_ms: 120_000,
     })?;
     decode_response(response.status, response.body)

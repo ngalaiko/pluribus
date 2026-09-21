@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["credentials"],
+  "properties": {
+    "credentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["account"],
+      "properties": {
+        "account": { "type": "string", "minLength": 1 }
+      }
+    },
+    "mailbox": {
+      "description": "The mailbox observed. One instance watches one mailbox.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "default": "INBOX"
+    },
+    "max_message_bytes": {
+      "description": "Largest message fetched whole. A larger one is observed by its header and marked truncated.",
+      "type": "integer",
+      "minimum": 1024,
+      "maximum": 8388608,
+      "default": 2097152
+    },
+    "max_attachment_bytes": {
+      "description": "Largest attachment stored as a blob. A larger one is described without its bytes.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8388608,
+      "default": 8388608
+    },
+    "batch": {
+      "description": "Messages fetched before committing and looking around.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 200,
+      "default": 20
+    },
+    "import_history": {
+      "description": "Observe what is already in the mailbox on first connection. Off by default: a first run records the boundary and observes arrivals.",
+      "type": "boolean",
+      "default": false
+    },
+    "from": {
+      "description": "The address outgoing mail is sent from, envelope and header both. Defaults to the credential's username, which for iCloud is the account's address.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 320
+    },
+    "display_name": {
+      "description": "The display name outgoing mail carries beside the address.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    }
+  }
+}

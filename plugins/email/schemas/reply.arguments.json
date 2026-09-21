@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["conversationId", "to", "messageId", "text"],
+  "properties": {
+    "conversationId": {
+      "description": "The observation's conversationId, email:<mailbox>.",
+      "type": "string",
+      "minLength": 1
+    },
+    "to": {
+      "description": "Where the answer goes: the observation's replyTo when it had one, otherwise its from.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 320
+    },
+    "messageId": {
+      "description": "The observation's messageId. Becomes In-Reply-To and the last entry of References.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 998
+    },
+    "references": {
+      "description": "The observation's references, so a long thread keeps its chain.",
+      "type": "array",
+      "maxItems": 64,
+      "items": { "type": "string", "minLength": 1, "maxLength": 998 }
+    },
+    "subject": {
+      "description": "The observation's subject. Sent prefixed with Re: unless it already is.",
+      "type": "string",
+      "maxLength": 998
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 262144
+    }
+  }
+}

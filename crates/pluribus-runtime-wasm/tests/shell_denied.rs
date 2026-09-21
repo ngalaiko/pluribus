@@ -213,11 +213,13 @@ async fn export_delivery(mode: &str) {
                         })].into_iter().collect()
                     },
                 }),
-                stream: Some(stream.clone()),
-                stream_grant: Some(pluribus_core::StreamGrant {
-                    endpoint: pluribus_core::StreamEndpoint::Unix { path: "/unused/executor.sock".into(), peer_uids: vec![1001] },
-                    max_bytes: 1024 * 1024, max_timeout_ms: 30_000,
-                }),
+                streams: [("default".to_owned(), pluribus_runtime_wasm::GrantedStream {
+                    service: stream.clone(),
+                    grant: pluribus_core::StreamGrant {
+                        endpoint: pluribus_core::StreamEndpoint::Unix { path: "/unused/executor.sock".into(), peer_uids: vec![1001] },
+                        max_bytes: 1024 * 1024, max_timeout_ms: 30_000, max_connections: u32::MAX,
+                    },
+                })].into(),
                 ..PluginServices::default()
             },
         )

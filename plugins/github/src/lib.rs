@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-wit_bindgen::generate!({ generate_all,path:"../../wit",world:"plugin"});
+use pluribus_plugin_sdk::export;
+pub use pluribus_plugin_sdk::{exports, pluribus, wasi};
 mod auth;
 #[allow(dead_code)]
 mod common;
@@ -28,7 +29,7 @@ struct Config {
 }
 thread_local! {static CONFIG:std::cell::RefCell<Option<Config>>=const{std::cell::RefCell::new(None)};}
 struct Github;
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+use pluribus_plugin_sdk::serve;
 
 fn setup(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     let config: Config =
@@ -455,5 +456,4 @@ fn now_ms() -> i64 {
     t.seconds * 1000 + i64::from(t.nanoseconds / 1_000_000)
 }
 
-#[path = "../../shared/http.rs"]
-pub mod http;
+pub use pluribus_plugin_sdk::http;

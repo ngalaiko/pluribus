@@ -19,7 +19,6 @@ pub const RESERVED_EVENT_TYPES: &[&str] = &[
     "observation.received",
     // Gates
     "policy.decision",
-    "credential.lifecycle",
     "credential.enrollment.requested",
     // Capability and model dispatch. The request itself is plugin-emitted;
     // the core owns the decision and the dispatch record.
@@ -138,7 +137,6 @@ impl EventTypeRegistry {
                 "cognition.resource-exhausted",
                 "pluribus.cognition-resource-exhausted/1",
             ),
-            ("credential.lifecycle", "pluribus.credential-lifecycle/1"),
             ("activity.attempted", "pluribus.activity-attempt/1"),
             ("activity.unknown", "pluribus.activity-attempt/1"),
             ("cognition.checkpoint", "pluribus.cognition-checkpoint/1"),

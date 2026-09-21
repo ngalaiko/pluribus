@@ -1,13 +1,29 @@
 //! The Telegram HTTP surface both components call.
 
 use crate::http::{self, Header, Request};
-use crate::pluribus::plugin::blobs;
 use crate::pluribus::plugin::types::{BlobRef, Error, ErrorCode};
+use crate::pluribus::plugin::{blobs, credentials};
+use serde::Deserialize;
 use serde_json::Value;
 
 pub const ORIGIN: &str = "https://api.telegram.org";
-pub const CREDENTIAL_MARKER: &str = "_pluribus_credential_";
 pub const CHUNK_BYTES: u32 = 1024 * 1024;
+
+/// The enrolled record behind a bot-token handle.
+#[derive(Deserialize)]
+struct BotToken {
+    token: String,
+}
+
+/// Reads the enrolled token. Telegram carries it in the path, so every
+/// request URL is built from what this returns.
+pub fn bot_token(handle: &str) -> Result<String, Error> {
+    let bytes =
+        credentials::get(handle)?.ok_or_else(|| invalid("Telegram bot token is not enrolled"))?;
+    let record: BotToken =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("invalid credential record"))?;
+    Ok(record.token)
+}
 
 pub struct TelegramResponse {
     pub value: Value,
@@ -19,17 +35,17 @@ pub struct TelegramResponse {
 pub fn call_json(
     method: &str,
     payload: &Value,
-    credential: &str,
+    token: &str,
     timeout_ms: u32,
 ) -> Result<TelegramResponse, Error> {
-    let response = http::send(&request(method, payload, credential, timeout_ms)?)?;
+    let response = http::send(&request(method, payload, token, timeout_ms)?)?;
     decode_response(response.status, response.body)
 }
 
 pub fn request(
     method: &str,
     payload: &Value,
-    credential: &str,
+    token: &str,
     timeout_ms: u32,
 ) -> Result<Request, Error> {
     let body = put_blob(
@@ -38,13 +54,12 @@ pub fn request(
     )?;
     Ok(Request {
         method: "POST".into(),
-        url: format!("{ORIGIN}/{CREDENTIAL_MARKER}/{method}"),
+        url: format!("{ORIGIN}/bot{token}/{method}"),
         headers: vec![Header {
             name: "content-type".into(),
             value: b"application/json".to_vec(),
         }],
         body: Some(body),
-        credential: Some(credential.into()),
         timeout_ms,
     })
 }

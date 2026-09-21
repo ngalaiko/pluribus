@@ -1,5 +1,4 @@
-//! The bindings, transport, and configuration plumbing both Telegram
-//! components build on. Each component crate exports the world from here.
+//! Telegram configuration and API helpers over the shared plugin SDK.
 
 pub mod api;
 
@@ -8,15 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::cell::RefCell;
 
-wit_bindgen::generate!({ generate_all,
-    path: "../../../wit",
-    world: "plugin",
-    pub_export_macro: true,
-    // Component crates take this crate as `telegram`.
-    default_bindings_module: "telegram",
-    export_macro_name: "export",
-    generate_unused_types: true,
-});
+pub use pluribus_plugin_sdk::{exports, pluribus, wasi};
 
 /// Configuration arrives in `init` and no import returns it later, so the
 /// instance holds it. A restart runs `init` again.
@@ -69,5 +60,4 @@ pub fn proposal(
     })
 }
 
-#[path = "../../../shared/http.rs"]
-pub mod http;
+pub use pluribus_plugin_sdk::http;

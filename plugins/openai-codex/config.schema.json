@@ -28,7 +28,7 @@
         "subscription": {
           "type": "string",
           "minLength": 1,
-          "description": "Host-owned OAuth credential handle."
+          "description": "Handle of the enrolled Codex token pair."
         }
       },
       "additionalProperties": false

@@ -51,6 +51,10 @@ rec {
       components = [ "listen" ];
       binaries = [ "${workspace.helpers}/bin/pluribus-http-listener" ];
     };
+    email = package {
+      name = "email";
+      components = [ "" ];
+    };
     github = package {
       name = "github";
       components = [ "receive" ];

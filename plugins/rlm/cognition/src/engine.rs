@@ -20,6 +20,10 @@ pub struct Engine {
     routing_jobs: BTreeMap<String, (Job, Value)>,
     #[serde(skip)]
     routing_observations: BTreeMap<String, Observation>,
+    /// Same-conversation observations held in the index but outside the loaded working set,
+    /// counted per conversation key.
+    #[serde(skip)]
+    unloaded_observations: BTreeMap<String, usize>,
     #[serde(skip)]
     partial: bool,
     #[serde(skip)]
@@ -1712,7 +1716,13 @@ impl Engine {
                 })
                 .collect();
             observations.sort_by_key(|o| o.sequence);
-            let available = observations.len();
+            let available = observations.len()
+                + self.origin_value(&task.root).map_or(0, |origin| {
+                    self.unloaded_observations
+                        .get(&conversation_key(origin))
+                        .copied()
+                        .unwrap_or(0)
+                });
             let entries: Vec<_> = observations
                 .into_iter()
                 .rev()
@@ -2322,15 +2332,16 @@ impl Engine {
         self.request(config, observation, cause)
     }
 
+    fn origin_value(&self, job: &str) -> Option<&Value> {
+        match self.tasks.get(job) {
+            Some(task) => Some(&task.context["observation"]),
+            None => self.routing_jobs.get(job).map(|(_, origin)| origin),
+        }
+    }
+
     fn same_origin(&self, _config: &Config, job: &str, value: &Value) -> bool {
-        let Some(task) = self.tasks.get(job) else {
-            return self
-                .routing_jobs
-                .get(job)
-                .is_some_and(|(_, origin)| same_conversation(origin, value));
-        };
-        let original = &task.context["observation"];
-        same_conversation(original, value)
+        self.origin_value(job)
+            .is_some_and(|original| same_conversation(original, value))
     }
 
     pub fn add_routing_observation(&mut self, observation: Observation) {
@@ -2345,6 +2356,10 @@ impl Engine {
 
     pub fn set_partial(&mut self) {
         self.partial = true;
+    }
+
+    pub fn set_unloaded_observations(&mut self, counts: BTreeMap<String, usize>) {
+        self.unloaded_observations = counts;
     }
 
     pub fn restore_resource_task(&mut self, config: &Config, id: &str, summary: &Value) {
@@ -2573,6 +2588,16 @@ fn reply_request(observation: &Value, text: &Value) -> Option<Value> {
         "capability": format!("{provider}.reply"),
         "arguments": {"conversationId": conversation, "text": text},
     }))
+}
+
+/// Identity of the conversation an observation belongs to.
+pub fn conversation_key(value: &Value) -> String {
+    json!([
+        value["provider"],
+        value["externalSenderId"],
+        value["conversationId"]
+    ])
+    .to_string()
 }
 
 pub fn same_conversation(original: &Value, value: &Value) -> bool {

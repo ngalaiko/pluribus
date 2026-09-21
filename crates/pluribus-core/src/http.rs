@@ -1,4 +1,4 @@
-use crate::{BlobRef, PrincipalRef, SecretHandle};
+use crate::{BlobRef, PrincipalRef};
 use std::error::Error;
 use std::fmt;
 
@@ -14,7 +14,6 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<HttpHeader>,
     pub body: Option<BlobRef>,
-    pub credential_handle: Option<SecretHandle>,
     pub timeout_ms: u32,
 }
 
@@ -23,7 +22,6 @@ pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<HttpHeader>,
     pub body: BlobRef,
-    pub credentials_used: Vec<SecretHandle>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

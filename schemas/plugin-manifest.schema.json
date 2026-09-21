@@ -175,14 +175,6 @@
             "$ref": "#/$defs/component_name"
           }
         },
-        "enrollment_origins": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "format": "uri"
-          }
-        },
         "access": {
           "type": "boolean",
           "default": false

@@ -1,12 +1,11 @@
+mod migration;
+
 use pluribus_core::{
-    AppendError, AppendRequest, AuthorityId, BlobRef, CommittedEvent, CredentialLifecycle,
-    CredentialStatus, CredentialStore, CursorKey, DeliveryCommit, DeliveryError, DeliveryReceipt,
-    DeliveryStore, EventId, EventMetadataSource, EventPayload, EventQuery, EventStore,
-    HttpCredential, OAuthCredential, OAuthCredentialSnapshot, OAuthCredentialStore, PrincipalKind,
-    PrincipalRef, SecretError, SecretHandle, SecretHeader, StateEntry, StateError, StateMutation,
-    StateNamespace, StatePage, StateSnapshot, StateStore, StreamId, StreamKind, credential_time_ms,
-    validate_http_credential, validate_oauth_credential, validate_recipe_adoption,
-    validate_refresh_replacement,
+    AppendError, AppendRequest, AuthorityId, BlobRef, CommittedEvent, CursorKey, DeliveryCommit,
+    DeliveryError, DeliveryReceipt, DeliveryStore, EventId, EventMetadataSource, EventPayload,
+    EventQuery, EventStore, PrincipalKind, PrincipalRef, SecretError, SecretHandle, StateEntry,
+    StateError, StateMutation, StateNamespace, StatePage, StateSnapshot, StateStore, StreamId,
+    StreamKind,
 };
 use rusqlite::types::Type;
 use rusqlite::types::Value;
@@ -134,6 +133,8 @@ const EVENT_SEARCH_SCHEMA: &str = "
     );
 ";
 
+/// Credential tables schema 11 drops. The ladder still creates them so a
+/// database from any earlier version migrates through the same steps.
 const CREDENTIAL_SCHEMA: &str = "
     CREATE TABLE http_credentials (
         handle TEXT PRIMARY KEY CHECK (handle <> ''),
@@ -262,7 +263,7 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
             let version: i64 = connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(storage)?;
-            if !(9..=10).contains(&version) {
+            if !(9..=11).contains(&version) {
                 return Err(storage("unsupported snapshot schema version"));
             }
             for query in [
@@ -271,10 +272,6 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                 "SELECT namespace,key,value FROM component_state LIMIT 0",
                 "SELECT stream_id,namespace,checkpoint FROM delivery_cursors LIMIT 0",
                 "SELECT handle FROM plugin_credentials LIMIT 0",
-                "SELECT handle FROM http_credentials LIMIT 0",
-                "SELECT handle FROM oauth_credentials LIMIT 0",
-                "SELECT handle,generation FROM credential_generations LIMIT 0",
-                "SELECT sequence,handle,outcome FROM credential_lifecycle LIMIT 0",
             ] {
                 connection.prepare(query).map_err(storage)?;
             }
@@ -415,7 +412,7 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                     "BEGIN IMMEDIATE; {DELIVERY_SCHEMA} PRAGMA user_version=6; COMMIT;"
                 ))
                 .map_err(storage)?,
-            6..=10 => {}
+            6..=11 => {}
             version => {
                 return Err(AppendError::Storage(format!(
                     "unsupported SQLite schema version: {version}"
@@ -453,6 +450,9 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
                     FROM events;
                 PRAGMA user_version=10; COMMIT;")).map_err(storage)?;
             }
+            if version < 11 {
+                migration::plugin_credentials(connection)?;
+            }
             Ok(())
         };
         database_call(&connection, operation, storage).await?;
@@ -460,364 +460,6 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
             metadata: Arc::new(metadata),
             connection,
         })
-    }
-
-    /// Adds or replaces a scoped HTTP credential.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid metadata or unavailable storage.
-    pub async fn put_http_credential(
-        &self,
-        handle: &SecretHandle,
-        credential: &HttpCredential,
-    ) -> Result<(), SecretError> {
-        let handle_owned = handle.to_owned();
-        let credential_owned = credential.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-            let credential = &credential_owned;
-
-            validate_http_credential(handle, credential)?;
-
-            let transaction = connection.transaction().map_err(secret_storage)?;
-            bump_credential_generation(&transaction, handle)?;
-            record_credential_lifecycle(
-                &transaction,
-                handle,
-                "enrolled",
-                credential_time_ms(),
-                None,
-            )?;
-            write_http_credential(&transaction, handle, credential)?;
-            transaction.commit().map_err(secret_storage)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-
-    /// Removes a scoped HTTP credential.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when storage is unavailable.
-    pub async fn remove_credential(&self, handle: &SecretHandle) -> Result<(), SecretError> {
-        let handle_owned = handle.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(secret_storage)?;
-            bump_credential_generation(&transaction, handle)?;
-            record_credential_lifecycle(
-                &transaction,
-                handle,
-                "revoked",
-                credential_time_ms(),
-                None,
-            )?;
-            transaction
-                .execute(
-                    "DELETE FROM http_credentials WHERE handle = ?1",
-                    params![handle.as_str()],
-                )
-                .map_err(secret_storage)?;
-            transaction.commit().map_err(secret_storage)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-}
-
-#[async_trait::async_trait]
-
-impl<M: Send + Sync + 'static> CredentialStore for SqliteEventStore<M> {
-    async fn resolve_http(
-        &self,
-        handle: &SecretHandle,
-        component: &PrincipalRef,
-        origin: &str,
-    ) -> Result<HttpCredential, SecretError> {
-        let handle_owned = handle.to_owned();
-        let component_owned = component.to_owned();
-        let origin_owned = origin.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-            let component = &component_owned;
-            let origin = &origin_owned;
-
-            let credential = load_http_credential(connection, handle)?;
-            if !credential
-                .allowed_origins
-                .iter()
-                .any(|allowed| allowed == origin)
-                || !credential
-                    .allowed_components
-                    .iter()
-                    .any(|allowed| allowed == component)
-            {
-                return Err(SecretError::PermissionDenied);
-            }
-            Ok(credential)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-}
-
-#[async_trait::async_trait]
-impl<M: Send + Sync + 'static> OAuthCredentialStore for SqliteEventStore<M> {
-    async fn lifecycle_after(
-        &self,
-        after_sequence: u64,
-        limit: usize,
-    ) -> Result<Vec<CredentialLifecycle>, SecretError> {
-        let operation = move |connection: &mut Connection| {
-            let mut statement = connection.prepare("SELECT sequence, handle, generation, outcome, at_ms, deadline_ms FROM credential_lifecycle WHERE sequence > ?1 ORDER BY sequence LIMIT ?2").map_err(secret_storage)?;
-            statement
-                .query_map(
-                    params![
-                        i64::try_from(after_sequence).unwrap_or(i64::MAX),
-                        i64::try_from(limit.min(1000)).unwrap_or(1000)
-                    ],
-                    |row| {
-                        Ok(CredentialLifecycle {
-                            sequence: row.get::<_, i64>(0)?.unsigned_abs(),
-                            handle: SecretHandle::new(row.get::<_, String>(1)?),
-                            generation: row.get::<_, i64>(2)?.unsigned_abs(),
-                            outcome: row.get(3)?,
-                            at_ms: row.get(4)?,
-                            deadline_ms: row.get(5)?,
-                        })
-                    },
-                )
-                .map_err(secret_storage)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(secret_storage)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-
-    async fn put_http(
-        &self,
-        handle: &SecretHandle,
-        credential: &HttpCredential,
-    ) -> Result<(), SecretError> {
-        self.put_http_credential(handle, credential).await
-    }
-
-    async fn load_oauth(&self, handle: &SecretHandle) -> Result<OAuthCredential, SecretError> {
-        Ok(self.load_oauth_snapshot(handle).await?.credential)
-    }
-
-    async fn load_oauth_snapshot(
-        &self,
-        handle: &SecretHandle,
-    ) -> Result<OAuthCredentialSnapshot, SecretError> {
-        let handle_owned = handle.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-
-            load_oauth_snapshot(connection, handle)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-
-    async fn put_oauth(
-        &self,
-        handle: &SecretHandle,
-        credential: &OAuthCredential,
-    ) -> Result<(), SecretError> {
-        let handle_owned = handle.to_owned();
-        let credential_owned = credential.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-            let credential = &credential_owned;
-
-            validate_oauth_credential(handle, credential)?;
-
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(secret_storage)?;
-            bump_credential_generation(&transaction, handle)?;
-            record_credential_lifecycle(
-                &transaction,
-                handle,
-                "enrolled",
-                credential_time_ms(),
-                None,
-            )?;
-            write_oauth_credential(&transaction, handle, credential)?;
-            transaction.commit().map_err(secret_storage)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-
-    async fn begin_refresh(
-        &self,
-        handle: &SecretHandle,
-        expected_generation: u64,
-        now_ms: i64,
-        deadline_ms: i64,
-    ) -> Result<bool, SecretError> {
-        let handle_owned = handle.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-
-            if deadline_ms <= now_ms {
-                return Err(SecretError::Invalid("refresh deadline elapsed".into()));
-            }
-
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(secret_storage)?;
-            let expired = transaction.execute("UPDATE credential_generations SET status='unknown', deadline_ms=NULL WHERE handle=?1 AND generation=?2 AND status='refreshing' AND deadline_ms<=?3", params![handle.as_str(), i64::try_from(expected_generation).map_err(|_| SecretError::Invalid("generation overflow".into()))?, now_ms]).map_err(secret_storage)?;
-            if expired == 1 {
-                record_credential_lifecycle(&transaction, handle, "unknown", now_ms, None)?;
-            }
-            let changed = transaction.execute("UPDATE credential_generations SET status='refreshing', deadline_ms=?4 WHERE handle=?1 AND generation=?2 AND (status='usable' OR (status='backoff' AND deadline_ms<=?3)) AND EXISTS (SELECT 1 FROM oauth_credentials WHERE handle=?1)", params![handle.as_str(), i64::try_from(expected_generation).map_err(|_| SecretError::Invalid("generation overflow".into()))?, now_ms, deadline_ms]).map_err(secret_storage)?;
-            if changed == 1 {
-                record_credential_lifecycle(
-                    &transaction,
-                    handle,
-                    "refreshing",
-                    now_ms,
-                    Some(deadline_ms),
-                )?;
-            }
-            transaction.commit().map_err(secret_storage)?;
-            Ok(changed == 1)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-
-    async fn finish_refresh(
-        &self,
-        handle: &SecretHandle,
-        expected_generation: u64,
-        credential: &OAuthCredential,
-        completed_at_ms: i64,
-    ) -> Result<bool, SecretError> {
-        let handle_owned = handle.to_owned();
-        let credential_owned = credential.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-            let credential = &credential_owned;
-
-            validate_oauth_credential(handle, credential)?;
-
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(secret_storage)?;
-            let changed = transaction.execute("UPDATE credential_generations SET generation=generation+1, status='usable', deadline_ms=NULL WHERE handle=?1 AND generation=?2 AND status='refreshing'", params![handle.as_str(), i64::try_from(expected_generation).map_err(|_| SecretError::Invalid("generation overflow".into()))?]).map_err(secret_storage)?;
-            if changed == 1 {
-                validate_refresh_replacement(
-                    &load_oauth_snapshot(&transaction, handle)?.credential,
-                    credential,
-                )?;
-                write_oauth_credential(&transaction, handle, credential)?;
-                record_credential_lifecycle(
-                    &transaction,
-                    handle,
-                    "refreshed",
-                    completed_at_ms,
-                    None,
-                )?;
-            }
-            transaction.commit().map_err(secret_storage)?;
-            Ok(changed == 1)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-
-    async fn adopt_oauth_recipe(
-        &self,
-        handle: &SecretHandle,
-        expected_generation: u64,
-        credential: &OAuthCredential,
-        completed_at_ms: i64,
-    ) -> Result<bool, SecretError> {
-        let handle_owned = handle.to_owned();
-        let credential_owned = credential.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-            let credential = &credential_owned;
-
-            validate_oauth_credential(handle, credential)?;
-
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(secret_storage)?;
-            let current = match load_oauth_snapshot(&transaction, handle) {
-                Ok(current) => current,
-                Err(SecretError::NotFound) => return Ok(false),
-                Err(error) => return Err(error),
-            };
-            if current.generation != expected_generation
-                || current.status != CredentialStatus::Usable
-            {
-                return Ok(false);
-            }
-            validate_recipe_adoption(&current.credential, credential)?;
-            if current.credential.refresh_recipe.is_some() {
-                return Ok(true);
-            }
-            bump_credential_generation(&transaction, handle)?;
-            record_credential_lifecycle(
-                &transaction,
-                handle,
-                "recipe-adopted",
-                completed_at_ms,
-                None,
-            )?;
-            write_oauth_credential(&transaction, handle, credential)?;
-            transaction.commit().map_err(secret_storage)?;
-            Ok(true)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-
-    async fn fail_refresh(
-        &self,
-        handle: &SecretHandle,
-        expected_generation: u64,
-        status: CredentialStatus,
-        completed_at_ms: i64,
-    ) -> Result<bool, SecretError> {
-        let handle_owned = handle.to_owned();
-        let operation = move |connection: &mut Connection| {
-            let handle = &handle_owned;
-
-            let (status, deadline) = match status {
-                CredentialStatus::Backoff { retry_at_ms } => ("backoff", Some(retry_at_ms)),
-                CredentialStatus::ReauthorizationRequired => ("reauthorization", None),
-                CredentialStatus::UnknownOutcome => ("unknown", None),
-                _ => {
-                    return Err(SecretError::Invalid(
-                        "invalid refresh failure status".into(),
-                    ));
-                }
-            };
-
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(secret_storage)?;
-            let changed = transaction.execute("UPDATE credential_generations SET generation=generation+1, status=?3, deadline_ms=?4 WHERE handle=?1 AND generation=?2 AND status='refreshing'", params![handle.as_str(), i64::try_from(expected_generation).map_err(|_| SecretError::Invalid("generation overflow".into()))?, status, deadline]).map_err(secret_storage)?;
-            if changed == 1 {
-                record_credential_lifecycle(
-                    &transaction,
-                    handle,
-                    status,
-                    completed_at_ms,
-                    deadline,
-                )?;
-            }
-            transaction.commit().map_err(secret_storage)?;
-            Ok(changed == 1)
-        };
-        database_call(&self.connection, operation, secret_storage).await
-    }
-
-    async fn remove_credential(&self, handle: &SecretHandle) -> Result<(), SecretError> {
-        Self::remove_credential(self, handle).await
     }
 }
 
@@ -1638,218 +1280,6 @@ fn state_storage(error: impl std::fmt::Display) -> StateError {
     StateError::Storage(error.to_string())
 }
 
-fn record_credential_lifecycle(
-    transaction: &Transaction<'_>,
-    handle: &SecretHandle,
-    outcome: &str,
-    at_ms: i64,
-    deadline_ms: Option<i64>,
-) -> Result<(), SecretError> {
-    transaction.execute("INSERT INTO credential_lifecycle (handle,generation,outcome,at_ms,deadline_ms) SELECT handle,generation,?2,?3,?4 FROM credential_generations WHERE handle=?1", params![handle.as_str(), outcome, at_ms, deadline_ms]).map_err(secret_storage)?;
-    Ok(())
-}
-
-fn bump_credential_generation(
-    transaction: &Transaction<'_>,
-    handle: &SecretHandle,
-) -> Result<(), SecretError> {
-    transaction.execute("INSERT INTO credential_generations (handle,generation,status) VALUES (?1,1,'usable') ON CONFLICT(handle) DO UPDATE SET generation=generation+1,status='usable',deadline_ms=NULL", params![handle.as_str()]).map_err(secret_storage)?;
-    Ok(())
-}
-
-fn write_oauth_credential(
-    transaction: &Transaction<'_>,
-    handle: &SecretHandle,
-    credential: &OAuthCredential,
-) -> Result<(), SecretError> {
-    write_http_credential(transaction, handle, &credential.http)?;
-    transaction.execute("INSERT INTO oauth_credentials (handle,provider,refresh_token,expires_at_ms,token_url,client_id,refresh_recipe,access_token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![handle.as_str(), credential.provider, credential.refresh_token, credential.expires_at_ms, credential.token_url, credential.client_id, credential.refresh_recipe, credential.access_token]).map_err(secret_storage)?;
-    Ok(())
-}
-
-fn load_oauth_snapshot(
-    connection: &Connection,
-    handle: &SecretHandle,
-) -> Result<OAuthCredentialSnapshot, SecretError> {
-    let metadata = connection.query_row("SELECT o.provider,o.refresh_token,o.expires_at_ms,o.token_url,o.client_id,o.refresh_recipe,g.generation,g.status,g.deadline_ms,o.access_token FROM oauth_credentials o JOIN credential_generations g USING(handle) WHERE handle=?1", params![handle.as_str()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,Option<Vec<u8>>>(5)?,row.get::<_,i64>(6)?,row.get::<_,String>(7)?,row.get::<_,Option<i64>>(8)?,row.get::<_,Option<Vec<u8>>>(9)?))).optional().map_err(secret_storage)?.ok_or(SecretError::NotFound)?;
-    let status = match metadata.7.as_str() {
-        "usable" => CredentialStatus::Usable,
-        "refreshing" => CredentialStatus::Refreshing {
-            deadline_ms: metadata
-                .8
-                .ok_or_else(|| SecretError::Storage("missing refresh deadline".into()))?,
-        },
-        "backoff" => CredentialStatus::Backoff {
-            retry_at_ms: metadata
-                .8
-                .ok_or_else(|| SecretError::Storage("missing retry deadline".into()))?,
-        },
-        "reauthorization" => CredentialStatus::ReauthorizationRequired,
-        "unknown" => CredentialStatus::UnknownOutcome,
-        _ => return Err(SecretError::Storage("invalid credential status".into())),
-    };
-    Ok(OAuthCredentialSnapshot {
-        credential: OAuthCredential {
-            provider: metadata.0,
-            http: load_http_credential(connection, handle)?,
-            refresh_token: metadata.1,
-            expires_at_ms: metadata.2,
-            token_url: metadata.3,
-            client_id: metadata.4,
-            refresh_recipe: metadata.5,
-            access_token: metadata.9,
-        },
-        generation: u64::try_from(metadata.6)
-            .map_err(|_| SecretError::Storage("invalid generation".into()))?,
-        status,
-    })
-}
-
-fn write_http_credential(
-    transaction: &Transaction<'_>,
-    handle: &SecretHandle,
-    credential: &HttpCredential,
-) -> Result<(), SecretError> {
-    transaction
-        .execute(
-            "DELETE FROM http_credentials WHERE handle = ?1",
-            params![handle.as_str()],
-        )
-        .map_err(secret_storage)?;
-    let primary = credential.headers.first();
-    transaction
-        .execute(
-            "INSERT INTO http_credentials (handle, header_name, header_value, path_prefix)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                handle.as_str(),
-                primary.map(|header| header.name.as_str()),
-                primary.map(|header| header.value.as_slice()),
-                credential
-                    .path_prefix
-                    .as_ref()
-                    .map(pluribus_core::SecretPathPrefix::as_bytes)
-            ],
-        )
-        .map_err(secret_storage)?;
-    for (position, header) in credential.headers.iter().enumerate().skip(1) {
-        transaction
-            .execute(
-                "INSERT INTO http_credential_extra_headers (
-                    handle, position, header_name, header_value
-                 ) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    handle.as_str(),
-                    i64::try_from(position).map_err(|_| {
-                        SecretError::Invalid("too many credential headers".into())
-                    })?,
-                    header.name,
-                    header.value
-                ],
-            )
-            .map_err(secret_storage)?;
-    }
-    for origin in &credential.allowed_origins {
-        transaction
-            .execute(
-                "INSERT INTO http_credential_origins (handle, origin) VALUES (?1, ?2)",
-                params![handle.as_str(), origin],
-            )
-            .map_err(secret_storage)?;
-    }
-    for component in &credential.allowed_components {
-        transaction
-            .execute(
-                "INSERT INTO http_credential_components (
-                    handle, component_kind, component_id
-                 ) VALUES (?1, ?2, ?3)",
-                params![
-                    handle.as_str(),
-                    encode_principal_kind(component.kind),
-                    component.id.as_str()
-                ],
-            )
-            .map_err(secret_storage)?;
-    }
-    Ok(())
-}
-
-fn load_http_credential(
-    connection: &Connection,
-    handle: &SecretHandle,
-) -> Result<HttpCredential, SecretError> {
-    let (primary_name, primary_value, path_prefix) = connection
-        .query_row(
-            "SELECT header_name, header_value, path_prefix FROM http_credentials WHERE handle = ?1",
-            params![handle.as_str()],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(secret_storage)?
-        .ok_or(SecretError::NotFound)?;
-    let mut extra_headers = connection
-        .prepare(
-            "SELECT header_name, header_value FROM http_credential_extra_headers
-             WHERE handle = ?1 ORDER BY position",
-        )
-        .map_err(secret_storage)?;
-    let mut headers = primary_name
-        .zip(primary_value)
-        .map(|(name, value)| vec![SecretHeader { name, value }])
-        .unwrap_or_default();
-    headers.extend(
-        extra_headers
-            .query_map(params![handle.as_str()], |row| {
-                Ok(SecretHeader {
-                    name: row.get(0)?,
-                    value: row.get(1)?,
-                })
-            })
-            .map_err(secret_storage)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(secret_storage)?,
-    );
-    let mut origins = connection
-        .prepare(
-            "SELECT origin FROM http_credential_origins
-             WHERE handle = ?1 ORDER BY origin",
-        )
-        .map_err(secret_storage)?;
-    let allowed_origins = origins
-        .query_map(params![handle.as_str()], |row| row.get(0))
-        .map_err(secret_storage)?
-        .collect::<rusqlite::Result<Vec<String>>>()
-        .map_err(secret_storage)?;
-    let mut components = connection
-        .prepare(
-            "SELECT component_kind, component_id FROM http_credential_components
-             WHERE handle = ?1 ORDER BY component_kind, component_id",
-        )
-        .map_err(secret_storage)?;
-    let allowed_components = components
-        .query_map(params![handle.as_str()], |row| {
-            Ok(PrincipalRef::new(
-                decode_principal_kind(row.get(0)?)?,
-                row.get::<_, String>(1)?,
-            ))
-        })
-        .map_err(secret_storage)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(secret_storage)?;
-    Ok(HttpCredential {
-        headers,
-        path_prefix: path_prefix.map(pluribus_core::SecretPathPrefix::new),
-        allowed_origins,
-        allowed_components,
-    })
-}
-
 fn secret_storage(error: impl std::fmt::Display) -> SecretError {
     SecretError::Storage(error.to_string())
 }
@@ -1879,12 +1309,56 @@ async fn database_call<T: Send + 'static, E: Send + 'static>(
         .map_err(map_error)?
 }
 
+#[async_trait::async_trait]
+impl<M: EventMetadataSource + 'static> pluribus_core::PluginCredentialStore
+    for SqliteEventStore<M>
+{
+    async fn read_plugin_credential(
+        &self,
+        handle: &SecretHandle,
+        provider: &str,
+    ) -> Result<Option<Vec<u8>>, SecretError> {
+        let handle = handle.as_str().to_owned();
+        let provider = provider.to_owned();
+        database_call(
+            &self.connection,
+            move |db| {
+                db.query_row(
+                    "SELECT value FROM plugin_credentials WHERE handle=?1 AND provider=?2",
+                    params![handle, provider],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(secret_storage)
+            },
+            secret_storage,
+        )
+        .await
+    }
+    async fn replace_plugin_credential(
+        &self,
+        handle: &SecretHandle,
+        provider: &str,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<bool, SecretError> {
+        let handle = handle.as_str().to_owned();
+        let provider = provider.to_owned();
+        database_call(&self.connection, move |db| {
+            let changed = if let Some(previous) = expected {
+                db.execute("UPDATE plugin_credentials SET value=?3 WHERE handle=?1 AND provider=?2 AND value=?4", params![handle,provider,value,previous])
+            } else {
+                db.execute("INSERT OR IGNORE INTO plugin_credentials(handle,provider,value) VALUES (?1,?2,?3)", params![handle,provider,value])
+            }.map_err(secret_storage)?;
+            Ok(changed == 1)
+        }, secret_storage).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pluribus_core::{
-        EventId, EventPayload, PrincipalKind, PrincipalRef, SecretPathPrefix, StreamKind,
-    };
+    use pluribus_core::{EventId, EventPayload, PrincipalKind, PrincipalRef, StreamKind};
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2649,74 +2123,6 @@ mod tests {
         assert_eq!(read, [committed]);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn credentials_survive_reopen_and_enforce_scope() {
-        let path = temporary_database_path("credentials");
-        let handle = SecretHandle::new("codex");
-        let component = PrincipalRef::new(PrincipalKind::Component, "codex-1");
-        let credential = HttpCredential {
-            headers: vec![
-                SecretHeader {
-                    name: "authorization".into(),
-                    value: b"Bearer private".to_vec(),
-                },
-                SecretHeader {
-                    name: "chatgpt-account-id".into(),
-                    value: b"account-1".to_vec(),
-                },
-            ],
-            path_prefix: None,
-            allowed_origins: vec!["https://chatgpt.com".into()],
-            allowed_components: vec![component.clone()],
-        };
-        {
-            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-                .await
-                .unwrap();
-            store
-                .put_http_credential(&handle, &credential)
-                .await
-                .unwrap();
-        }
-        {
-            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-                .await
-                .unwrap();
-            assert_eq!(
-                store
-                    .resolve_http(&handle, &component, "https://chatgpt.com")
-                    .await
-                    .unwrap(),
-                credential
-            );
-            assert_eq!(
-                store
-                    .resolve_http(&handle, &component, "https://example.com")
-                    .await,
-                Err(SecretError::PermissionDenied)
-            );
-            // Naming another component's handle confers no access to it.
-            assert_eq!(
-                store
-                    .resolve_http(
-                        &handle,
-                        &PrincipalRef::new(PrincipalKind::Component, "other"),
-                        "https://chatgpt.com"
-                    )
-                    .await,
-                Err(SecretError::PermissionDenied)
-            );
-            store.remove_credential(&handle).await.unwrap();
-            assert_eq!(
-                store
-                    .resolve_http(&handle, &component, "https://chatgpt.com")
-                    .await,
-                Err(SecretError::NotFound)
-            );
-        }
-        remove_database(&path);
-    }
-
     #[tokio::test]
     async fn plugin_secrets_survive_reopen_and_compare_atomically() {
         use pluribus_core::PluginCredentialStore;
@@ -2791,635 +2197,6 @@ mod tests {
         remove_database(&path);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn path_only_credentials_survive_reopen() {
-        let path = temporary_database_path("path-credential");
-        let handle = SecretHandle::new("telegram");
-        let component = PrincipalRef::new(PrincipalKind::Component, "telegram-1");
-        let credential = HttpCredential {
-            headers: Vec::new(),
-            path_prefix: Some(SecretPathPrefix::new(b"/bot123456:secret")),
-            allowed_origins: vec!["https://api.telegram.org".into()],
-            allowed_components: vec![component.clone()],
-        };
-        {
-            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-                .await
-                .unwrap();
-            store
-                .put_http_credential(&handle, &credential)
-                .await
-                .unwrap();
-        }
-        {
-            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-                .await
-                .unwrap();
-            assert_eq!(
-                store
-                    .resolve_http(&handle, &component, "https://api.telegram.org")
-                    .await
-                    .unwrap(),
-                credential
-            );
-        }
-        remove_database(&path);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn oauth_credentials_survive_reopen() {
-        let path = temporary_database_path("oauth-credentials");
-        let handle = SecretHandle::new("codex");
-        let component = PrincipalRef::new(PrincipalKind::Component, "codex-1");
-        let credential = OAuthCredential {
-            access_token: None,
-            refresh_recipe: None,
-            provider: "openai-codex".into(),
-            http: HttpCredential {
-                headers: vec![
-                    SecretHeader {
-                        name: "authorization".into(),
-                        value: b"Bearer access".to_vec(),
-                    },
-                    SecretHeader {
-                        name: "chatgpt-account-id".into(),
-                        value: b"account-1".to_vec(),
-                    },
-                ],
-                path_prefix: None,
-                allowed_origins: vec!["https://chatgpt.com".into()],
-                allowed_components: vec![component.clone()],
-            },
-            refresh_token: b"refresh".to_vec(),
-            expires_at_ms: 42,
-            token_url: "https://auth.openai.com/oauth/token".into(),
-            client_id: "client".into(),
-        };
-        {
-            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-                .await
-                .unwrap();
-            store.put_oauth(&handle, &credential).await.unwrap();
-        }
-        {
-            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-                .await
-                .unwrap();
-            assert_eq!(store.load_oauth(&handle).await.unwrap(), credential);
-            assert_eq!(
-                store
-                    .resolve_http(&handle, &component, "https://chatgpt.com")
-                    .await
-                    .unwrap()
-                    .headers
-                    .len(),
-                2
-            );
-        }
-        remove_database(&path);
-    }
-
-    fn refresh_fixture() -> OAuthCredential {
-        OAuthCredential {
-            access_token: Some(b"fixture-access-token".to_vec()),
-            refresh_recipe: Some(b"sealed-recipe-secret".to_vec()),
-            provider: "fixture".into(),
-            http: HttpCredential {
-                headers: vec![SecretHeader {
-                    name: "authorization".into(),
-                    value: b"Bearer fixture-secret".to_vec(),
-                }],
-                path_prefix: None,
-                allowed_origins: vec!["https://fixture.example".into()],
-                allowed_components: vec![PrincipalRef::new(PrincipalKind::Component, "fixture")],
-            },
-            refresh_token: b"rotating-secret".to_vec(),
-            expires_at_ms: 100,
-            token_url: "https://fixture.example/token".into(),
-            client_id: "client".into(),
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn refresh_contract(store: &dyn OAuthCredentialStore) {
-        let handle = SecretHandle::new("fixture");
-        let original = refresh_fixture();
-        store.put_oauth(&handle, &original).await.unwrap();
-        let first = store.load_oauth_snapshot(&handle).await.unwrap();
-        assert!(
-            store
-                .begin_refresh(&handle, first.generation, 0, 100)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .begin_refresh(&handle, first.generation, 1, 100)
-                .await
-                .unwrap()
-        );
-        let mut rotated = original.clone();
-        rotated.refresh_token = b"new-refresh-secret".to_vec();
-        rotated.http.headers[0].value = b"Bearer new-access-secret".to_vec();
-        assert!(
-            store
-                .finish_refresh(&handle, first.generation, &rotated, 50)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .finish_refresh(&handle, first.generation, &original, 50)
-                .await
-                .unwrap()
-        );
-        let second = store.load_oauth_snapshot(&handle).await.unwrap();
-        assert_eq!(second.credential, rotated);
-        assert!(second.generation > first.generation);
-        assert!(
-            store
-                .begin_refresh(&handle, second.generation, 1, 100)
-                .await
-                .unwrap()
-        );
-        store.put_oauth(&handle, &original).await.unwrap();
-        assert!(
-            !store
-                .finish_refresh(&handle, second.generation, &rotated, 50)
-                .await
-                .unwrap()
-        );
-        let third = store.load_oauth_snapshot(&handle).await.unwrap();
-        assert!(
-            store
-                .begin_refresh(&handle, third.generation, 1, 100)
-                .await
-                .unwrap()
-        );
-        store.remove_credential(&handle).await.unwrap();
-        store.put_oauth(&handle, &original).await.unwrap();
-        assert!(
-            !store
-                .finish_refresh(&handle, third.generation, &rotated, 50)
-                .await
-                .unwrap()
-        );
-        let fourth = store.load_oauth_snapshot(&handle).await.unwrap();
-        assert!(
-            store
-                .begin_refresh(&handle, fourth.generation, 1, 100)
-                .await
-                .unwrap()
-        );
-        assert!(
-            store
-                .fail_refresh(
-                    &handle,
-                    fourth.generation,
-                    CredentialStatus::Backoff { retry_at_ms: 200 },
-                    50
-                )
-                .await
-                .unwrap()
-        );
-        let fifth = store.load_oauth_snapshot(&handle).await.unwrap();
-        assert!(
-            !store
-                .begin_refresh(&handle, fifth.generation, 100, 300)
-                .await
-                .unwrap()
-        );
-        assert!(
-            store
-                .begin_refresh(&handle, fifth.generation, 200, 300)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .finish_refresh(&handle, fourth.generation, &rotated, 50)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .begin_refresh(&handle, fifth.generation, 300, 400)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            store.load_oauth_snapshot(&handle).await.unwrap().status,
-            CredentialStatus::UnknownOutcome
-        );
-        assert!(
-            !store
-                .finish_refresh(&handle, fifth.generation, &rotated, 50)
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_claims_have_in_memory_parity() {
-        refresh_contract(&pluribus_core::InMemoryCredentialStore::default()).await;
-        refresh_contract(
-            &SqliteEventStore::open_in_memory(Metadata::new("event", 1))
-                .await
-                .unwrap(),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn refresh_claims_survive_restart_and_coordinate_connections() {
-        let path = temporary_database_path("refresh-claims");
-        let handle = SecretHandle::new("fixture");
-        let first = SqliteEventStore::open(&path, Metadata::new("event", 1))
-            .await
-            .unwrap();
-        first.put_oauth(&handle, &refresh_fixture()).await.unwrap();
-        let generation = first.load_oauth_snapshot(&handle).await.unwrap().generation;
-        assert!(
-            first
-                .begin_refresh(&handle, generation, 0, 100)
-                .await
-                .unwrap()
-        );
-        let second = SqliteEventStore::open(&path, Metadata::new("other", 1))
-            .await
-            .unwrap();
-        assert!(
-            !second
-                .begin_refresh(&handle, generation, 1, 100)
-                .await
-                .unwrap()
-        );
-        drop(first);
-        assert!(
-            !second
-                .begin_refresh(&handle, generation, 100, 200)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            second.load_oauth_snapshot(&handle).await.unwrap().status,
-            CredentialStatus::UnknownOutcome
-        );
-        drop(second);
-        let reopened = SqliteEventStore::open(&path, Metadata::new("event", 1))
-            .await
-            .unwrap();
-        assert_eq!(
-            reopened.load_oauth_snapshot(&handle).await.unwrap().status,
-            CredentialStatus::UnknownOutcome
-        );
-        assert!(
-            !reopened
-                .begin_refresh(&handle, generation, 200, 300)
-                .await
-                .unwrap()
-        );
-        drop(reopened);
-        remove_database(&path);
-    }
-
-    #[tokio::test]
-    async fn simultaneous_refresh_claims_have_one_owner() {
-        let path = temporary_database_path("parallel-refresh");
-        let handle = SecretHandle::new("fixture");
-        let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-            .await
-            .unwrap();
-        store.put_oauth(&handle, &refresh_fixture()).await.unwrap();
-        let generation = store.load_oauth_snapshot(&handle).await.unwrap().generation;
-        let other = SqliteEventStore::open(&path, Metadata::new("other", 1))
-            .await
-            .unwrap();
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-        let workers: Vec<_> = [store, other]
-            .into_iter()
-            .map(|store| {
-                let barrier = barrier.clone();
-                let handle = handle.clone();
-                tokio::spawn(async move {
-                    barrier.wait().await;
-                    store
-                        .begin_refresh(&handle, generation, 0, 100)
-                        .await
-                        .unwrap()
-                })
-            })
-            .collect();
-        let mut owners = 0;
-        for worker in workers {
-            owners += usize::from(worker.await.unwrap());
-        }
-        assert_eq!(owners, 1);
-        remove_database(&path);
-    }
-
-    #[tokio::test]
-    async fn rotated_token_state_survives_restart() {
-        let path = temporary_database_path("rotated-state");
-        let handle = SecretHandle::new("fixture");
-        let mut replacement = refresh_fixture();
-        {
-            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-                .await
-                .unwrap();
-            store.put_oauth(&handle, &replacement).await.unwrap();
-            let generation = store.load_oauth_snapshot(&handle).await.unwrap().generation;
-            assert!(
-                store
-                    .begin_refresh(&handle, generation, 0, 100)
-                    .await
-                    .unwrap()
-            );
-            replacement.access_token = Some(b"replacement-access-secret".to_vec());
-            replacement.refresh_token = b"replacement-refresh-secret".to_vec();
-            replacement.http.headers.push(SecretHeader {
-                name: "account".into(),
-                value: b"derived-account-secret".to_vec(),
-            });
-            replacement.expires_at_ms = 200;
-            assert!(
-                store
-                    .finish_refresh(&handle, generation, &replacement, 50)
-                    .await
-                    .unwrap()
-            );
-        }
-        let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-            .await
-            .unwrap();
-        let snapshot = store.load_oauth_snapshot(&handle).await.unwrap();
-        assert_eq!(snapshot.credential, replacement);
-        assert_eq!(snapshot.generation, 2);
-        assert_eq!(snapshot.status, CredentialStatus::Usable);
-        let debug = format!("{snapshot:?}");
-        for secret in [
-            "replacement-access-secret",
-            "replacement-refresh-secret",
-            "derived-account-secret",
-            "sealed-recipe-secret",
-        ] {
-            assert!(!debug.contains(secret));
-        }
-        drop(store);
-        remove_database(&path);
-    }
-
-    #[tokio::test]
-    async fn credential_lifecycle_is_atomic_paginated_and_secret_free() {
-        let stores: Vec<Box<dyn OAuthCredentialStore>> = vec![
-            Box::new(pluribus_core::InMemoryCredentialStore::default()),
-            Box::new(
-                SqliteEventStore::open_in_memory(Metadata::new("event", 1))
-                    .await
-                    .unwrap(),
-            ),
-        ];
-        for store in stores {
-            let handle = SecretHandle::new("fixture");
-            let credential = refresh_fixture();
-            store.put_oauth(&handle, &credential).await.unwrap();
-            let generation = store.load_oauth_snapshot(&handle).await.unwrap().generation;
-            assert!(
-                store
-                    .begin_refresh(&handle, generation, 10, 100)
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                !store
-                    .begin_refresh(&handle, generation, 11, 100)
-                    .await
-                    .unwrap()
-            );
-            let mut invalid = credential.clone();
-            invalid.refresh_recipe = Some(b"different".to_vec());
-            assert!(
-                store
-                    .finish_refresh(&handle, generation, &invalid, 12)
-                    .await
-                    .is_err()
-            );
-            assert_eq!(store.lifecycle_after(0, 100).await.unwrap().len(), 2);
-            assert!(
-                store
-                    .finish_refresh(&handle, generation, &credential, 20)
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                !store
-                    .finish_refresh(&handle, generation, &credential, 21)
-                    .await
-                    .unwrap()
-            );
-            store.remove_credential(&handle).await.unwrap();
-            let records = store.lifecycle_after(0, 100).await.unwrap();
-            assert_eq!(
-                records
-                    .iter()
-                    .map(|entry| entry.outcome.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["enrolled", "refreshing", "refreshed", "revoked"]
-            );
-            assert_eq!(records[1].at_ms, 10);
-            assert_eq!(records[1].deadline_ms, Some(100));
-            assert_eq!(records[2].at_ms, 20);
-            assert_eq!(
-                store.lifecycle_after(records[0].sequence, 1).await.unwrap(),
-                records[1..2]
-            );
-            assert!(store.lifecycle_after(0, 0).await.unwrap().is_empty());
-            assert!(
-                records
-                    .windows(2)
-                    .all(|pair| pair[0].sequence < pair[1].sequence)
-            );
-            let debug = format!("{records:?}");
-            for secret in [
-                "sealed-recipe-secret",
-                "fixture-access-token",
-                "rotating-secret",
-                "fixture-secret",
-            ] {
-                assert!(!debug.contains(secret));
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn credential_lifecycle_survives_restart() {
-        let path = temporary_database_path("credential-lifecycle");
-        let handle = SecretHandle::new("fixture");
-        let records;
-        {
-            let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-                .await
-                .unwrap();
-            store.put_oauth(&handle, &refresh_fixture()).await.unwrap();
-            let generation = store.load_oauth_snapshot(&handle).await.unwrap().generation;
-            store
-                .begin_refresh(&handle, generation, 1, 100)
-                .await
-                .unwrap();
-            store
-                .fail_refresh(&handle, generation, CredentialStatus::UnknownOutcome, 2)
-                .await
-                .unwrap();
-            records = store.lifecycle_after(0, 100).await.unwrap();
-        }
-        let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
-            .await
-            .unwrap();
-        assert_eq!(store.lifecycle_after(0, 100).await.unwrap(), records);
-        assert_eq!(records.last().unwrap().outcome, "unknown");
-        drop(store);
-        remove_database(&path);
-    }
-
-    #[tokio::test]
-    async fn recipe_adoption_is_atomic_and_preserves_enrollment() {
-        let stores: Vec<Box<dyn OAuthCredentialStore>> = vec![
-            Box::new(pluribus_core::InMemoryCredentialStore::default()),
-            Box::new(
-                SqliteEventStore::open_in_memory(Metadata::new("event", 1))
-                    .await
-                    .unwrap(),
-            ),
-        ];
-        for store in stores {
-            let handle = SecretHandle::new("fixture");
-            let adopted = refresh_fixture();
-            let mut legacy = adopted.clone();
-            legacy.refresh_recipe = None;
-            legacy.access_token = None;
-            store.put_oauth(&handle, &legacy).await.unwrap();
-            let generation = store.load_oauth_snapshot(&handle).await.unwrap().generation;
-            assert!(
-                store
-                    .adopt_oauth_recipe(&handle, generation, &adopted, 50)
-                    .await
-                    .unwrap()
-            );
-            let current = store.load_oauth_snapshot(&handle).await.unwrap();
-            assert_eq!(current.credential, adopted);
-            assert!(current.generation > generation);
-            assert!(
-                !store
-                    .adopt_oauth_recipe(&handle, generation, &adopted, 50)
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                store
-                    .adopt_oauth_recipe(&handle, current.generation, &adopted, 50)
-                    .await
-                    .unwrap()
-            );
-            assert_eq!(
-                store.load_oauth_snapshot(&handle).await.unwrap().generation,
-                current.generation
-            );
-            store.put_oauth(&handle, &legacy).await.unwrap();
-            let generation = store.load_oauth_snapshot(&handle).await.unwrap().generation;
-            assert!(
-                store
-                    .begin_refresh(&handle, generation, 0, 100)
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                !store
-                    .adopt_oauth_recipe(&handle, generation, &adopted, 50)
-                    .await
-                    .unwrap()
-            );
-            store.put_oauth(&handle, &legacy).await.unwrap();
-            assert!(
-                !store
-                    .adopt_oauth_recipe(&handle, generation, &adopted, 50)
-                    .await
-                    .unwrap()
-            );
-            let generation = store.load_oauth_snapshot(&handle).await.unwrap().generation;
-            let mut changed = adopted.clone();
-            changed.refresh_token = b"unauthorized-replacement".to_vec();
-            assert!(
-                store
-                    .adopt_oauth_recipe(&handle, generation, &changed, 50)
-                    .await
-                    .is_err()
-            );
-            changed = adopted.clone();
-            changed
-                .http
-                .allowed_origins
-                .push("https://other.example".into());
-            assert!(
-                store
-                    .adopt_oauth_recipe(&handle, generation, &changed, 50)
-                    .await
-                    .is_err()
-            );
-            store.remove_credential(&handle).await.unwrap();
-            assert!(
-                !store
-                    .adopt_oauth_recipe(&handle, generation, &adopted, 50)
-                    .await
-                    .unwrap()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn refresh_cannot_replace_recipe_or_widen_scope() {
-        let stores: Vec<Box<dyn OAuthCredentialStore>> = vec![
-            Box::new(pluribus_core::InMemoryCredentialStore::default()),
-            Box::new(
-                SqliteEventStore::open_in_memory(Metadata::new("event", 1))
-                    .await
-                    .unwrap(),
-            ),
-        ];
-        for store in stores {
-            let handle = SecretHandle::new("fixture");
-            let credential = refresh_fixture();
-            store.put_oauth(&handle, &credential).await.unwrap();
-            let generation = store.load_oauth_snapshot(&handle).await.unwrap().generation;
-            assert!(
-                store
-                    .begin_refresh(&handle, generation, 0, 100)
-                    .await
-                    .unwrap()
-            );
-            let mut changed = credential.clone();
-            changed.refresh_recipe = Some(b"other recipe".to_vec());
-            assert!(
-                store
-                    .finish_refresh(&handle, generation, &changed, 50)
-                    .await
-                    .is_err()
-            );
-            changed = credential.clone();
-            changed
-                .http
-                .allowed_origins
-                .push("https://other.example".into());
-            assert!(
-                store
-                    .finish_refresh(&handle, generation, &changed, 50)
-                    .await
-                    .is_err()
-            );
-            assert_eq!(store.load_oauth(&handle).await.unwrap(), credential);
-        }
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
     async fn file_store_is_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3438,8 +2215,10 @@ mod tests {
         remove_database(&path);
     }
 
+    /// Legacy tables disappear; events and plugin records remain.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn schema_two_migrates_credentials() {
+    async fn schema_eleven_drops_host_injected_credentials() {
+        use pluribus_core::PluginCredentialStore;
         let path = temporary_database_path("credential-migration");
         let connection = Connection::open(&path).unwrap();
         connection
@@ -3454,44 +2233,210 @@ mod tests {
             .unwrap();
         let handle = SecretHandle::new("telegram");
         store
-            .put_http_credential(
-                &handle,
-                &HttpCredential {
-                    headers: vec![SecretHeader {
-                        name: "authorization".into(),
-                        value: b"Bearer private".to_vec(),
-                    }],
-                    path_prefix: None,
-                    allowed_origins: vec!["https://api.telegram.org".into()],
-                    allowed_components: vec![PrincipalRef::new(
-                        PrincipalKind::Component,
-                        "telegram-1",
-                    )],
-                },
-            )
+            .replace_plugin_credential(&handle, "dev.pluribus.telegram", None, b"token".to_vec())
             .await
             .unwrap();
+        drop(store);
 
+        let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
+            .await
+            .unwrap();
         assert_eq!(
             store
-                .resolve_http(
-                    &handle,
-                    &PrincipalRef::new(PrincipalKind::Component, "telegram-1"),
-                    "https://api.telegram.org",
-                )
+                .read_plugin_credential(&handle, "dev.pluribus.telegram")
                 .await
-                .unwrap()
-                .headers[0]
-                .value,
-            b"Bearer private"
+                .unwrap(),
+            Some(b"token".to_vec())
+        );
+        let tables = store
+            .connection
+            .conn(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%credential%'")?;
+                let names = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        assert_eq!(tables, ["plugin_credentials"]);
+        drop(store);
+        remove_database(&path);
+    }
+
+    async fn legacy_credential_database(label: &str) -> std::path::PathBuf {
+        let path = temporary_database_path(label);
+        drop(
+            SqliteEventStore::open(&path, Metadata::new("event", 1))
+                .await
+                .unwrap(),
+        );
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "{CREDENTIAL_SCHEMA}
+             ALTER TABLE oauth_credentials ADD COLUMN refresh_recipe BLOB;
+             ALTER TABLE oauth_credentials ADD COLUMN access_token BLOB;
+             PRAGMA user_version=10;"
+            ))
+            .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_secrets_survive_schema_eleven() {
+        use pluribus_core::PluginCredentialStore;
+        let path = legacy_credential_database("legacy-provider-secrets").await;
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("
+            INSERT INTO http_credentials VALUES ('router', 'authorization', CAST('Bearer router-key' AS BLOB), NULL);
+            INSERT INTO http_credentials VALUES ('telegram', NULL, NULL, CAST('/bottelegram-token' AS BLOB));
+            INSERT INTO http_credentials VALUES ('codex', 'authorization', CAST('Bearer access' AS BLOB), NULL);
+            INSERT INTO http_credential_origins VALUES ('router', 'https://openrouter.ai');
+            INSERT INTO http_credential_origins VALUES ('telegram', 'https://api.telegram.org');
+            INSERT INTO http_credential_origins VALUES ('codex', 'https://chatgpt.com');
+            INSERT INTO oauth_credentials VALUES ('codex', 'openai-codex', CAST('refresh' AS BLOB), 1, 'https://auth.openai.com/oauth/token', 'client', NULL, CAST('access' AS BLOB));
+        ").unwrap();
+        drop(connection);
+        let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
+            .await
+            .unwrap();
+        for (handle, provider, expected) in [
+            (
+                "router",
+                "dev.pluribus.openrouter",
+                r#"{"api_key":"router-key"}"#,
+            ),
+            (
+                "telegram",
+                "dev.pluribus.telegram",
+                r#"{"token":"telegram-token"}"#,
+            ),
+            (
+                "codex",
+                "dev.pluribus.openai-codex",
+                r#"{"access_token":"access","refresh_token":"refresh"}"#,
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .read_plugin_credential(&SecretHandle::new(handle), provider)
+                    .await
+                    .unwrap(),
+                Some(expected.as_bytes().to_vec())
+            );
+        }
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_preserves_newer_plugin_credentials() {
+        use pluribus_core::PluginCredentialStore;
+        let path = legacy_credential_database("legacy-existing-record").await;
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("
+            INSERT INTO http_credentials VALUES ('router', 'authorization', CAST('Bearer old-key' AS BLOB), NULL);
+            INSERT INTO http_credential_origins VALUES ('router', 'https://openrouter.ai');
+            INSERT INTO plugin_credentials VALUES ('router', 'dev.pluribus.openrouter', CAST('{\"api_key\":\"new-key\"}' AS BLOB));
+        ").unwrap();
+        drop(connection);
+        let store = SqliteEventStore::open(&path, Metadata::new("event", 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .read_plugin_credential(&SecretHandle::new("router"), "dev.pluribus.openrouter")
+                .await
+                .unwrap(),
+            Some(br#"{"api_key":"new-key"}"#.to_vec())
         );
         drop(store);
         remove_database(&path);
     }
 
     #[tokio::test]
-    async fn schema_three_migrates_oauth_credentials() {
-        let path = temporary_database_path("oauth-migration");
+    async fn malformed_legacy_secret_bytes_are_not_discarded() {
+        for secret in [b"Bearer \xff".as_slice(), b"Bearer key\0tail".as_slice()] {
+            let path = legacy_credential_database("malformed-legacy-secret").await;
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO http_credentials VALUES ('router', 'authorization', ?1, NULL)",
+                    params![secret],
+                )
+                .unwrap();
+            connection.execute("INSERT INTO http_credential_origins VALUES ('router', 'https://openrouter.ai')", []).unwrap();
+            drop(connection);
+            assert!(
+                SqliteEventStore::open(&path, Metadata::new("event", 1))
+                    .await
+                    .is_err()
+            );
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT header_value FROM http_credentials WHERE handle='router'",
+                        [],
+                        |row| row.get::<_, Vec<u8>>(0)
+                    )
+                    .unwrap(),
+                secret
+            );
+            drop(connection);
+            remove_database(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_legacy_credentials_prevent_destructive_migration() {
+        let path = legacy_credential_database("unknown-legacy-secret").await;
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("
+            INSERT INTO http_credentials VALUES ('router', 'authorization', CAST('Bearer router-key' AS BLOB), NULL);
+            INSERT INTO http_credential_origins VALUES ('router', 'https://openrouter.ai');
+            INSERT INTO http_credentials VALUES ('custom', 'authorization', CAST('private-key' AS BLOB), NULL);
+            INSERT INTO http_credential_origins VALUES ('custom', 'https://custom.example');
+        ").unwrap();
+        drop(connection);
+        assert!(
+            SqliteEventStore::open(&path, Metadata::new("event", 1))
+                .await
+                .is_err()
+        );
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM plugin_credentials", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT header_value FROM http_credentials WHERE handle='custom'",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0)
+                )
+                .unwrap(),
+            b"private-key"
+        );
+        drop(connection);
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn a_schema_three_database_migrates_to_the_current_version() {
+        let path = temporary_database_path("schema-three-migration");
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(&format!(
@@ -3527,7 +2472,7 @@ mod tests {
                     .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)))
                 .await
                 .unwrap(),
-            10
+            11
         );
         drop(store);
         remove_database(&path);
@@ -3537,7 +2482,7 @@ mod tests {
     async fn unknown_schema_version_is_rejected() {
         let path = temporary_database_path("future-schema");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 11).unwrap();
+        connection.pragma_update(None, "user_version", 12).unwrap();
         drop(connection);
 
         let result = SqliteEventStore::open(&path, Metadata::new("event", 1)).await;
@@ -3545,7 +2490,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(AppendError::Storage(message))
-                if message == "unsupported SQLite schema version: 11"
+                if message == "unsupported SQLite schema version: 12"
         ));
         remove_database(&path);
     }
@@ -3695,51 +2640,5 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
-    }
-}
-
-#[async_trait::async_trait]
-impl<M: EventMetadataSource + 'static> pluribus_core::PluginCredentialStore
-    for SqliteEventStore<M>
-{
-    async fn read_plugin_credential(
-        &self,
-        handle: &SecretHandle,
-        provider: &str,
-    ) -> Result<Option<Vec<u8>>, SecretError> {
-        let handle = handle.as_str().to_owned();
-        let provider = provider.to_owned();
-        database_call(
-            &self.connection,
-            move |db| {
-                db.query_row(
-                    "SELECT value FROM plugin_credentials WHERE handle=?1 AND provider=?2",
-                    params![handle, provider],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(secret_storage)
-            },
-            secret_storage,
-        )
-        .await
-    }
-    async fn replace_plugin_credential(
-        &self,
-        handle: &SecretHandle,
-        provider: &str,
-        expected: Option<Vec<u8>>,
-        value: Vec<u8>,
-    ) -> Result<bool, SecretError> {
-        let handle = handle.as_str().to_owned();
-        let provider = provider.to_owned();
-        database_call(&self.connection, move |db| {
-            let changed = if let Some(previous) = expected {
-                db.execute("UPDATE plugin_credentials SET value=?3 WHERE handle=?1 AND provider=?2 AND value=?4", params![handle,provider,value,previous])
-            } else {
-                db.execute("INSERT OR IGNORE INTO plugin_credentials(handle,provider,value) VALUES (?1,?2,?3)", params![handle,provider,value])
-            }.map_err(secret_storage)?;
-            Ok(changed == 1)
-        }, secret_storage).await
     }
 }

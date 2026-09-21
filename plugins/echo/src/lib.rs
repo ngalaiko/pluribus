@@ -1,9 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-wit_bindgen::generate!({ generate_all,
-    path: "../../wit",
-    world: "plugin",
-});
+use pluribus_plugin_sdk::export;
+pub use pluribus_plugin_sdk::{exports, pluribus, wasi};
 
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::events;
@@ -17,7 +15,7 @@ struct Echo;
 const CAPABILITY: &str = "system.echo";
 const COUNT_KEY: &str = "invocations";
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+use pluribus_plugin_sdk::serve;
 
 fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     let config: serde_json::Value = serde_json::from_slice(&config)

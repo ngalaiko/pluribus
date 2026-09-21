@@ -10,7 +10,6 @@ use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 // Consumed by this adapter before any network request, including redirects.
-pub(super) const CREDENTIAL_HEADER: &str = "x-pluribus-credential-handle";
 pub(super) fn resource_table() -> wasmtime::component::ResourceTable {
     let mut table = wasmtime::component::ResourceTable::new();
     table.set_max_capacity(256);
@@ -197,16 +196,7 @@ async fn exchange(
         Some(service) => (service, transient),
         None => (service, blobs),
     };
-    let (mut parts, body) = request.into_parts();
-    let credential = parts
-        .headers
-        .remove(CREDENTIAL_HEADER)
-        .map(|h| {
-            h.to_str()
-                .map(|s| SecretHandle::new(s.to_owned()))
-                .map_err(|_| ErrorCode::HttpRequestDenied)
-        })
-        .transpose()?;
+    let (parts, body) = request.into_parts();
     let media_type = parts
         .headers
         .get("content-type")
@@ -251,7 +241,6 @@ async fn exchange(
             })
             .collect(),
         body,
-        credential_handle: credential,
         timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
     };
     let head = service
@@ -505,20 +494,13 @@ mod tests {
         host.wasi_table.push(request).unwrap()
     }
     #[tokio::test]
-    async fn credentials_are_removed_from_headers_and_policy_errors_remain_denials() {
+    async fn policy_errors_remain_denials() {
         let fixture = Arc::new(Fixture {
             denied: true,
             ..Default::default()
         });
         let mut store = setup(fixture.clone()).await;
         let request = request(store.data_mut(), false);
-        credentials::Host::authorize_http(
-            store.data_mut(),
-            Resource::new_borrow(request.rep()),
-            "opaque-token".into(),
-        )
-        .await
-        .unwrap();
         store
             .run_concurrent(async |accessor| {
                 let error =
@@ -529,12 +511,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let seen = fixture.seen.lock().unwrap();
-        assert_eq!(
-            seen[0].credential_handle,
-            Some(SecretHandle::new("opaque-token"))
-        );
-        assert!(!seen[0].headers.iter().any(|h| h.name == CREDENTIAL_HEADER));
+        assert_eq!(fixture.seen.lock().unwrap().len(), 1);
     }
     #[tokio::test]
     async fn native_http_cancellation_and_deadlines() {
@@ -647,7 +624,6 @@ mod tests {
             while !headers.ends_with(b"\r\n\r\n") {
                 headers.push(socket.read_u8().await.unwrap());
             }
-            assert!(!String::from_utf8_lossy(&headers).contains(CREDENTIAL_HEADER));
             let mut body = [0; 15];
             socket.read_exact(&mut body).await.unwrap();
             assert_eq!(&body, b"private-request");
@@ -660,7 +636,6 @@ mod tests {
         store.data_mut().blob_store = durable.clone();
         store.data_mut().http = Some(Arc::new(pluribus_host_http::PolicyHttpService::new(
             durable.clone(),
-            Arc::new(pluribus_core::InMemoryCredentialStore::default()),
         )));
         let grant = store.data_mut().http_grant.as_mut().unwrap();
         grant.origins = vec![origin.clone()];

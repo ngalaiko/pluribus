@@ -23,7 +23,7 @@ use pluribus_core::{
 use pluribus_plugin_bindings as bindings;
 use pluribus_plugin_package::PluginComponent;
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -117,9 +117,20 @@ pub struct PluginServices {
     pub identity: Option<String>,
     pub http: Option<Arc<dyn HttpStreamService>>,
     pub http_grant: Option<HttpGrant>,
-    pub stream: Option<Arc<dyn StreamService>>,
-    pub stream_grant: Option<StreamGrant>,
+    /// Endpoints this component may reach, by the name `socket.connect`
+    /// selects them with. A name absent here is denied.
+    pub streams: BTreeMap<String, GrantedStream>,
     pub limits: Option<RuntimeLimits>,
+}
+
+/// One named endpoint: the transport that reaches it and its ceilings.
+///
+/// Each endpoint carries its own transport so that a connection ceiling
+/// bounds that endpoint rather than the component's traffic as a whole.
+#[derive(Clone)]
+pub struct GrantedStream {
+    pub service: Arc<dyn StreamService>,
+    pub grant: StreamGrant,
 }
 
 #[derive(Clone)]
@@ -1000,7 +1011,10 @@ fn prepare_call(store: &mut Store<HostState>, limits: &RuntimeLimits, phase: &st
     store.data_mut().call_deadline = Some(deadline);
     *store.data().io_completion_deadline.lock().unwrap() = None;
     store.epoch_deadline_callback(move |store| {
-        if store.data().interrupted() {
+        // An idle source handles shutdown through runtime.next; its deadline
+        // bounds the unwind. Active deliveries still cancel immediately.
+        let host = store.data();
+        if host.interrupted() && (!host.runner.active || host.runner.has_pending_delivery()) {
             return Err(wasmtime::Error::msg("call cancelled"));
         }
         if store
@@ -1094,8 +1108,7 @@ struct HostState {
     append_sequence: u64,
     http: Option<Arc<dyn HttpStreamService>>,
     http_grant: Option<HttpGrant>,
-    stream: Option<Arc<dyn StreamService>>,
-    stream_grant: Option<StreamGrant>,
+    streams: BTreeMap<String, GrantedStream>,
     call_deadline: Option<Instant>,
     io_completion_deadline: Arc<std::sync::Mutex<Option<Instant>>>,
     transports: Vec<Arc<Transport>>,
@@ -1306,8 +1319,7 @@ impl HostState {
             append_sequence: 0,
             http: granted.http,
             http_grant: granted.http_grant,
-            stream: granted.stream,
-            stream_grant: granted.stream_grant,
+            streams: granted.streams,
             call_deadline: None,
             io_completion_deadline: Arc::default(),
             transports: Vec::new(),
@@ -1478,31 +1490,6 @@ impl HostState {
 impl types::Host for HostState {}
 
 impl credentials::Host for HostState {
-    async fn authorize_http(
-        &mut self,
-        request: Resource<wasmtime_wasi_http::p3::Request>,
-        handle: String,
-    ) -> Result<(), types::Error> {
-        self.http_grant()?;
-        let request = self
-            .wasi_table
-            .get_mut(&request)
-            .map_err(|_| closed_channel())?;
-        let mut headers = (*request.headers).clone();
-        headers.insert(
-            wasi_http::CREDENTIAL_HEADER,
-            handle.parse().map_err(|_| {
-                host_error(
-                    types::ErrorCode::InvalidArgument,
-                    "invalid credential handle",
-                )
-            })?,
-        );
-        request.headers =
-            wasmtime_wasi_http::FieldMap::new_immutable(&mut self.wasi_hooks, headers);
-        Ok(())
-    }
-
     async fn resolve_export(&mut self, binding: String) -> Result<String, types::Error> {
         self.credentials
             .as_ref()
@@ -1936,10 +1923,15 @@ impl HostState {
         Ok(remaining)
     }
 
-    fn stream_access(&self) -> Result<(Arc<dyn StreamService>, StreamGrant), types::Error> {
-        let service = self.stream.clone().ok_or_else(stream_denied)?;
-        let grant = self.stream_grant.clone().ok_or_else(stream_denied)?;
-        Ok((service, grant))
+    /// The transport and ceilings behind one granted endpoint name. A name
+    /// the operator did not grant is denied, so naming an endpoint never
+    /// widens what the component can reach.
+    fn stream_access(
+        &self,
+        endpoint: &str,
+    ) -> Result<(Arc<dyn StreamService>, StreamGrant), types::Error> {
+        let granted = self.streams.get(endpoint).ok_or_else(stream_denied)?;
+        Ok((Arc::clone(&granted.service), granted.grant.clone()))
     }
 
     /// Milliseconds a connection may take to establish: the grant's ceiling,
@@ -2189,10 +2181,6 @@ fn state_error(error: StateError) -> types::Error {
     }
 }
 
-fn closed_channel() -> types::Error {
-    host_error(types::ErrorCode::InvalidArgument, "channel is closed")
-}
-
 fn stream_denied() -> types::Error {
     host_error(
         types::ErrorCode::PermissionDenied,
@@ -2211,6 +2199,7 @@ fn stream_plugin_error(error: StreamError) -> types::Error {
             types::ErrorCode::ResourceExhausted,
             "stream exceeded its granted transfer limit",
         ),
+        StreamError::Denied(message) => host_error(types::ErrorCode::PermissionDenied, &message),
         StreamError::Unavailable(message) => host_error(types::ErrorCode::Unavailable, &message),
     }
 }

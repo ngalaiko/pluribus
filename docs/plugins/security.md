@@ -49,21 +49,21 @@ Prompt injection is not solved by sandboxing. A model may still choose a harmful
 
 ## Secrets
 
-Configuration contains opaque handles. The `credentials` import grants explicitly declared components access only to their bound, package-scoped records. Such plugins may process secrets in Wasm; credentials remain outside ordinary state, events, and durable blobs. Export bindings grant read-only access to selected values through `resolve-export`, without raw-record access. Other plugins use host-side credential injection.
+Configuration contains opaque handles. The `credentials` import grants explicitly declared components access only to their bound, package-scoped records. Such plugins process secrets in Wasm; credentials remain outside ordinary state, events, and durable blobs. Export bindings grant read-only access to selected values through `resolve-export`, without raw-record access.
 
 Plugins MUST NOT:
 
 - request plaintext credentials through ordinary configuration;
 - place credentials in state, blobs, events, model input, errors, or logs;
-- copy injected authorization into provider metadata;
+- copy authorization into provider metadata;
 - follow redirects or retry requests outside host HTTP policy;
 - expose a credential handle as if it were a secret or user-facing identifier.
 
-Handles are scoped by installation, agent, component instance, allowed operation, and destination. They are not bearer tokens, but disclosure still aids reconnaissance and SHOULD be avoided.
+Handles are scoped by installation, agent, and component instance. They are not bearer tokens, but disclosure still aids reconnaissance and SHOULD be avoided.
 
-Enrollment input, OAuth responses, access tokens, and refresh tokens never cross the ABI. The host validates the plugin's declarative flow, serializes refresh, stores replacement credentials, and injects access tokens after destination checks.
+The host attaches no secret to an outgoing request. A component granted `access` holds its record and owns every exchange the secret takes part in, including renewal.
 
-Credential declarations are executable security policy. Installation MUST show their input fields, authorization endpoints, token endpoints, and injection destinations. Effective network grants must contain every endpoint and destination; declarations cannot expand them.
+Credential declarations are executable security policy. Installation MUST show their input fields and the components granted access. Effective network grants must contain every endpoint a plugin reaches; declarations cannot expand them.
 
 ## Network
 

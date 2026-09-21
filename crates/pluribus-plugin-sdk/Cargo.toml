@@ -1,0 +1,12 @@
+[package]
+name = "pluribus-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Guest bindings and runtime helpers for Pluribus plugins"
+
+[dependencies]
+futures-util.workspace = true
+url.workspace = true
+wit-bindgen.workspace = true

@@ -39,8 +39,7 @@ thread_local! {
 
 struct Telegram;
 
-use telegram::{exports, pluribus};
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../shared/run.rs"));
+use pluribus_plugin_sdk::serve;
 
 fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     let parsed = parse_config(&config)?;
@@ -225,7 +224,7 @@ fn send_media(arguments: &Value, config: &Config) -> Result<Value, Error> {
         method,
         &fields,
         &[(field.into(), file_name, blob.into())],
-        &config.credentials.bot_token,
+        &telegram::api::bot_token(&config.credentials.bot_token)?,
     )?;
     Ok(response.value)
 }
@@ -271,13 +270,19 @@ fn send_media_group(arguments: &Value, config: &Config) -> Result<Value, Error> 
         "sendMediaGroup",
         &fields,
         &files,
-        &config.credentials.bot_token,
+        &telegram::api::bot_token(&config.credentials.bot_token)?,
     )?
     .value)
 }
 
 fn simple_call(method: &str, arguments: &Value, config: &Config) -> Result<Value, Error> {
-    Ok(telegram::api::call_json(method, arguments, &config.credentials.bot_token, 60_000)?.value)
+    Ok(telegram::api::call_json(
+        method,
+        arguments,
+        &telegram::api::bot_token(&config.credentials.bot_token)?,
+        60_000,
+    )?
+    .value)
 }
 
 fn common_fields(arguments: &Value) -> Vec<(String, String)> {
@@ -333,7 +338,7 @@ fn internal(error: impl std::fmt::Display) -> Error {
     telegram::api::internal(error)
 }
 
-telegram::export!(Telegram);
+pluribus_plugin_sdk::export!(Telegram);
 
 #[cfg(test)]
 mod role_tests {

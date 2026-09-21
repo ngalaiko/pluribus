@@ -22,10 +22,11 @@ models_pointer = "/models"
 [[credentials]]
 components = ["main"]
 id = "api-key"
+access = true
 display_name = "OpenRouter API key"
 description = "Spend one OpenRouter key's credit on the configured models."
 input_schema = "schemas/credential.input.json"
-flow_schema = "pluribus:credential/static-http@1"
+flow_schema = "pluribus:credential/static-plugin@1"
 flow = "flows/api-key.json"
 
 [[components.main.requested_capabilities]]

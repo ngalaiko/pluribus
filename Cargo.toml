@@ -7,10 +7,10 @@ members = [
     "crates/pluribus-model",
     "crates/pluribus-paths",
     "crates/pluribus-plugin-bindings",
+    "crates/pluribus-plugin-sdk",
     "crates/pluribus-plugin-package",
     "crates/pluribus-host-http",
     "crates/pluribus-host-stream",
-    "crates/pluribus-host-oauth",
     "crates/pluribus-runtime-wasm",
     "crates/pluribus-cognition",
     "crates/pluribus-cli",
@@ -19,6 +19,7 @@ members = [
     "plugins/cli",
     "plugins/cli/protocol",
     "plugins/echo",
+    "plugins/email",
     "plugins/memory",
     "plugins/openai-codex",
     "plugins/openrouter",
@@ -45,6 +46,7 @@ all = "warn"
 pedantic = "warn"
 
 [workspace.dependencies]
+pluribus-plugin-sdk = { path = "crates/pluribus-plugin-sdk" }
 async-sqlite = { version = "0.6", default-features = false, features = ["bundled"] }
 async-trait = "0.1"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
@@ -83,3 +85,4 @@ http = "1"
 http-body-util = "0.1"
 http-body = "1"
 bytes = "1"
+webpki-roots = "1.0"

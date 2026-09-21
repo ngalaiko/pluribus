@@ -14,10 +14,10 @@ name = "pluribus-shell-executor"
 path = "executor/src/main.rs"
 
 [dependencies]
+pluribus-plugin-sdk.workspace = true
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-wit-bindgen = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

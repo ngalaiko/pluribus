@@ -450,17 +450,13 @@ Core-owned:
 timer.fired
 ```
 
-### Policy and credentials
+### Policy
 
 Core-owned:
 
 ```text
 policy.decision
-credential.lifecycle   pluribus.credential-lifecycle/1
 ```
-
-`credential.lifecycle` records the handle, component, and operation. It never
-records secret bytes.
 
 ### Telegram media
 

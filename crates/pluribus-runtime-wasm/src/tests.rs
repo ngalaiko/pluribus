@@ -1102,6 +1102,9 @@ async fn credential_exports_are_scoped_without_raw_record_access() {
 #[derive(Default)]
 pub(super) struct SubscriptionFixture {
     pub(super) fail: AtomicBool,
+    /// Milliseconds a read waits before answering, standing in for a
+    /// connection that sits idle between server pushes.
+    pub(super) read_delay_ms: AtomicU64,
     pub(super) opens: AtomicU64,
     pub(super) reads: AtomicU64,
     pub(super) sent: std::sync::Mutex<Vec<Vec<u8>>>,
@@ -1117,6 +1120,10 @@ impl StreamService for SubscriptionFixture {
     }
     async fn next(&self, _: &str, _: u32) -> Result<pluribus_core::StreamPage, StreamError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        let delay = self.read_delay_ms.load(Ordering::Acquire);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.fail.load(Ordering::Acquire) {
             return Err(StreamError::Unavailable("disconnected".into()));
         }
@@ -1209,15 +1216,22 @@ async fn packaged_cli_run_frames_input_and_commits_offsets() {
             &serde_json::json!({}),
             delivery(),
             PluginServices {
-                stream: Some(stream.clone()),
-                stream_grant: Some(StreamGrant {
-                    endpoint: pluribus_core::StreamEndpoint::Unix {
-                        path: "/unused".into(),
-                        peer_uids: vec![1],
+                streams: [(
+                    "default".to_owned(),
+                    crate::GrantedStream {
+                        service: stream.clone(),
+                        grant: StreamGrant {
+                            endpoint: pluribus_core::StreamEndpoint::Unix {
+                                path: "/unused".into(),
+                                peer_uids: vec![1],
+                            },
+                            max_bytes: 1024,
+                            max_timeout_ms: 1000,
+                            max_connections: u32::MAX,
+                        },
                     },
-                    max_bytes: 1024,
-                    max_timeout_ms: 1000,
-                }),
+                )]
+                .into(),
                 limits: Some(RuntimeLimits {
                     memory_bytes: 32 * 1024 * 1024,
                     call_timeout: Duration::from_millis(100),

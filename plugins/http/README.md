@@ -17,8 +17,8 @@ pluribus-http-listener \
 Repeat `--route ID:METHODS:PATH:CONSUMER` for additional routes. Methods are
 comma-separated; a trailing `*` matches a path prefix. Routes are checked in order.
 
-Install `bundled:http`, configuring `components.listen.stream.socket` and
-`peer_uids` to match. The plugin's ordinary configuration is `{}`.
+Install `bundled:http`, configuring `components.listen.stream.default.socket`
+and `peer_uids` to match. The plugin's ordinary configuration is `{}`.
 
 Defaults: 1 MiB request body, 32 KiB headers, 256 MiB inbox, 64 concurrent HTTP
 requests, eight-second response deadline. `--max-body-bytes` supports up to 25 MiB;

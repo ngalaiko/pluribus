@@ -49,8 +49,7 @@ config_schema = "config.schema.json"
 
 `[defaults]` contains package configuration defaults. Instance values override
 these recursively. Credentials can omit `components` when the package has one
-component; multi-component packages name consumers explicitly. Credential
-`enrollment_origins` declares allowed enrollment endpoints.
+component; multi-component packages name consumers explicitly.
 
 A multi-component manifest uses:
 
@@ -67,8 +66,9 @@ id = "bot-token"
 display_name = "Telegram bot token"
 description = "Bot token issued by BotFather."
 components = ["receive", "send"]
+access = true
 input_schema = "schemas/credential.input.json"
-flow_schema = "pluribus:credential/static-http@1"
+flow_schema = "pluribus:credential/static-plugin@1"
 flow = "flows/bot-token.json"
 
 [components.receive]
@@ -223,7 +223,7 @@ Secret references are opaque handles in `config.credentials`, keyed by the manif
 { "credentials": {"bot-token": "telegram:primary"} }
 ```
 
-The string is an opaque handle, not secret material. A plugin attaches it with `credentials.authorize-http(request, handle)`, and the host injects the secret after its policy checks. A plugin MUST NOT accept plaintext secrets in ordinary configuration.
+The string is an opaque handle, not secret material. A component granted `access` reads the record behind it with `credentials.get(handle)`. A plugin MUST NOT accept plaintext secrets in ordinary configuration.
 
 ## Requested capabilities
 
@@ -267,7 +267,6 @@ request delivery progress stays unchanged. Handlers must consume each replay
 batch without emitting events. Replay providers may import only `events` and
 `state`. See [memory](../memory-plugin.md).
 
-Credential declarations may set `access = true` when their Wasm component must
-manage its own secrets. The host grants only that declaration's configured
-handle to its listed components, under the package ID. Other credential flows
-keep using host-side injection without exposing secret bytes.
+Credential declarations set `access = true` when their Wasm component reads
+the sealed record. The host grants only that declaration's configured handle
+to its listed components, under the package ID.

@@ -30,9 +30,8 @@ This fragment needs a model package and `model_instance` to run. Packages use ab
 | `config` | Package configuration; credentials are opaque handles, never secrets. |
 | `aliases` | Enrollment command aliases for the package instance. |
 | `components.<name>.http` | Component HTTP origins, methods, request/response limits, and timeout. |
-| `components.<name>.stream` | Component Unix socket endpoint and transfer limits. |
+| `components.<name>.stream` | Component endpoints by name, each a Unix socket or TLS destination with its own transfer limits. |
 | `components.<name>.limits` | Optional memory and lifecycle-call timeout overrides; defaults: 32 MiB and 60 seconds. |
-| `enrollment_origins` | Package OAuth enrollment and refresh origins. |
 
 HTTP requires HTTPS, excludes private networks and redirects, and must match that component's declared requests. Runtime access does not follow from a manifest declaration alone. HTTP grant principals must match their component instance. Stream access additionally requires the endpoint's account to be listed in `peer_uids`; see [stream transport](plugins/stream.md).
 

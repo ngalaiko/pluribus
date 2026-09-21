@@ -1,6 +1,6 @@
 # Telegram connector
 
-One package contains two independent components. `receive` owns polling and the update offset; `send` owns outbound capabilities. Both use the package bot-token credential. A blocked poll does not block sending. It declares bot-token enrollment in its manifest. The host seals the token as a path credential; component memory receives only its handle.
+One package contains two independent components. `receive` owns polling and the update offset; `send` owns outbound capabilities. Both use the package bot-token credential. A blocked poll does not block sending. The host seals the enrolled token under the handle; each component reads it back with `credentials.get` and builds the `/bot<token>` URL path itself.
 
 Set `plugin_instances.telegram.config.trusted_senders` to Telegram user IDs as strings:
 

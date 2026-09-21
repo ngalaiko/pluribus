@@ -9,9 +9,8 @@ rust-version.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+pluribus-plugin-sdk.workspace = true
 url.workspace = true
-futures-util.workspace = true
 pluribus-model = { path = "../../crates/pluribus-model" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-wit-bindgen = { workspace = true }

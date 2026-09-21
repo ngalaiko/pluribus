@@ -27,7 +27,7 @@ pub fn proposal(kind: &str, value: Value, cause: Option<String>) -> Proposal {
     }
 }
 pub async fn exchange(value: Value) -> Result<Value, Error> {
-    let mut channel = crate::Socket::connect().await?;
+    let mut channel = crate::Socket::connect("default").await?;
     let mut bytes = serde_json::to_vec(&value).unwrap();
     bytes.push(b'\n');
     channel.send(&bytes).await?;

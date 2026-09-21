@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["messageId", "recipients"],
+  "properties": {
+    "messageId": {
+      "description": "The Message-Id the submitted message carries.",
+      "type": "string"
+    },
+    "recipients": {
+      "description": "The envelope recipients the endpoint accepted.",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

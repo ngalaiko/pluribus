@@ -23,7 +23,6 @@ pluribus-cognition = { path = "../pluribus-cognition" }
 pluribus-core = { path = "../pluribus-core" }
 pluribus-host-http = { path = "../pluribus-host-http" }
 pluribus-host-stream = { path = "../pluribus-host-stream" }
-pluribus-host-oauth = { path = "../pluribus-host-oauth" }
 pluribus-log = { path = "../pluribus-log" }
 pluribus-paths = { path = "../pluribus-paths" }
 pluribus-plugin-package = { path = "../pluribus-plugin-package" }

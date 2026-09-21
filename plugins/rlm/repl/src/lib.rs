@@ -174,11 +174,12 @@ impl Environment {
 #[cfg(target_arch = "wasm32")]
 mod component {
     use super::*;
-    use std::cell::RefCell;
-    wit_bindgen::generate!({ generate_all,path: "../../../wit", world: "plugin"});
     use exports::pluribus::plugin::lifecycle::{Context as CallContext, Guest, Outcome};
     use pluribus::plugin::types::{Error, ErrorCode, Event, Payload, Proposal};
+    use pluribus_plugin_sdk::export;
+    use pluribus_plugin_sdk::{exports, pluribus};
     use serde_json::json;
+    use std::cell::RefCell;
 
     // A running cell is a paused async function, not serializable state. The
     // manifest declares a pinned session so the host keeps this instance for
@@ -187,7 +188,7 @@ mod component {
 
     struct Code;
 
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../shared/run.rs"));
+    use pluribus_plugin_sdk::serve;
 
     fn setup(_context: CallContext, _config: Vec<u8>) -> Result<Outcome, Error> {
         Ok(empty())

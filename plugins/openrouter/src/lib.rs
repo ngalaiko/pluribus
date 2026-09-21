@@ -7,15 +7,14 @@ use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-wit_bindgen::generate!({ generate_all,
-    path: "../../wit",
-    world: "plugin",
-});
+use pluribus_plugin_sdk::export;
+pub use pluribus_plugin_sdk::{exports, http, pluribus, wasi};
 
 use crate::http::Reader;
 use crate::http::{Header, Request};
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::blobs;
+use pluribus::plugin::credentials;
 use pluribus::plugin::events;
 use pluribus::plugin::types::{self, Error, ErrorCode, Event, Payload, Proposal};
 
@@ -60,6 +59,12 @@ struct Credentials {
     api_key: String,
 }
 
+/// The enrolled record behind the `api-key` handle.
+#[derive(Deserialize)]
+struct ApiKey {
+    api_key: String,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -71,7 +76,7 @@ struct Config {
 
 struct OpenRouter;
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+use pluribus_plugin_sdk::serve;
 
 fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     let parsed: Config = serde_json::from_slice(&config)
@@ -158,9 +163,9 @@ fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error
         headers: vec![
             header("accept", "text/event-stream"),
             header("content-type", "application/json"),
+            header("authorization", &format!("Bearer {}", api_key(config)?)),
         ],
         body: Some(body),
-        credential: Some(config.credentials.api_key.clone()),
         timeout_ms: config.timeout_ms,
     })?;
     // The reader closes when it drops, ending the transfer.
@@ -772,6 +777,16 @@ fn chunk_error(error: &Value) -> Error {
     }
 }
 
+/// Reads the enrolled key. The host attaches nothing, so the request carries
+/// whatever this returns.
+fn api_key(config: &Config) -> Result<String, Error> {
+    let bytes = credentials::get(&config.credentials.api_key)?
+        .ok_or_else(|| invalid("OpenRouter key is not enrolled"))?;
+    let record: ApiKey =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("invalid credential record"))?;
+    Ok(record.api_key)
+}
+
 fn header(name: &str, value: &str) -> Header {
     Header {
         name: name.to_owned(),
@@ -1009,6 +1024,3 @@ mod tests {
         assert!(!error.retryable);
     }
 }
-
-#[path = "../../shared/http.rs"]
-pub mod http;

@@ -40,8 +40,10 @@ this one.
   "components": {
     "main": {
       "stream": {
-        "socket": "/tmp/pluribus-cli.sock",
-        "peer_uids": [501]
+        "default": {
+          "socket": "/tmp/pluribus-cli.sock",
+          "peer_uids": [501]
+        }
       }
     }
   }

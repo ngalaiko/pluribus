@@ -1,6 +1,6 @@
 //! HTTP helpers over WASI resources and native body streams.
 use crate::pluribus::plugin::{
-    blobs, credentials,
+    blobs,
     types::{BlobRef, Chunk, Error, ErrorCode},
 };
 use crate::wasi::http::{client, types as wasi};
@@ -15,7 +15,6 @@ pub struct Request {
     pub url: String,
     pub headers: Vec<Header>,
     pub body: Option<BlobRef>,
-    pub credential: Option<String>,
     pub timeout_ms: u32,
 }
 pub struct Response {
@@ -84,7 +83,6 @@ async fn request(
     url: &str,
     headers: &[Header],
     bytes: Vec<u8>,
-    credential: Option<&str>,
     timeout_ms: u32,
 ) -> Result<wasi::Response, Error> {
     let url = url::Url::parse(url).map_err(invalid)?;
@@ -143,9 +141,6 @@ async fn request(
             &url[url::Position::BeforePath..url::Position::AfterQuery],
         ))
         .map_err(|()| invalid("invalid HTTP path"))?;
-    if let Some(handle) = credential {
-        credentials::authorize_http(&request, handle)?;
-    }
     let response = client::send(request).await.map_err(error)?;
     sent.await.map_err(error)?;
     Ok(response)
@@ -155,20 +150,30 @@ struct Body {
     completion: Option<wit_bindgen::FutureReader<Result<Option<wasi::Fields>, wasi::ErrorCode>>>,
     ended: bool,
 }
-pub struct Reader(RefCell<Body>);
+pub struct Reader {
+    status: u16,
+    body: RefCell<Body>,
+}
 impl Reader {
     fn new(response: wasi::Response) -> Self {
+        let status = response.get_status_code();
         let (done, done_read) = crate::wit_future::new(|| Ok(()));
         drop(done);
         let (bytes, completion) = wasi::Response::consume_body(response, done_read);
-        Self(RefCell::new(Body {
-            bytes,
-            completion: Some(completion),
-            ended: false,
-        }))
+        Self {
+            status,
+            body: RefCell::new(Body {
+                bytes,
+                completion: Some(completion),
+                ended: false,
+            }),
+        }
+    }
+    pub fn status(&self) -> u16 {
+        self.status
     }
     async fn read(&self, max: u32, timeout_ms: Option<u32>) -> Result<Chunk, Error> {
-        let mut body = self.0.borrow_mut();
+        let mut body = self.body.borrow_mut();
         if body.ended {
             return Ok(Chunk {
                 bytes: vec![],
@@ -253,7 +258,6 @@ pub async fn fetch(input: Request) -> Result<Response, Error> {
         &input.url,
         &input.headers,
         bytes,
-        input.credential.as_deref(),
         input.timeout_ms,
     )
     .await?;
@@ -272,7 +276,6 @@ pub fn send(input: &Request) -> Result<Response, Error> {
             &input.url,
             &input.headers,
             bytes,
-            input.credential.as_deref(),
             input.timeout_ms,
         )
         .await?;
@@ -292,7 +295,6 @@ pub fn sse(input: &Request) -> Result<Reader, Error> {
             &input.url,
             &input.headers,
             bytes,
-            input.credential.as_deref(),
             input.timeout_ms,
         )
         .await?;
@@ -306,12 +308,11 @@ pub fn exchange(input: &InlineRequest) -> Result<InlineResponse, Error> {
             &input.url,
             &input.headers,
             input.body.clone(),
-            None,
             input.timeout_ms,
         )
         .await?;
-        let status = response.get_status_code();
         let reader = Reader::new(response);
+        let status = reader.status();
         let mut body = Vec::new();
         loop {
             let chunk = reader.read(64 * 1024, None).await?;

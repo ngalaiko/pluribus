@@ -250,9 +250,10 @@ impl StreamConsumer<HostState> for SocketSend {
 impl socket::HostWithStore<HostState> for HostData {
     async fn connect(
         accessor: &Accessor<HostState, Self>,
+        endpoint: String,
         mut outgoing: StreamReader<u8>,
     ) -> Result<(StreamReader<u8>, FutureReader<Result<(), types::Error>>), types::Error> {
-        let (transport, cancelled) = match Self::open_transport(accessor).await {
+        let (transport, cancelled) = match Self::open_transport(accessor, &endpoint).await {
             Ok(opened) => opened,
             Err(error) => {
                 accessor.with(|mut access| {
@@ -312,17 +313,18 @@ impl socket::HostWithStore<HostState> for HostData {
 }
 
 impl HostData {
-    /// Connects the granted endpoint under the call's cancellation and
+    /// Connects the named granted endpoint under the call's cancellation and
     /// deadline. Connection establishment is bounded by the grant.
     async fn open_transport(
         accessor: &Accessor<HostState, Self>,
+        endpoint: &str,
     ) -> Result<(Arc<Transport>, Arc<tokio::sync::Notify>), types::Error> {
         let (service, grant, interrupt, deadline, cancelled) = accessor.with(|mut access| {
             let host = access.get();
             if host.replaying || host.runner.stopping || host.interrupted() {
                 return Err(stream_denied());
             }
-            let (service, grant) = host.stream_access()?;
+            let (service, grant) = host.stream_access(endpoint)?;
             let grant = StreamGrant {
                 max_timeout_ms: host.connect_budget(&grant)?,
                 ..grant
@@ -391,15 +393,21 @@ mod tests {
     }
 
     fn granted(host: &mut HostState, service: &Arc<crate::tests::SubscriptionFixture>) {
-        host.stream = Some(service.clone());
-        host.stream_grant = Some(StreamGrant {
-            endpoint: pluribus_core::StreamEndpoint::Unix {
-                path: "/unused".into(),
-                peer_uids: vec![1],
+        host.streams.insert(
+            "default".into(),
+            crate::GrantedStream {
+                service: service.clone(),
+                grant: StreamGrant {
+                    endpoint: pluribus_core::StreamEndpoint::Unix {
+                        path: "/unused".into(),
+                        peer_uids: vec![1],
+                    },
+                    max_bytes: 1024,
+                    max_timeout_ms: 1000,
+                    max_connections: 1,
+                },
             },
-            max_bytes: 1024,
-            max_timeout_ms: 1000,
-        });
+        );
     }
 
     #[tokio::test]
@@ -411,7 +419,7 @@ mod tests {
                 let outgoing =
                     accessor.with(|mut access| StreamReader::new(&mut access, Once(None)).unwrap());
                 assert!(
-                    socket::HostWithStore::connect(&host_access, outgoing)
+                    socket::HostWithStore::connect(&host_access, "default".into(), outgoing)
                         .await
                         .is_err()
                 );
@@ -431,9 +439,10 @@ mod tests {
                 let outgoing = accessor.with(|mut access| {
                     StreamReader::new(&mut access, Once(Some(b"ping".to_vec()))).unwrap()
                 });
-                let (incoming, mut done) = socket::HostWithStore::connect(&host_access, outgoing)
-                    .await
-                    .unwrap();
+                let (incoming, mut done) =
+                    socket::HostWithStore::connect(&host_access, "default".into(), outgoing)
+                        .await
+                        .unwrap();
                 assert_eq!(service.opens.load(Ordering::Acquire), 1);
                 assert_eq!(service.reads.load(Ordering::Acquire), 0, "reads are lazy");
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -500,9 +509,10 @@ mod tests {
                 let host_access = accessor.with_getter::<HostData>(|h| h);
                 let outgoing =
                     accessor.with(|mut access| StreamReader::new(&mut access, Once(None)).unwrap());
-                let (incoming, done) = socket::HostWithStore::connect(&host_access, outgoing)
-                    .await
-                    .unwrap();
+                let (incoming, done) =
+                    socket::HostWithStore::connect(&host_access, "default".into(), outgoing)
+                        .await
+                        .unwrap();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 accessor.with(|access| incoming.pipe(access, Hold).unwrap());
                 accessor.with(|access| done.pipe(access, Settle(Some(tx))).unwrap());
@@ -539,5 +549,110 @@ mod tests {
         let before = monotonic_clock::Host::now(&mut host).await;
         let after = monotonic_clock::Host::now(&mut host).await;
         assert!(after >= before);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use wasmtime::component::StreamConsumer;
+
+    /// Collects the first chunk and reports when it arrived.
+    struct FirstBytes(Option<tokio::sync::oneshot::Sender<Vec<u8>>>);
+    impl StreamConsumer<HostState> for FirstBytes {
+        type Item = u8;
+        fn poll_consume(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            store: StoreContextMut<HostState>,
+            mut source: Source<'_, u8>,
+            _: bool,
+        ) -> Poll<wasmtime::Result<StreamResult>> {
+            let mut bytes = Vec::with_capacity(32 * 1024);
+            source.read(store, &mut bytes)?;
+            if bytes.is_empty() {
+                return Poll::Ready(Ok(StreamResult::Completed));
+            }
+            let _ = self.0.take().unwrap().send(bytes);
+            Poll::Ready(Ok(StreamResult::Dropped))
+        }
+    }
+
+    struct Once(Option<Vec<u8>>);
+    impl StreamProducer<HostState> for Once {
+        type Item = u8;
+        type Buffer = VecBuffer<u8>;
+        fn poll_produce<'a>(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: StoreContextMut<'a, HostState>,
+            mut dst: Destination<'a, u8, Self::Buffer>,
+            _: bool,
+        ) -> Poll<wasmtime::Result<StreamResult>> {
+            Poll::Ready(Ok(match self.0.take() {
+                Some(bytes) => {
+                    dst.set_buffer(bytes.into());
+                    StreamResult::Completed
+                }
+                None => StreamResult::Dropped,
+            }))
+        }
+    }
+
+    /// A source parked on a socket read outlives its call budget: a pushed
+    /// message arrives long after the last commit. The epoch ticker traps the
+    /// guest when it resumes past the deadline, so arriving bytes move it.
+    #[tokio::test]
+    async fn a_read_past_the_call_budget_refreshes_the_source_deadline() {
+        let (mut store, _, _) = crate::runner::tests::source().await;
+        let service = Arc::new(crate::tests::SubscriptionFixture {
+            read_delay_ms: std::sync::atomic::AtomicU64::new(60),
+            ..Default::default()
+        });
+        {
+            let host = store.data_mut();
+            host.streams.insert(
+                "default".into(),
+                crate::GrantedStream {
+                    service: service.clone(),
+                    grant: StreamGrant {
+                        endpoint: pluribus_core::StreamEndpoint::Unix {
+                            path: "/unused".into(),
+                            peer_uids: vec![1],
+                        },
+                        max_bytes: 1024,
+                        max_timeout_ms: 1000,
+                        max_connections: 1,
+                    },
+                },
+            );
+            host.runner.timeout = Duration::from_millis(500);
+            host.call_deadline = Some(Instant::now() + Duration::from_millis(30));
+        }
+        store
+            .run_concurrent(async |accessor| {
+                let host_access = accessor.with_getter::<HostData>(|h| h);
+                let outgoing =
+                    accessor.with(|mut access| StreamReader::new(&mut access, Once(None)).unwrap());
+                let (incoming, mut done) =
+                    socket::HostWithStore::connect(&host_access, "default".into(), outgoing)
+                        .await
+                        .unwrap();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                accessor.with(|access| incoming.pipe(access, FirstBytes(Some(tx))).unwrap());
+                assert_eq!(rx.await.unwrap(), vec![1]);
+                accessor.with(|mut access| {
+                    let remaining = access
+                        .get()
+                        .effective_deadline()
+                        .unwrap()
+                        .checked_duration_since(Instant::now())
+                        .expect("bytes arrived past the call budget without renewing it");
+                    assert!(remaining > Duration::from_millis(400));
+                });
+                done.close_with(accessor).unwrap();
+            })
+            .await
+            .unwrap();
     }
 }

@@ -93,17 +93,24 @@ async fn http_echo_crosses_listener_wasm_and_agent() {
         let package = PluginPackage::load(packages.join(name)).unwrap();
         let services = if name == "http" {
             PluginServices {
-                stream: Some(Arc::new(
-                    pluribus_host_stream::LocalStreamService::new(dir.path()).unwrap(),
-                )),
-                stream_grant: Some(StreamGrant {
-                    endpoint: StreamEndpoint::Unix {
-                        path: socket.clone(),
-                        peer_uids: vec![rustix::process::geteuid().as_raw()],
+                streams: [(
+                    "default".to_owned(),
+                    pluribus_runtime_wasm::GrantedStream {
+                        service: Arc::new(
+                            pluribus_host_stream::LocalStreamService::new(dir.path()).unwrap(),
+                        ),
+                        grant: StreamGrant {
+                            endpoint: StreamEndpoint::Unix {
+                                path: socket.clone(),
+                                peer_uids: vec![rustix::process::geteuid().as_raw()],
+                            },
+                            max_bytes: 16 * 1024 * 1024,
+                            max_timeout_ms: 1000,
+                            max_connections: u32::MAX,
+                        },
                     },
-                    max_bytes: 16 * 1024 * 1024,
-                    max_timeout_ms: 1000,
-                }),
+                )]
+                .into(),
                 ..Default::default()
             }
         } else {

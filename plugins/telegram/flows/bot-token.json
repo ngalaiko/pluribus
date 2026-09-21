@@ -1,8 +1,3 @@
 {
-  "http": {
-    "origins": ["https://api.telegram.org"],
-    "pathPrefix": {
-      "parts": [{ "literal": "/bot" }, { "input": "token" }]
-    }
-  }
+  "components": ["receive", "send"]
 }

@@ -1,4 +1,4 @@
-// Byte channel to the one granted socket endpoint. Framing is the caller's.
+// Byte channel to a granted socket endpoint. Framing is the caller's.
 
 use crate::pluribus::plugin::{
     socket,
@@ -15,9 +15,11 @@ pub struct Socket {
 }
 
 impl Socket {
-    pub async fn connect() -> Result<Self, Error> {
+    /// Connects the endpoint granted under `endpoint`. The name selects
+    /// among the grants; it does not name a destination.
+    pub async fn connect(endpoint: &str) -> Result<Self, Error> {
         let (outgoing, peer) = crate::wit_stream::new::<u8>();
-        let (incoming, completion) = socket::connect(peer).await?;
+        let (incoming, completion) = socket::connect(endpoint.to_owned(), peer).await?;
         Ok(Self {
             outgoing: Some(outgoing),
             incoming,
@@ -44,6 +46,11 @@ impl Socket {
 
     /// Reads at most `max` bytes. A timeout yields an empty open chunk. End of
     /// stream yields a closed chunk and surfaces the transport error, if any.
+    ///
+    /// The end of the stream is taken from what the transport reported, not
+    /// from an empty read: a timeout that races a transport ending returns
+    /// no bytes either way, and starting another read on an ended stream
+    /// traps.
     pub async fn read(&mut self, max: u32, timeout_ms: Option<u32>) -> Result<Chunk, Error> {
         if self.ended {
             return Ok(Chunk {
@@ -57,7 +64,7 @@ impl Socket {
                 "read size must be positive",
             ));
         }
-        let (bytes, timed_out) = {
+        let (status, bytes) = {
             let mut read = std::pin::pin!(
                 self.incoming
                     .read(Vec::with_capacity(max.min(64 * 1024) as usize))
@@ -67,18 +74,14 @@ impl Socket {
                     u64::from(ms) * 1_000_000
                 ));
                 match futures_util::future::select(read.as_mut(), timer).await {
-                    futures_util::future::Either::Left(((_, bytes), _)) => (bytes, false),
-                    futures_util::future::Either::Right(((), read)) => {
-                        let (_, bytes) = read.cancel();
-                        (bytes, true)
-                    }
+                    futures_util::future::Either::Left((result, _)) => result,
+                    futures_util::future::Either::Right(((), read)) => read.cancel(),
                 }
             } else {
-                let (_, bytes) = read.await;
-                (bytes, false)
+                read.await
             }
         };
-        let closed = bytes.is_empty() && !timed_out;
+        let closed = !matches!(status, wit_bindgen::StreamResult::Cancelled) && bytes.is_empty();
         if closed {
             self.ended = true;
             self.completion.take().unwrap().await?;

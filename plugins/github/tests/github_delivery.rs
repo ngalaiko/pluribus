@@ -70,7 +70,6 @@ impl HttpService for GithubHttp {
             status: 200,
             headers: vec![],
             body: self.blob(body).await,
-            credentials_used: vec![],
         })
     }
 }
@@ -140,17 +139,22 @@ fn delivery(instance: &str) -> Delivery {
 }
 fn services(dir: &Path, socket: PathBuf, _instance: &str) -> PluginServices {
     PluginServices {
-        stream: Some(Arc::new(
-            pluribus_host_stream::LocalStreamService::new(dir).unwrap(),
-        )),
-        stream_grant: Some(StreamGrant {
-            endpoint: StreamEndpoint::Unix {
-                path: socket,
-                peer_uids: vec![rustix::process::geteuid().as_raw()],
+        streams: [(
+            "default".to_owned(),
+            pluribus_runtime_wasm::GrantedStream {
+                service: Arc::new(pluribus_host_stream::LocalStreamService::new(dir).unwrap()),
+                grant: StreamGrant {
+                    endpoint: StreamEndpoint::Unix {
+                        path: socket,
+                        peer_uids: vec![rustix::process::geteuid().as_raw()],
+                    },
+                    max_bytes: 40 * 1024 * 1024,
+                    max_timeout_ms: 5000,
+                    max_connections: u32::MAX,
+                },
             },
-            max_bytes: 40 * 1024 * 1024,
-            max_timeout_ms: 5000,
-        }),
+        )]
+        .into(),
         ..PluginServices::default()
     }
 }

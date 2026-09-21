@@ -96,7 +96,7 @@ interface blobs {
     -> result<chunk, error>;
 }
 
-/// Byte channel to the one Unix socket endpoint granted to this instance.
+/// Byte channels to the endpoints granted to this instance.
 ///
 /// The host owns transport, peer-credential verification, and byte and
 /// time budgets. The plugin owns framing and protocol. No credential is
@@ -105,7 +105,12 @@ interface blobs {
 interface socket {
   use types.{error};
 
-  /// Connects the granted endpoint.
+  /// Connects one granted endpoint.
+  ///
+  /// `endpoint` selects among the names the operator granted this
+  /// component; it is not a destination. A name the grant does not carry
+  /// is denied, so the plugin still cannot choose where bytes go. A
+  /// component granted one unnamed endpoint reaches it as `default`.
   ///
   /// Bytes written to `outgoing` reach the peer. Closing its writer
   /// half-closes the channel: the peer reads EOF while the incoming
@@ -117,17 +122,15 @@ interface socket {
   /// after it ends, carrying the transport error if one ended it. The
   /// transport closes when both directions are done or dropped.
   ///
-  /// Denied during replay. Both directions share one byte budget.
-  connect: async func(outgoing: stream<u8>)
+  /// Denied during replay. Each endpoint carries its own byte budget,
+  /// shared by both directions of one connection.
+  connect: async func(endpoint: string, outgoing: stream<u8>)
     -> result<tuple<stream<u8>, future<result<_, error>>>, error>;
 }
 
 /// Explicitly granted access to a plugin's own credential records.
 interface credentials {
-  use wasi:http/types@0.3.0.{request};
   use types.{error};
-  /// Attaches a granted credential to one request. Secret bytes remain in the host.
-  authorize-http: func(request: borrow<request>, handle: string) -> result<_, error>;
   resolve-export: func(binding: string) -> result<string, error>;
   get: func(handle: string) -> result<option<list<u8>>, error>;
   compare-and-swap: func(handle: string, expected: option<list<u8>>, value: list<u8>) -> result<bool, error>;

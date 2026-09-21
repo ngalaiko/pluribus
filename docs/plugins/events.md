@@ -73,7 +73,8 @@ gates, dispatch outcomes, and timers:
 component.failed        component.backoff       component.recovered
 operator.job-control    operator.attempt-reconciled
 observation.received
-policy.decision         credential.lifecycle
+policy.decision
+credential.enrollment.requested
 activity.attempted      activity.unknown
 capability.denied       capability.timed-out    capability.cancelled
 timer.fired
@@ -88,6 +89,7 @@ authority.
 ### Plugin-emittable
 
 ```text
+credential.enrollment.started
 capability.requested    model.requested
 capability.output       capability.completed    capability.failed
 model.stream            model.completed         model.failed
@@ -102,6 +104,13 @@ code.close-requested    code.closed
 timer.set               timer.cancel
 http.request.received    http.response.requested
 ```
+
+Credential enrollment uses one core-owned request and one plugin result. The
+CLI emits `credential.enrollment.requested` with `{component, credential,
+enrollment}` after staging private input. The declared component may emit
+`credential.enrollment.started` with `{url, userCode?}`. The URL is required;
+`userCode` is an optional operator-facing device code. Neither event carries
+secret input.
 
 The list is exhaustive. A plugin needing a type outside it changes
 `RESERVED_EVENT_TYPES` or `PLUGIN_EVENT_TYPES` in

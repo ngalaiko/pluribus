@@ -134,7 +134,7 @@ pluribus auth openrouter
 pluribus auth mail-work
 ```
 
-Secrets are sealed as scoped credentials; a component receives only the handle.
+Secrets are sealed as scoped credentials; configuration carries only the handle.
 Piped input is supported for automation.
 
 Define packages, configurations, aliases, and grants in the [plugin-instance registry](docs/plugin-instances.md).
@@ -149,6 +149,11 @@ Observations, raw payloads, media descriptors, model deltas, capability calls,
 and delivery outcomes persist under the data directory.
 
 Receive [HTTP requests](plugins/http/README.md) and [GitHub observations](plugins/github/README.md), with App tokens available to the shell executor.
+
+Observe [arriving mail over IMAP](plugins/email/README.md) and answer it over
+SMTP. The host holds a TLS connection to each configured endpoint, speaking
+the STARTTLS preamble where submission needs one; the plugin speaks IMAP and
+SMTP, and waits on server push rather than polling.
 
 Add [durable memory](plugins/memory/README.md), [configured tools](docs/plugin-instances.md) and [isolated shell execution](plugins/shell/README.md).
 

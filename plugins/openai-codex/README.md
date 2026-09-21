@@ -1,17 +1,17 @@
 # OpenAI Codex subscription
 
-Calls the ChatGPT Codex Responses backend using a host-owned OAuth credential. It declares device enrollment through `credential-provider`; it does not invoke or embed the Codex CLI.
+Calls the ChatGPT Codex Responses backend with a ChatGPT subscription token pair the plugin owns. It does not invoke or embed the Codex CLI.
 
 Responses stream through host-managed SSE. Each model delta is audited before the next frame is read.
 
 Build and package:
 
 ```sh
-cargo build --manifest-path plugins/openai-codex/Cargo.toml --target wasm32-unknown-unknown --release
+cargo build -p pluribus-plugin-openai-codex --target wasm32-unknown-unknown --release
 cargo run -p pluribus-plugin-package --bin pluribus-package -- \
   plugins/openai-codex \
   target/plugins/openai-codex \
-  main=plugins/openai-codex/target/wasm32-unknown-unknown/release/pluribus_plugin_openai_codex.wasm
+  main=target/wasm32-unknown-unknown/release/pluribus_plugin_openai_codex.wasm
 ```
 
 Configuration:
@@ -24,10 +24,33 @@ Configuration:
 }
 ```
 
-`credential` is an opaque handle created from the plugin's declarative flow. The host executes enrollment, stores and refreshes tokens, and injects requests. Token bytes never enter the component.
+Start device login:
+
+```sh
+pluribus --data-dir ./data auth openai-codex
+```
+
+Open the displayed URL and enter the displayed code. Enable device-code login
+in [ChatGPT security settings](https://learn.chatgpt.com/docs/auth) if required.
+The node must be running to process enrollment and polling timers.
+
+The plugin starts, polls, and completes device authorization. Pending device
+state and tokens remain in the sealed credential record; only the verification
+URL, user code, and scheduling metadata enter events. Pending enrollment resumes
+after restart. Re-enrollment replaces the pending attempt.
+
+`credentials.subscription` is an opaque handle. The component reads the sealed
+pair with `credentials.get`, sets `authorization` and the
+`chatgpt-account-id` claim it decodes from the access token, and, when
+`https://chatgpt.com` rejects the token, exchanges the refresh token at
+`https://auth.openai.com/oauth/token` and seals the replacement with
+`credentials.compare-and-swap`. One rejection is retried; an established SSE
+stream is not.
+
+The grant must cover both origins:
+
+```json
+{"main": {"http": {"origins": ["https://chatgpt.com", "https://auth.openai.com"], "methods": ["POST"]}}}
+```
 
 The Codex backend does not accept `max_output_tokens`; this provider omits that optional hint. Host response-byte and time limits still apply.
-
-The v2 subscription recipe binds `chatgpt-account-id`, uses the earliest response/JWT expiry, and permits one retry only for a rejected `POST /backend-api/codex/responses`. Other requests and established SSE streams do not replay.
-
-For an existing credential, run `pluribus auth <instance> --adopt-recipe` to validate and attach the installed recipe without rotating tokens. If its identity or scope cannot be verified, run normal `pluribus auth <instance>`.

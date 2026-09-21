@@ -3,7 +3,8 @@ use pluribus_cognition::{Agent, ComponentInstall, OriginAuthority, OriginConstra
 use pluribus_core::*;
 use pluribus_plugin_package::PluginPackage;
 use pluribus_runtime_wasm::{
-    Delivery, PluginServices, Principal, PrincipalKind as WasmKind, Runtime, RuntimeLimits,
+    CredentialAccess, Delivery, PluginServices, Principal, PrincipalKind as WasmKind, Runtime,
+    RuntimeLimits,
 };
 use pluribus_store_sqlite::SqliteEventStore;
 use serde_json::json;
@@ -77,7 +78,6 @@ impl HttpService for Telegram {
             status: 200,
             headers: vec![],
             body: self.blobs.finish_put(&upload).await.unwrap(),
-            credentials_used: vec![],
         })
     }
 }
@@ -189,7 +189,22 @@ fn package() -> PluginPackage {
     )
     .unwrap()
 }
-fn settings(http: &Arc<Telegram>) -> BTreeMap<String, ComponentInstall> {
+/// Both components read the same sealed bot token.
+async fn credentials() -> Arc<InMemoryCredentialStore> {
+    let store = Arc::new(InMemoryCredentialStore::default());
+    store
+        .replace_plugin_credential(
+            &SecretHandle::new("fixture"),
+            "dev.pluribus.telegram",
+            None,
+            br#"{"token":"123456:fixture"}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+    store
+}
+async fn settings(http: &Arc<Telegram>) -> BTreeMap<String, ComponentInstall> {
+    let credentials = credentials().await;
     ["receive", "send"]
         .into_iter()
         .map(|name| {
@@ -198,6 +213,12 @@ fn settings(http: &Arc<Telegram>) -> BTreeMap<String, ComponentInstall> {
                 ComponentInstall {
                     models: vec![],
                     services: PluginServices {
+                        credentials: Some(CredentialAccess {
+                            store: credentials.clone(),
+                            provider: "dev.pluribus.telegram".into(),
+                            handles: std::collections::HashSet::from(["fixture".to_owned()]),
+                            exports: std::collections::BTreeMap::new(),
+                        }),
                         http: Some(http.clone()),
                         http_grant: Some(HttpGrant {
                             component: PrincipalRef::new(
@@ -226,7 +247,7 @@ fn config() -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn later_component_preflight_failure_leaves_no_initialization_or_registration() {
     let (mut agent, store, http) = setup().await;
-    let mut components = settings(&http);
+    let mut components = settings(&http).await;
     components.get_mut("send").unwrap().services.limits = Some(RuntimeLimits {
         memory_bytes: usize::MAX,
         ..RuntimeLimits::default()
@@ -247,7 +268,7 @@ async fn later_component_preflight_failure_leaves_no_initialization_or_registrat
     );
     assert!(!http.entered.load(Ordering::SeqCst));
     agent
-        .install_package(&package(), &config(), delivery(), settings(&http))
+        .install_package(&package(), &config(), delivery(), settings(&http).await)
         .await
         .unwrap();
     assert_eq!(
@@ -260,7 +281,7 @@ async fn blocked_receiver_does_not_block_sender_and_keeps_separate_grants_and_st
     let (mut agent, store, http) = setup().await;
     let _release = Release(http.clone());
     agent
-        .install_package(&package(), &config(), delivery(), settings(&http))
+        .install_package(&package(), &config(), delivery(), settings(&http).await)
         .await
         .unwrap();
     let until = Instant::now() + Duration::from_secs(2);
@@ -322,7 +343,7 @@ async fn blocked_receiver_does_not_block_sender_and_keeps_separate_grants_and_st
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_cannot_reuse_a_sibling_host_grant() {
     let (mut agent, store, http) = setup().await;
-    let mut components = settings(&http);
+    let mut components = settings(&http).await;
     components
         .get_mut("send")
         .unwrap()
@@ -351,7 +372,7 @@ async fn idle_subscription_does_not_block_agent_wait() {
     let (mut agent, _store, http) = setup().await;
     let _release = Release(http.clone());
     agent
-        .install_package(&package(), &config(), delivery(), settings(&http))
+        .install_package(&package(), &config(), delivery(), settings(&http).await)
         .await
         .unwrap();
     let waited = tokio::time::timeout(Duration::from_millis(50), agent.tick_wait(0)).await;

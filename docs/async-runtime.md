@@ -12,7 +12,7 @@ A pending HTTP cancellation test also failed before cancellation handling. It pa
 
 ## Execution
 
-- Tokio drives agent delivery tasks, Wasmtime lifecycle calls, HTTP, DNS, streams, and OAuth refresh/device polling.
+- Tokio drives agent delivery tasks, Wasmtime lifecycle calls, HTTP, DNS, and streams.
 - Wasmtime async host imports suspend the guest during I/O. Epoch callbacks yield CPU-bound guests every 10 ms while retaining deadline and cancellation traps.
 - Cancelling an agent wait retains ownership of its provider. Dropping a lifecycle future invalidates that instance; reinstantiation reads the durable checkpoint.
 - Each instance still owns one mutable store and receives one lifecycle call at a time. Cognition remains serialized. Independent providers share the executor instead of spawning delivery threads.
@@ -22,7 +22,7 @@ A pending HTTP cancellation test also failed before cancellation handling. It pa
 
 ## Boundaries
 
-SQLite uses `async-sqlite` with one dedicated worker per connection. Event, state, delivery, credential, snapshot, and retention APIs are async. Each transaction stays inside one worker operation. Router projections use an async mutex; readers and OAuth bookkeeping await storage directly. Blob storage uses an async API and Tokio file I/O. Uploads have separate async locks; the registry lock covers only bookkeeping. Admitted writes and publication retain ownership until completion, preserving offsets when a caller cancels. Temporary-file creation, atomic publication, and cleanup use blocking workers.
+SQLite uses `async-sqlite` with one dedicated worker per connection. Event, state, delivery, credential, snapshot, and retention APIs are async. Each transaction stays inside one worker operation. Router projections use an async mutex; readers await storage directly. Blob storage uses an async API and Tokio file I/O. Uploads have separate async locks; the registry lock covers only bookkeeping. Admitted writes and publication retain ownership until completion, preserving offsets when a caller cancels. Temporary-file creation, atomic publication, and cleanup use blocking workers.
 
 Single-thread executor regressions measured heartbeat delays of 317 ms behind a busy database connection and 326 ms behind a locked blob upload. Both async implementations pass a 100 ms responsiveness bound while contention lasts 300 ms. Another regression verifies that an unrelated upload progresses and a cancelled write can be replayed without duplicating bytes.
 
@@ -36,11 +36,11 @@ The guest WIT contract and packaged Wasm files are unchanged. Rust callers must 
 
 ## Checks
 
-Verified: 280 workspace tests passed; 7 opt-in tests skipped. Separate runs passed 15 package tests, 41 HTTP/OAuth tests, and the packaged credential-refresh fixture. Clippy and formatting checks passed. Checks cover transaction atomicity, recovery, package integrity, cancellation, and executor responsiveness.
+Verified: the workspace tests pass with opt-in tests skipped. Separate runs pass the package tests, the HTTP tests, and the packaged credential-refresh fixture. Clippy and formatting checks pass. Checks cover transaction atomicity, recovery, package integrity, cancellation, and executor responsiveness.
 
 ```sh
 cargo test --locked --workspace
-cargo test --locked -p pluribus-host-http -p pluribus-host-oauth -- --include-ignored
+cargo test --locked -p pluribus-host-http -- --include-ignored
 cargo test --locked -p pluribus-host-stream -- --nocapture
 cargo clippy --locked --workspace --all-targets
 ```

@@ -177,7 +177,6 @@ any blob reference nested in an inline payload. Any other reference is denied.
 `wasi:http/client.send` accepts a standard request resource and returns a
 response resource. Bodies use `stream<u8>` and completion futures. Plugins
 MUST consume the completion future after EOF to detect body errors.
-`credentials.authorize-http(request, handle)` attaches a granted credential.
 
 The host enforces:
 
@@ -186,16 +185,12 @@ The host enforces:
 - redirect policy on every hop;
 - request and response size limits;
 - deadline and cancellation;
-- credential destination constraints;
 - removal of hop-by-hop headers.
 
-The plugin MUST NOT set `authorization`, `cookie`, or any other header the
-granted credential injects. The host injects credentials after policy checks.
-Redirects never forward credentials to a different origin.
-
-A credential may instead define a secret URL path prefix for APIs, including
-Telegram, that authenticate in the path. Components never receive or construct
-the resulting URL.
+The host attaches no credential. A plugin that authenticates reads its own
+record with `credentials.get` and sets the header, or builds the URL path, in
+guest code. A redirect to a different origin drops `authorization`,
+`proxy-authorization`, and `cookie`.
 
 SSE uses an ordinary HTTP response body; plugins own record framing.
 Production transport bodies use temporary storage. The guest HTTP helpers
@@ -228,16 +223,18 @@ interfaces. See [WASI security](https://wasi.dev/security).
 
 ### `socket`
 
-`connect(outgoing)` opens the one Unix socket endpoint granted to this
-instance. The plugin passes the read end of a stream it writes to; bytes
-written reach the peer. The call returns the peer's byte stream and a
-completion future, which resolves after that stream ends and carries the
-transport error if one ended it.
+`connect(endpoint, outgoing)` opens one of the endpoints granted to this
+instance. `endpoint` selects among the granted names and is not a
+destination; an unknown name is denied. A component granted one endpoint
+whose manifest names none reaches it as `default`. The plugin passes the read
+end of a stream it writes to; bytes written reach the peer. The call returns
+the peer's byte stream and a completion future, which resolves after that
+stream ends and carries the transport error if one ended it.
 
 Closing the outgoing writer half-closes: the peer reads EOF while the incoming
 stream stays open, and an endpoint MAY treat that as cancellation. Dropping the
 incoming stream stops reading. The transport closes when both directions are
-finished. Both directions share one byte budget.
+finished. Both directions share the endpoint's byte budget.
 
 Reads have no idle deadline; a plugin bounds one by racing the read against
 `wasi:clocks/monotonic-clock.wait-for`, as it does for HTTP bodies. The host

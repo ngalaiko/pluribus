@@ -1,6 +1,13 @@
-//! Authenticated local byte streams for granted endpoints.
+//! Authenticated byte streams for granted endpoints.
+//!
+//! Two endpoint kinds, one contract. A Unix endpoint is authenticated by the
+//! kernel's report of the peer's account; a TLS endpoint by a certificate
+//! chaining to a trusted root and matching the configured hostname. Both
+//! share the grant's byte budget, its establishment timeout, and its
+//! connection ceiling.
 
 pub mod ipc;
+mod tls;
 
 use pluribus_core::{StreamEndpoint, StreamError, StreamGrant, StreamPage, StreamService};
 use std::collections::HashMap;
@@ -13,24 +20,47 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 
-const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Write bound for a local endpoint, which is either reading or gone.
+const LOCAL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Write bound for a remote endpoint. Generous, because a slow network is not
+/// a dead peer. Reads stay unbounded: an idle connection is the normal state
+/// of a server-push session.
+const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One connection. `remaining` is the grant's byte budget, shared by both
 /// directions.
 struct Stream {
-    socket: AsyncFd<UnixStream>,
+    transport: Transport,
     remaining: Mutex<u64>,
     writes: tokio::sync::Mutex<()>,
+}
+
+enum Transport {
+    Unix(AsyncFd<UnixStream>),
+    Tls(tls::Connection),
+}
+
+impl Stream {
+    fn write_timeout(&self) -> Duration {
+        match self.transport {
+            Transport::Unix(_) => LOCAL_WRITE_TIMEOUT,
+            Transport::Tls(_) => REMOTE_WRITE_TIMEOUT,
+        }
+    }
 }
 
 /// Connects granted endpoints and enforces their ceilings.
 pub struct LocalStreamService {
     streams: Mutex<HashMap<String, Arc<Stream>>>,
     sequence: Mutex<u64>,
+    /// Whether this service validated a private runtime directory. Local
+    /// endpoints require one; a service built for remote endpoints refuses
+    /// them rather than connecting without the check.
+    local_endpoints: bool,
 }
 
 impl LocalStreamService {
-    /// Validates the private runtime directory.
+    /// Validates the private runtime directory local endpoints live in.
     ///
     /// # Errors
     /// Returns an error for an insecure directory.
@@ -39,7 +69,19 @@ impl LocalStreamService {
         Ok(Self {
             streams: Mutex::new(HashMap::new()),
             sequence: Mutex::new(0),
+            local_endpoints: true,
         })
+    }
+
+    /// A service for remote endpoints only. No local socket path is involved,
+    /// so no runtime directory is required or accepted.
+    #[must_use]
+    pub fn remote() -> Self {
+        Self {
+            streams: Mutex::new(HashMap::new()),
+            sequence: Mutex::new(0),
+            local_endpoints: false,
+        }
     }
 
     fn get(&self, id: &str) -> Result<Arc<Stream>, StreamError> {
@@ -50,15 +92,43 @@ impl LocalStreamService {
             .cloned()
             .ok_or_else(|| unavailable("unknown stream"))
     }
-}
 
-#[async_trait::async_trait]
-impl StreamService for LocalStreamService {
-    async fn open(&self, grant: &StreamGrant) -> Result<String, StreamError> {
-        let StreamEndpoint::Unix { path, peer_uids } = &grant.endpoint;
-        validate_peers(peer_uids).map_err(unavailable)?;
+    /// Registers a connection, refusing one past the grant's ceiling.
+    fn register(&self, grant: &StreamGrant, transport: Transport) -> Result<String, StreamError> {
+        let mut streams = self.streams.lock().map_err(|_| poisoned())?;
+        if streams.len() as u64 >= u64::from(grant.max_connections) {
+            return Err(StreamError::LimitExceeded);
+        }
+        let mut sequence = self.sequence.lock().map_err(|_| poisoned())?;
+        *sequence += 1;
+        let id = format!("stream:{sequence}");
+        streams.insert(
+            id.clone(),
+            Arc::new(Stream {
+                transport,
+                remaining: Mutex::new(grant.max_bytes),
+                writes: tokio::sync::Mutex::new(()),
+            }),
+        );
+        Ok(id)
+    }
+
+    async fn open_unix(
+        &self,
+        grant: &StreamGrant,
+        path: &Path,
+        peer_uids: &[u32],
+    ) -> Result<Transport, StreamError> {
+        if !self.local_endpoints {
+            return Err(StreamError::Denied(
+                "local endpoint requires a validated runtime directory".into(),
+            ));
+        }
+        validate_peers(peer_uids).map_err(denied)?;
         if !path.is_absolute() {
-            return Err(unavailable("endpoint socket must be absolute"));
+            return Err(StreamError::Denied(
+                "endpoint socket must be absolute".into(),
+            ));
         }
         let timeout = Duration::from_millis(u64::from(grant.max_timeout_ms));
         let socket = tokio::time::timeout(timeout, tokio::net::UnixStream::connect(path))
@@ -67,52 +137,66 @@ impl StreamService for LocalStreamService {
             .map_err(unavailable)?
             .into_std()
             .map_err(unavailable)?;
-        verify_peer(&socket, peer_uids).map_err(unavailable)?;
-        let mut sequence = self.sequence.lock().map_err(|_| poisoned())?;
-        *sequence += 1;
-        let id = format!("stream:{sequence}");
-        self.streams.lock().map_err(|_| poisoned())?.insert(
-            id.clone(),
-            Arc::new(Stream {
-                socket: AsyncFd::new(socket).map_err(unavailable)?,
-                remaining: Mutex::new(grant.max_bytes),
-                writes: tokio::sync::Mutex::new(()),
-            }),
-        );
-        Ok(id)
+        verify_peer(&socket, peer_uids).map_err(denied)?;
+        Ok(Transport::Unix(AsyncFd::new(socket).map_err(unavailable)?))
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamService for LocalStreamService {
+    async fn open(&self, grant: &StreamGrant) -> Result<String, StreamError> {
+        if grant.max_connections == 0 {
+            return Err(StreamError::Denied("grant permits no connections".into()));
+        }
+        let transport = match &grant.endpoint {
+            StreamEndpoint::Unix { path, peer_uids } => {
+                self.open_unix(grant, path, peer_uids).await?
+            }
+            StreamEndpoint::Tls {
+                hostname,
+                port,
+                allow_private_network,
+                starttls,
+            } => Transport::Tls(
+                tls::connect(
+                    hostname,
+                    *port,
+                    *allow_private_network,
+                    *starttls,
+                    Duration::from_millis(u64::from(grant.max_timeout_ms)),
+                )
+                .await?,
+            ),
+        };
+        self.register(grant, transport)
     }
 
     async fn next(&self, id: &str, max_bytes: u32) -> Result<StreamPage, StreamError> {
         let stream = self.get(id)?;
-        loop {
-            let mut ready = stream.socket.readable().await.map_err(unavailable)?;
-            let mut remaining = stream.remaining.lock().map_err(|_| poisoned())?;
-            let limit = usize::try_from(*remaining)
-                .unwrap_or(usize::MAX)
-                .min(max_bytes as usize);
-            if limit == 0 {
-                return Err(StreamError::LimitExceeded);
-            }
-            let mut bytes = vec![0; limit];
-            match ready.try_io(|socket| socket.get_ref().read(&mut bytes)) {
-                Ok(Ok(n)) => {
-                    *remaining -= n as u64;
-                    bytes.truncate(n);
-                    return Ok(StreamPage {
-                        bytes,
-                        closed: n == 0,
-                    });
+        match &stream.transport {
+            Transport::Unix(socket) => loop {
+                let mut ready = socket.readable().await.map_err(unavailable)?;
+                let limit = stream.take_read_budget(max_bytes)?;
+                let mut bytes = vec![0; limit];
+                match ready.try_io(|socket| socket.get_ref().read(&mut bytes)) {
+                    Ok(Ok(n)) => return stream.finish_read(bytes, limit, n),
+                    Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Ok(Err(e)) => return Err(unavailable(e)),
+                    Err(_) => {}
                 }
-                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
-                Ok(Err(e)) => return Err(unavailable(e)),
-                Err(_) => {}
+            },
+            Transport::Tls(connection) => {
+                let limit = stream.take_read_budget(max_bytes)?;
+                let mut bytes = vec![0; limit];
+                let n = connection.read(&mut bytes).await?;
+                stream.finish_read(bytes, limit, n)
             }
         }
     }
 
     async fn send(&self, id: &str, bytes: &[u8]) -> Result<(), StreamError> {
         let stream = self.get(id)?;
-        let until = Instant::now() + WRITE_TIMEOUT;
+        let until = Instant::now() + stream.write_timeout();
         let _writer = tokio::time::timeout_at(until.into(), stream.writes.lock())
             .await
             .map_err(|_| StreamError::DeadlineExceeded)?;
@@ -130,17 +214,22 @@ impl StreamService for LocalStreamService {
             complete: false,
         };
         let send = async {
-            let mut offset = 0;
-            while offset < bytes.len() {
-                let mut ready = stream.socket.writable().await.map_err(unavailable)?;
-                match ready.try_io(|socket| socket.get_ref().write(&bytes[offset..])) {
-                    Ok(Ok(0)) => return Err(unavailable("socket write returned zero")),
-                    Ok(Ok(n)) => offset += n,
-                    Ok(Err(e)) => return Err(unavailable(e)),
-                    Err(_) => {}
+            match &stream.transport {
+                Transport::Unix(socket) => {
+                    let mut offset = 0;
+                    while offset < bytes.len() {
+                        let mut ready = socket.writable().await.map_err(unavailable)?;
+                        match ready.try_io(|socket| socket.get_ref().write(&bytes[offset..])) {
+                            Ok(Ok(0)) => return Err(unavailable("socket write returned zero")),
+                            Ok(Ok(n)) => offset += n,
+                            Ok(Err(e)) => return Err(unavailable(e)),
+                            Err(_) => {}
+                        }
+                    }
+                    Ok(())
                 }
+                Transport::Tls(connection) => connection.write_all(bytes).await,
             }
-            Ok(())
         };
         let result = tokio::time::timeout_at(until.into(), send)
             .await
@@ -151,7 +240,12 @@ impl StreamService for LocalStreamService {
 
     fn shutdown_write(&self, id: &str) {
         if let Ok(stream) = self.get(id) {
-            let _ = stream.socket.get_ref().shutdown(Shutdown::Write);
+            match &stream.transport {
+                Transport::Unix(socket) => {
+                    let _ = socket.get_ref().shutdown(Shutdown::Write);
+                }
+                Transport::Tls(connection) => connection.shutdown_write(),
+            }
         }
     }
 
@@ -159,8 +253,43 @@ impl StreamService for LocalStreamService {
         if let Ok(mut streams) = self.streams.lock()
             && let Some(stream) = streams.remove(id)
         {
-            let _ = stream.socket.get_ref().shutdown(Shutdown::Both);
+            match &stream.transport {
+                Transport::Unix(socket) => {
+                    let _ = socket.get_ref().shutdown(Shutdown::Both);
+                }
+                Transport::Tls(connection) => connection.close(),
+            }
         }
+    }
+}
+
+impl Stream {
+    /// Reserves the smaller of the caller's request and the grant's remainder.
+    fn take_read_budget(&self, max_bytes: u32) -> Result<usize, StreamError> {
+        let remaining = *self.remaining.lock().map_err(|_| poisoned())?;
+        let limit = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(max_bytes as usize);
+        if limit == 0 {
+            return Err(StreamError::LimitExceeded);
+        }
+        Ok(limit)
+    }
+
+    /// Charges what was actually read and shapes the page.
+    fn finish_read(
+        &self,
+        mut bytes: Vec<u8>,
+        limit: usize,
+        read: usize,
+    ) -> Result<StreamPage, StreamError> {
+        debug_assert!(read <= limit);
+        *self.remaining.lock().map_err(|_| poisoned())? -= read as u64;
+        bytes.truncate(read);
+        Ok(StreamPage {
+            bytes,
+            closed: read == 0,
+        })
     }
 }
 
@@ -184,6 +313,10 @@ fn poisoned() -> StreamError {
 
 fn unavailable(error: impl std::fmt::Display) -> StreamError {
     StreamError::Unavailable(error.to_string())
+}
+
+fn denied(error: impl std::fmt::Display) -> StreamError {
+    StreamError::Denied(error.to_string())
 }
 
 fn validate_runtime_data(path: &Path) -> io::Result<()> {

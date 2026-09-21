@@ -53,7 +53,7 @@ fn socket_exposes_only_connect() {
             .iter()
             .map(|p| p.name.as_str())
             .collect::<Vec<_>>(),
-        ["outgoing"]
+        ["endpoint", "outgoing"]
     );
 }
 

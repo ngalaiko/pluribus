@@ -3,7 +3,8 @@ use pluribus_cognition::{Agent, AuthorityResolver, OriginConstraints, Router};
 use pluribus_core::*;
 use pluribus_plugin_package::PluginPackage;
 use pluribus_runtime_wasm::{
-    Delivery, PluginServices, Principal, PrincipalKind as WasmKind, Runtime, RuntimeLimits,
+    CredentialAccess, Delivery, PluginServices, Principal, PrincipalKind as WasmKind, Runtime,
+    RuntimeLimits,
 };
 use pluribus_store_sqlite::SqliteEventStore;
 use serde_json::{Value, json};
@@ -52,7 +53,6 @@ impl TelegramFixture {
             status,
             headers: vec![],
             body: self.blobs.finish_put(&upload).await.unwrap(),
-            credentials_used: vec![],
         }
     }
 }
@@ -86,7 +86,6 @@ impl HttpService for TelegramFixture {
                 status: 503,
                 headers: vec![],
                 body: self.blobs.finish_put(&upload).await.unwrap(),
-                credentials_used: vec![],
             });
         }
         assert!(request.url.ends_with("/getUpdates"));
@@ -120,7 +119,6 @@ impl HttpService for TelegramFixture {
             status: 200,
             headers: vec![],
             body: self.blobs.finish_put(&upload).await.unwrap(),
-            credentials_used: vec![],
         })
     }
 }
@@ -199,6 +197,16 @@ async fn run_polling(with_media: bool, recover: bool) {
     .unwrap();
     let source_clock = clock.clone();
     let runtime = runtime.with_clock(Arc::new(move || source_clock.load(Ordering::SeqCst)));
+    let credentials = Arc::new(InMemoryCredentialStore::default());
+    credentials
+        .replace_plugin_credential(
+            &SecretHandle::new("fabricated"),
+            "dev.pluribus.telegram",
+            None,
+            br#"{"token":"123456:fabricated"}"#.to_vec(),
+        )
+        .await
+        .unwrap();
     let principal = PrincipalRef::new(PrincipalKind::Agent, "fixture");
     let stream = StreamId::new("fixture");
     let mut agent = Agent::new(
@@ -243,6 +251,12 @@ async fn run_polling(with_media: bool, recover: bool) {
                 visible_blobs: vec![],
             },
             PluginServices {
+                credentials: Some(CredentialAccess {
+                    store: credentials.clone(),
+                    provider: "dev.pluribus.telegram".into(),
+                    handles: std::collections::HashSet::from(["fabricated".to_owned()]),
+                    exports: std::collections::BTreeMap::new(),
+                }),
                 http: Some(http.clone()),
                 http_grant: Some(HttpGrant {
                     component: PrincipalRef::new(PrincipalKind::Component, "telegram-1"),

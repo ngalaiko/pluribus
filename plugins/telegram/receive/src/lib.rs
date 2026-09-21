@@ -120,7 +120,7 @@ fn poll_request(config: &Config, offset: Option<i64>) -> Result<http::Request, E
         "getUpdates",
         &json!({"offset":offset,"limit":100,"timeout":config.poll_timeout_seconds,
             "allowed_updates":["message","edited_message","channel_post","edited_channel_post","message_reaction","callback_query"]}),
-        &config.credentials.bot_token,
+        &telegram::api::bot_token(&config.credentials.bot_token)?,
         config
             .poll_timeout_seconds
             .saturating_add(10)
@@ -214,7 +214,10 @@ fn fetch_pending(
         let file_id = item["metadata"]["file_id"]
             .as_str()
             .ok_or_else(|| telegram::api::internal("missing pending file ID"))?;
-        match files::download(file_id, &config.credentials.bot_token) {
+        match files::download(
+            file_id,
+            &telegram::api::bot_token(&config.credentials.bot_token)?,
+        ) {
             Ok((mut blob, name)) => {
                 if item["fileName"].is_null() {
                     item["fileName"] = json!(name);
@@ -280,7 +283,7 @@ fn default_poll_timeout() -> u32 {
     30
 }
 
-telegram::export!(Telegram);
+pluribus_plugin_sdk::export!(Telegram);
 
 impl Telegram {
     fn process_response(response: http::Response, now_ms: i64) -> Result<SourceOutput, Error> {

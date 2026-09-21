@@ -1,0 +1,52 @@
+abi = "pluribus:plugin@3.0.0"
+manifest_version = 1
+id = "dev.pluribus.email"
+name = "Email"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+[[credentials]]
+id = "account"
+access = true
+display_name = "Mail account"
+description = "A mail username and password, used for both IMAP and SMTP. iCloud requires an app-specific password, not the account password."
+input_schema = "schemas/credential.input.json"
+flow_schema = "pluribus:credential/static-plugin@1"
+flow = "flows/account.json"
+
+[component]
+world = "pluribus:plugin/plugin@3.0.0"
+component = "plugin.wasm"
+digest = "sha256:dev"
+config_schema = "config.schema.json"
+imports = ["pluribus:plugin/runtime@3.0.0", "pluribus:plugin/state@3.0.0", "pluribus:plugin/blobs@3.0.0", "pluribus:plugin/credentials@3.0.0", "pluribus:plugin/socket@3.0.0", "wasi:clocks/monotonic-clock@0.3.0", "wasi:clocks/system-clock@0.3.0"]
+subscribes = []
+emits = ["observation.received", "capability.completed", "capability.failed"]
+
+[[component.requested_capabilities]]
+name = "net.tls"
+required = true
+reason = "Hold one IMAP session to iCloud, authenticate with the enrolled credential, and read arriving mail. The credential permits mailbox modification; this component only issues EXAMINE and BODY.PEEK."
+constraints = { name = "imap", hostname = "imap.mail.me.com", port = 993 }
+
+[[component.requested_capabilities]]
+name = "net.tls"
+required = true
+reason = "Submit outgoing mail to iCloud, authenticated with the same credential. iCloud submission is plaintext until STARTTLS, so the host speaks the upgrade and this component never holds an unencrypted connection."
+constraints = { name = "smtp", hostname = "smtp.mail.me.com", port = 587, starttls = "smtp", max_bytes = 33554432, max_timeout_ms = 30000 }
+
+[[component.provides]]
+capability = "email.reply"
+description = "Answer the message an observation came from. Every connector provides <provider>.reply; the arguments are the observation's own fields, and the reply threads onto it."
+arguments_schema = "schemas/reply.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"
+
+[[component.provides]]
+capability = "email.send-message"
+description = "Send plain text to explicit recipients. Starts a thread rather than continuing one."
+arguments_schema = "schemas/send-message.arguments.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "non-idempotent"

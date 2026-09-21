@@ -3,13 +3,14 @@
 use pluribus_core::{
     BlobRef, BlobStore, CommittedEvent, DeliveryStore, EventId, EventMetadataSource, EventPayload,
     EventStore, HttpError, HttpFrame, HttpFramePage, HttpGrant, HttpRequest, HttpResponse,
-    HttpService, HttpStreamProtocol, HttpStreamService, InMemoryBlobStore, PrincipalKind,
-    PrincipalRef, StateMutation, StateNamespace, StateStore, StreamId,
+    HttpService, HttpStreamProtocol, HttpStreamService, InMemoryBlobStore, InMemoryCredentialStore,
+    PluginCredentialStore, PrincipalKind, PrincipalRef, SecretHandle, StateMutation,
+    StateNamespace, StateStore, StreamId,
 };
 use pluribus_plugin_package::PluginPackage;
 use pluribus_runtime_wasm::{
-    Delivery, PluginInstance, PluginServices, Principal, PrincipalKind as RuntimePrincipalKind,
-    Runtime, RuntimeLimits,
+    CredentialAccess, Delivery, PluginInstance, PluginServices, Principal,
+    PrincipalKind as RuntimePrincipalKind, Runtime, RuntimeLimits,
 };
 use pluribus_store_sqlite::SqliteEventStore;
 use serde_json::{Value, json};
@@ -112,7 +113,6 @@ impl HttpService for FakeHttp {
             status: 200,
             headers: vec![],
             body: self.blob(if first { UPDATES } else { EMPTY }).await,
-            credentials_used: vec![],
         })
     }
 }
@@ -148,6 +148,7 @@ struct Harness {
     runtime: Runtime,
     store: Arc<SqliteEventStore<Metadata>>,
     http: Arc<FakeHttp>,
+    credentials: Arc<InMemoryCredentialStore>,
 }
 
 async fn harness() -> Harness {
@@ -171,10 +172,21 @@ async fn harness() -> Harness {
         downloads: AtomicU64::new(0),
         requested_offsets: Mutex::new(Vec::new()),
     });
+    let credentials = Arc::new(InMemoryCredentialStore::default());
+    credentials
+        .replace_plugin_credential(
+            &SecretHandle::new("fixture"),
+            &package().manifest().id,
+            None,
+            br#"{"token":"123456:fixture"}"#.to_vec(),
+        )
+        .await
+        .unwrap();
     Harness {
         runtime,
         store,
         http,
+        credentials,
     }
 }
 
@@ -190,6 +202,12 @@ impl Harness {
                 &json!({"credentials": {"bot-token": "fixture"},"trusted_senders":senders,"poll_timeout_seconds":30}),
                 delivery(),
                 PluginServices {
+                    credentials: Some(CredentialAccess {
+                        store: self.credentials.clone(),
+                        provider: package().manifest().id.clone(),
+                        handles: std::collections::HashSet::from(["fixture".to_owned()]),
+                        exports: std::collections::BTreeMap::new(),
+                    }),
                     http: Some(self.http.clone()),
                     http_grant: Some(HttpGrant {
                         component: PrincipalRef::new(PrincipalKind::Component, "telegram/receive"),

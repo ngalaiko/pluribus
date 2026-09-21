@@ -74,8 +74,10 @@ Merge into the runtime's `config.json`; replace `1002` with `id -u pluribus-work
       "components": {
         "main": {
           "stream": {
-            "socket": "/run/pluribus-workspace/executor.sock",
-            "peer_uids": [1002]
+            "default": {
+              "socket": "/run/pluribus-workspace/executor.sock",
+              "peer_uids": [1002]
+            }
           }
         }
       }

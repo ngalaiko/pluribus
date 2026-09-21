@@ -1,12 +1,13 @@
 use crate::engine::{Change, Config, Engine, Store};
-use serde_json::{Value, json};
-use std::cell::RefCell;
-wit_bindgen::generate!({ generate_all,path:"../../wit",world:"plugin"});
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::types::{
     Error, ErrorCode, Event, Mutation, Payload, PrincipalKind, Proposal, StateEntry,
 };
 use pluribus::plugin::{events, state};
+use pluribus_plugin_sdk::export;
+use pluribus_plugin_sdk::{exports, pluribus};
+use serde_json::{Value, json};
+use std::cell::RefCell;
 thread_local! { static CONFIG: RefCell<Config> = RefCell::new(Config::default()); }
 struct Memory;
 struct HostStore;
@@ -36,7 +37,7 @@ impl Store for HostStore {
             .collect()
     }
 }
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+use pluribus_plugin_sdk::serve;
 
 fn setup(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     let parsed: Config = serde_json::from_slice(&config).map_err(failure)?;

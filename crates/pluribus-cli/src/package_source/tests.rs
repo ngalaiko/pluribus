@@ -672,15 +672,18 @@ async fn manifest_access_and_credentials_are_defaults_not_saved_overrides() {
         instance.config["models"],
         serde_json::json!(["gpt-5.6-luna"])
     );
-    assert_eq!(instance.enrollment_origins, ["https://auth.openai.com"]);
     assert_eq!(
         serde_json::to_value(instance).unwrap()["components"],
         serde_json::json!({"main":{"http":{"max_timeout_ms":12000}}})
     );
 
-    config.plugin_instances.insert("echo".into(), serde_json::from_value(serde_json::json!({
-        "package": source, "components": {"main": {"http": {"origins": []}}}, "enrollment_origins": []
-    })).unwrap());
+    config.plugin_instances.insert(
+        "echo".into(),
+        serde_json::from_value(serde_json::json!({
+            "package": source, "components": {"main": {"http": {"origins": []}}}
+        }))
+        .unwrap(),
+    );
     let resolved = prepare(
         &crate::Paths::under(&temp.path().join("other")),
         &config,
@@ -693,11 +696,6 @@ async fn manifest_access_and_credentials_are_defaults_not_saved_overrides() {
         resolved.plugin_instances["echo"].components["main"]
             .http
             .origins
-            .is_empty()
-    );
-    assert!(
-        resolved.plugin_instances["echo"]
-            .enrollment_origins
             .is_empty()
     );
 }

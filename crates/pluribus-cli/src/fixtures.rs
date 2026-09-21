@@ -34,9 +34,8 @@ pub fn config() -> Config {
                 "aliases": ["codex", "openai-codex", "dev.pluribus.openai-codex"],
                 "config": {"credentials": {"subscription": "codex:primary"}, "models": ["gpt-5.6-luna"], "timeout_ms": 300_000},
                 "components": {
-                    "main": {"http": {"origins": ["https://chatgpt.com"], "methods": ["POST"]}}
-                },
-                "enrollment_origins": ["https://auth.openai.com"]
+                    "main": {"http": {"origins": ["https://chatgpt.com", "https://auth.openai.com"], "methods": ["POST"]}}
+                }
             },
             "rlm": {
                 "package": package("rlm"),

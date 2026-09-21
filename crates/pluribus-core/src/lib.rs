@@ -6,6 +6,7 @@ pub mod delivery;
 pub mod event;
 pub mod http;
 pub mod identity;
+pub mod net;
 pub mod registry;
 pub mod secret;
 pub mod state;
@@ -29,17 +30,12 @@ pub use http::{
     HttpService, HttpStreamProtocol, HttpStreamService, HttpStreamingResponse,
 };
 pub use identity::{PrincipalId, PrincipalKind, PrincipalRef};
+pub use net::is_public_address;
 pub use registry::{
     EventTypeRegistry, PLUGIN_EVENT_TYPES, RESERVED_EVENT_TYPES, RegistryError, matches_pattern,
 };
-pub use secret::{
-    AuthRecovery, CredentialLifecycle, CredentialStatus, CredentialStore, HttpCredential,
-    InMemoryCredentialStore, OAuthCredential, OAuthCredentialSnapshot, OAuthCredentialStore,
-    PluginCredentialStore, ResolvedHttpCredential, SecretError, SecretHandle, SecretHeader,
-    SecretPathPrefix, credential_time_ms, validate_http_credential, validate_oauth_credential,
-    validate_recipe_adoption, validate_refresh_replacement,
-};
+pub use secret::{InMemoryCredentialStore, PluginCredentialStore, SecretError, SecretHandle};
 pub use state::{
     StateEntry, StateError, StateMutation, StateNamespace, StatePage, StateSnapshot, StateStore,
 };
-pub use stream::{StreamEndpoint, StreamError, StreamGrant, StreamPage, StreamService};
+pub use stream::{StartTls, StreamEndpoint, StreamError, StreamGrant, StreamPage, StreamService};

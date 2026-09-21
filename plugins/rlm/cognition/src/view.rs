@@ -439,11 +439,19 @@ pub(super) fn load(batch: &[Event], config: &Config) -> Result<Engine, Error> {
     })?;
     let mut clarifications: Vec<super::super::jobs::Observation> = vec![];
     let mut recent: Vec<super::super::jobs::Observation> = vec![];
-    scan_index("inbox", |_, summary| {
+    // Same-conversation observations left outside the working set, so the turn envelope can
+    // report how many exist rather than how many were loaded.
+    let mut unloaded = std::collections::BTreeMap::new();
+    scan_index("inbox", |id, summary| {
         if origins
             .iter()
             .any(|value| super::super::engine::same_conversation(&summary["value"], value))
         {
+            if !engine.inbox.contains_key(id) {
+                *unloaded
+                    .entry(super::super::engine::conversation_key(&summary["value"]))
+                    .or_insert(0usize) += 1;
+            }
             let selected = if summary["status"] == "waiting-input" && summary["job"].is_null() {
                 &mut clarifications
             } else {
@@ -457,9 +465,16 @@ pub(super) fn load(batch: &[Event], config: &Config) -> Result<Engine, Error> {
         Ok(())
     })?;
     for observation in clarifications.into_iter().chain(recent) {
+        if !engine.inbox.contains_key(&observation.id)
+            && let Some(count) =
+                unloaded.get_mut(&super::super::engine::conversation_key(&observation.value))
+        {
+            *count -= 1;
+        }
         // Routing summaries are read-only; do not replace durable observations.
         engine.add_routing_observation(observation);
     }
+    engine.set_unloaded_observations(unloaded);
     for (job, origin) in candidates.into_iter().chain(recent_jobs) {
         engine.add_routing_job(job, origin);
     }

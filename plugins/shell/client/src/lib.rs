@@ -5,7 +5,8 @@
 #[allow(dead_code)]
 mod protocol;
 
-wit_bindgen::generate!({ generate_all, path: "../../wit", world: "plugin" });
+use pluribus_plugin_sdk::export;
+pub use pluribus_plugin_sdk::{exports, pluribus, wasi};
 
 use channel::Socket;
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
@@ -39,11 +40,9 @@ fn default_timeout() -> u32 {
     30_000
 }
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+use pluribus_plugin_sdk::serve;
 
-mod channel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/socket.rs"));
-}
+use pluribus_plugin_sdk::socket as channel;
 
 fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     let config: serde_json::Value = serde_json::from_slice(&config)
@@ -185,7 +184,7 @@ async fn run(
     let _ = context;
     // The channel stays open across the read: the executor reads a half-close
     // as a cancellation, and dropping it ends the command.
-    let mut channel = Socket::connect().await?;
+    let mut channel = Socket::connect("default").await?;
     exchange(&mut channel, &bytes, request.timeout_ms).await
 }
 

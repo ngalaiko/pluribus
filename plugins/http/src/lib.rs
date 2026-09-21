@@ -1,9 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-wit_bindgen::generate!({ generate_all,path:"../../wit",world:"plugin"});
+use pluribus_plugin_sdk::export;
+pub use pluribus_plugin_sdk::{exports, pluribus, wasi};
 mod common;
-mod channel {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/socket.rs"));
-}
 use channel::Socket;
 use common::*;
 use exports::pluribus::plugin::lifecycle::{Context, Guest as Lifecycle, Outcome};
@@ -11,6 +9,7 @@ use pluribus::plugin::{
     events, state,
     types::{Error, Event, Mutation, StateEntry},
 };
+use pluribus_plugin_sdk::socket as channel;
 use serde_json::json;
 
 /// Bytes requested per read on the listener subscription.
@@ -35,7 +34,7 @@ impl Lifecycle for Http {
             }
 
             let result: Result<bool, Error> = async {
-                let mut input = Socket::connect().await?;
+                let mut input = Socket::connect("default").await?;
                 input.send(b"{\"op\":\"subscribe\"}\n").await?;
                 loop {
                     let Some(chunk) =

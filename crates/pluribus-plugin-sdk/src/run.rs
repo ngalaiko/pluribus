@@ -1,5 +1,7 @@
+use crate::{exports, pluribus};
+
 /// Dispatches deliveries for plugins without an external source loop.
-async fn serve<G: exports::pluribus::plugin::lifecycle::Guest>(
+pub async fn serve<G: exports::pluribus::plugin::lifecycle::Guest>(
     mut context: exports::pluribus::plugin::lifecycle::Context,
 ) -> Result<(), pluribus::plugin::types::Error> {
     use pluribus::plugin::runtime;

@@ -46,6 +46,7 @@ rustPlatform.buildRustPackage {
       component "$plugin" "$plugin/main.wasm"
     done
 
+    component email email/main.wasm
     component http http/listen.wasm
     component github github/receive.wasm
 

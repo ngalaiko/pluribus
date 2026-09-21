@@ -1,19 +1,18 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-wit_bindgen::generate!({ generate_all,
-    path: "../../wit",
-    world: "plugin",
-});
+use pluribus_plugin_sdk::export;
+pub use pluribus_plugin_sdk::{exports, http, pluribus, wasi};
 
 use crate::http::Reader;
-use crate::http::{Header, Request};
+use crate::http::{Header, InlineRequest, Request};
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
 use pluribus::plugin::blobs;
+use pluribus::plugin::credentials;
 use pluribus::plugin::events;
 use pluribus::plugin::types::{self, Error, ErrorCode, Event, Payload, Proposal};
 
@@ -29,6 +28,12 @@ thread_local! {
 }
 
 const URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const DEVICE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const ACCOUNT_CLAIM: &str = "https://api.openai.com/auth";
 const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_TIMEOUT_MS: u32 = 300_000;
 const CHUNK_BYTES: u32 = 1024 * 1024;
@@ -39,6 +44,29 @@ const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 64;
 struct Credentials {
     #[serde(rename = "subscription")]
     subscription: String,
+}
+
+/// The enrolled record behind the subscription handle. The plugin owns it:
+/// the host attaches nothing and refreshes nothing.
+#[derive(Deserialize, Serialize)]
+struct Tokens {
+    access_token: String,
+    refresh_token: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct DeviceState {
+    id: String,
+    user_code: String,
+    interval_seconds: u64,
+    expires_at_ms: i64,
+    #[serde(default)]
+    next_poll_at_ms: i64,
+    #[serde(default)]
+    authorization_code: Option<String>,
+    #[serde(default)]
+    code_verifier: Option<String>,
+    enrollment_id: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -53,7 +81,7 @@ struct Config {
 
 struct Codex;
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../shared/run.rs"));
+use pluribus_plugin_sdk::serve;
 
 fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     let parsed: Config = serde_json::from_slice(&config)
@@ -64,8 +92,29 @@ fn setup(_context: Context, config: Vec<u8>) -> Result<Outcome, Error> {
     if parsed.models.is_empty() {
         return Err(invalid_argument("at least one model is required"));
     }
+    let handle = parsed.credentials.subscription.clone();
     CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
-    Ok(empty_outcome())
+    let mut outcome = empty_outcome();
+    if let Ok((previous, mut record)) = credential_record(&handle)
+        && let Some(mut device) = record
+            .get("device")
+            .and_then(|value| serde_json::from_value::<DeviceState>(value.clone()).ok())
+    {
+        let due = if device.next_poll_at_ms != 0 {
+            device.next_poll_at_ms
+        } else {
+            now_ms().saturating_add(interval_ms(device.interval_seconds))
+        };
+        if device.next_poll_at_ms != due {
+            device.next_poll_at_ms = due;
+            record["device"] = serde_json::to_value(&device).map_err(internal)?;
+            if !save_credential_record(&handle, previous.as_deref(), &record)? {
+                return Ok(outcome);
+            }
+        }
+        outcome.events.push(enrollment_timer(&device, due, None));
+    }
+    Ok(outcome)
 }
 
 impl Guest for Codex {
@@ -76,13 +125,66 @@ impl Guest for Codex {
         serve::<Self>(context).await
     }
 
-    async fn handle(_context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
+    async fn handle(context: Context, events: Vec<Event>) -> Result<Outcome, Error> {
         let config = config()?;
         let mut proposals = Vec::new();
         let mut checkpoint = None;
 
         for event in &events {
             checkpoint = Some(event.sequence);
+            if event.event_type == "credential.enrollment.requested" {
+                let request = event_value(event)?;
+                if request["component"] != context.instance_id
+                    || request["credential"] != config.credentials.subscription
+                    || event.actor.kind != types::PrincipalKind::Node
+                    || event.actor.id != "credential-cli"
+                {
+                    continue;
+                }
+                let enrollment = request["enrollment"]
+                    .as_str()
+                    .ok_or_else(|| invalid("enrollment request has no id"))?;
+                let emitted = start_device_enrollment(
+                    &config.credentials.subscription,
+                    enrollment,
+                    event.event_id.as_str(),
+                )?;
+                proposals.extend(emitted);
+                continue;
+            }
+            if event.event_type == "timer.fired" {
+                if event.actor.kind != types::PrincipalKind::Node {
+                    continue;
+                }
+                let mut timer = event_value(event)?;
+                let Some(request_id) = timer["requestEventId"].as_str() else {
+                    continue;
+                };
+                let Ok(request) = events::get(request_id) else {
+                    continue;
+                };
+                if request.event_type != "timer.set"
+                    || request.actor.kind != types::PrincipalKind::Component
+                    || request.actor.id != context.instance_id
+                {
+                    continue;
+                }
+                let request_value = event_value(&request)?;
+                if request_value["dueAtMs"] != timer["dueAtMs"] {
+                    continue;
+                }
+                let Some(enrollment_id) = request_value["enrollmentId"].as_str() else {
+                    continue;
+                };
+                timer["enrollmentId"] = Value::String(enrollment_id.to_owned());
+                let emitted = poll_device_enrollment(
+                    &config.credentials.subscription,
+                    &timer,
+                    event.event_id.as_str(),
+                )?;
+                proposals.extend(emitted);
+                continue;
+            }
             if event.event_type != "model.requested" {
                 continue;
             }
@@ -127,7 +229,25 @@ fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error
     reject_unsupported_features(&request.required_features)?;
     let (body, tool_names) = build_request(request)?;
     let body = put_blob("application/json", &body)?;
-    let read = http::sse(&Request {
+    let handle = &config.credentials.subscription;
+    let (record, tokens) = read_tokens(handle)?;
+    let read = responses(&body, &tokens, config.timeout_ms)?;
+    // An expired access token is rejected before any frame arrives, so one
+    // refresh replays the request.
+    let read = if read.status() == 401 {
+        drop(read);
+        let tokens = refresh(handle, record, &tokens)?;
+        responses(&body, &tokens, config.timeout_ms)?
+    } else {
+        read
+    };
+    // The reader closes when it drops, ending the transfer.
+    parse_stream(&request.call_id, &read, tool_names)
+}
+
+/// Opens one Responses stream under the supplied tokens.
+fn responses(body: &types::BlobRef, tokens: &Tokens, timeout_ms: u32) -> Result<Reader, Error> {
+    http::sse(&Request {
         method: "POST".to_owned(),
         url: URL.to_owned(),
         headers: vec![
@@ -135,13 +255,511 @@ fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error
             header("content-type", "application/json"),
             header("OpenAI-Beta", "responses=experimental"),
             header("originator", "pluribus"),
+            header("authorization", &format!("Bearer {}", tokens.access_token)),
+            header("chatgpt-account-id", &account_id(&tokens.access_token)?),
         ],
-        body: Some(body),
-        credential: Some(config.credentials.subscription.clone()),
-        timeout_ms: config.timeout_ms,
+        body: Some(body.clone()),
+        timeout_ms,
+    })
+}
+
+/// Reads the sealed record along with the bytes a swap must match.
+fn read_tokens(handle: &str) -> Result<(Vec<u8>, Tokens), Error> {
+    let bytes =
+        credentials::get(handle)?.ok_or_else(|| invalid("Codex subscription is not enrolled"))?;
+    let tokens =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("invalid credential record"))?;
+    Ok((bytes, tokens))
+}
+
+/// Exchanges the refresh token and seals the replacement under the handle.
+/// A lost swap adopts whatever the winner stored.
+fn refresh(handle: &str, previous: Vec<u8>, tokens: &Tokens) -> Result<Tokens, Error> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("refresh_token", &tokens.refresh_token)
+        .finish();
+    let response = http::exchange(&InlineRequest {
+        method: "POST".to_owned(),
+        url: TOKEN_URL.to_owned(),
+        headers: vec![header("content-type", "application/x-www-form-urlencoded")],
+        body: body.into_bytes(),
+        timeout_ms: 30_000,
     })?;
-    // The reader closes when it drops, ending the transfer.
-    parse_stream(&request.call_id, &read, tool_names)
+    if !(200..300).contains(&response.status) {
+        return Err(unavailable(format!(
+            "Codex token refresh returned HTTP {}",
+            response.status
+        )));
+    }
+    let value = parse_json(&response.body)?;
+    let refreshed = Tokens {
+        access_token: required_string(&value, "access_token")?.to_owned(),
+        refresh_token: option_string(&value, "refresh_token")
+            .unwrap_or(&tokens.refresh_token)
+            .to_owned(),
+    };
+    let mut record = parse_json(&previous)?;
+    if !record.is_object() {
+        return Err(invalid("invalid credential record"));
+    }
+    record["access_token"] = Value::String(refreshed.access_token.clone());
+    record["refresh_token"] = Value::String(refreshed.refresh_token.clone());
+    let bytes = serde_json::to_vec(&record).map_err(internal)?;
+    if credentials::compare_and_swap(handle, Some(&previous), &bytes)? {
+        return Ok(refreshed);
+    }
+    Ok(read_tokens(handle)?.1)
+}
+
+fn event_value(event: &Event) -> Result<Value, Error> {
+    match &event.payload {
+        Payload::Json(bytes) => parse_json(bytes),
+        Payload::Blob(_) => Err(invalid("event payload must be inline JSON")),
+    }
+}
+
+fn now_ms() -> i64 {
+    let time = wasi::clocks::system_clock::now();
+    time.seconds
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(time.nanoseconds / 1_000_000))
+}
+
+fn credential_record(handle: &str) -> Result<(Option<Vec<u8>>, Value), Error> {
+    let previous = credentials::get(handle)?;
+    let record = previous
+        .as_deref()
+        .map(parse_json)
+        .transpose()?
+        .unwrap_or_else(|| json!({}));
+    if !record.is_object() {
+        return Err(invalid("invalid credential record"));
+    }
+    Ok((previous, record))
+}
+
+fn save_credential_record(
+    handle: &str,
+    previous: Option<&[u8]>,
+    record: &Value,
+) -> Result<bool, Error> {
+    let bytes = serde_json::to_vec(record).map_err(internal)?;
+    credentials::compare_and_swap(handle, previous, &bytes)
+}
+
+fn seal_tokens(
+    handle: &str,
+    previous: Option<&[u8]>,
+    record: Value,
+    tokens: Tokens,
+) -> Result<bool, Error> {
+    let mut expected = previous.map(ToOwned::to_owned);
+    let mut candidate = record.clone();
+    for _ in 0..4 {
+        if let Some(enrollment_id) = candidate["device"]["enrollment_id"].as_str() {
+            candidate["completed_enrollment"] = Value::String(enrollment_id.to_owned());
+        }
+        candidate["device"] = Value::Null;
+        candidate["enrollment"] = Value::Null;
+        candidate["access_token"] = Value::String(tokens.access_token.clone());
+        candidate["refresh_token"] = Value::String(tokens.refresh_token.clone());
+        if let Some(expected) = expected.as_deref()
+            && credentials::compare_and_swap(
+                handle,
+                Some(expected),
+                &serde_json::to_vec(&candidate).map_err(internal)?,
+            )?
+        {
+            return Ok(true);
+        }
+        let Some(latest_bytes) = credentials::get(handle)? else {
+            return Err(unavailable("credential disappeared during enrollment"));
+        };
+        let latest = parse_json(&latest_bytes)?;
+        if !pending_record_matches(&latest, &record) {
+            return Ok(false);
+        }
+        expected = Some(latest_bytes);
+        candidate = latest;
+    }
+    Err(unavailable("credential changed during enrollment"))
+}
+
+fn pending_record_matches(actual: &Value, expected: &Value) -> bool {
+    let Some(actual_device) = actual.get("device").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(expected_device) = expected.get("device").and_then(Value::as_object) else {
+        return false;
+    };
+    for field in [
+        "id",
+        "user_code",
+        "enrollment_id",
+        "authorization_code",
+        "code_verifier",
+    ] {
+        if actual_device.get(field) != expected_device.get(field) {
+            return false;
+        }
+    }
+    actual.get("enrollment").and_then(|value| value.get("id"))
+        == expected.get("enrollment").and_then(|value| value.get("id"))
+}
+
+fn enrollment_started(device: &DeviceState, cause: &str) -> Proposal {
+    Proposal {
+        event_type: "credential.enrollment.started".into(),
+        payload_schema: "pluribus.credential.enrollment.started/1".into(),
+        payload: Payload::Json(
+            serde_json::to_vec(&json!({
+                "url": DEVICE_VERIFICATION_URL,
+                "userCode": device.user_code,
+            }))
+            .unwrap(),
+        ),
+        idempotency_key: Some(format!("codex:enrollment:{}:started", device.enrollment_id)),
+        causation_id: Some(cause.to_owned()),
+    }
+}
+
+fn enrollment_timer(device: &DeviceState, due_at_ms: i64, cause: Option<&str>) -> Proposal {
+    Proposal {
+        event_type: "timer.set".into(),
+        payload_schema: "pluribus.timer-set/1".into(),
+        payload: Payload::Json(
+            serde_json::to_vec(&json!({
+                "dueAtMs": due_at_ms,
+                "enrollmentId": device.enrollment_id,
+            }))
+            .unwrap(),
+        ),
+        idempotency_key: Some(format!(
+            "codex:enrollment:{}:timer:{}",
+            device.enrollment_id, due_at_ms
+        )),
+        causation_id: cause.map(str::to_owned),
+    }
+}
+
+fn start_device_enrollment(
+    handle: &str,
+    enrollment_id: &str,
+    cause: &str,
+) -> Result<Vec<Proposal>, Error> {
+    let (previous, mut record) = credential_record(handle)?;
+    if record["completed_enrollment"].as_str() == Some(enrollment_id) {
+        return Ok(Vec::new());
+    }
+    let staged_id = record
+        .get("enrollment")
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str);
+    if staged_id.is_none()
+        && let Some(device) = record
+            .get("device")
+            .and_then(|value| serde_json::from_value::<DeviceState>(value.clone()).ok())
+            .filter(|device| device.enrollment_id == enrollment_id)
+    {
+        let due = if device.next_poll_at_ms != 0 {
+            device.next_poll_at_ms
+        } else {
+            now_ms().saturating_add(interval_ms(device.interval_seconds))
+        };
+        return Ok(vec![
+            enrollment_started(&device, cause),
+            enrollment_timer(&device, due, Some(cause)),
+        ]);
+    }
+    let Some(staged) = record.get("enrollment") else {
+        return Ok(Vec::new());
+    };
+    if staged["id"].as_str() != Some(enrollment_id) {
+        return Ok(Vec::new());
+    }
+    let expires_at_ms = staged["expires_at_ms"]
+        .as_i64()
+        .ok_or_else(|| invalid("credential enrollment has no expiry"))?;
+    if expires_at_ms <= now_ms() {
+        record["enrollment"] = Value::Null;
+        record["completed_enrollment"] = Value::String(enrollment_id.to_owned());
+        if !save_credential_record(handle, previous.as_deref(), &record)? {
+            return Err(unavailable("credential changed during enrollment"));
+        }
+        return Ok(Vec::new());
+    }
+    let response = http::exchange(&InlineRequest {
+        method: "POST".into(),
+        url: DEVICE_URL.into(),
+        headers: vec![header("content-type", "application/json")],
+        body: serde_json::to_vec(&json!({"client_id": CLIENT_ID})).map_err(internal)?,
+        timeout_ms: 30_000,
+    })?;
+    if !(200..300).contains(&response.status) {
+        return Err(unavailable(format!(
+            "Codex device enrollment returned HTTP {}",
+            response.status
+        )));
+    }
+    let value = parse_json(&response.body)?;
+    let mut device = DeviceState {
+        id: required_string(&value, "device_auth_id")?.to_owned(),
+        user_code: required_string(&value, "user_code")?.to_owned(),
+        interval_seconds: integer_field(&value, "interval").unwrap_or(5).max(1) as u64,
+        expires_at_ms: now_ms().saturating_add(
+            integer_field(&value, "expires_in")
+                .unwrap_or(900)
+                .clamp(1, 900)
+                .saturating_mul(1_000),
+        ),
+        next_poll_at_ms: 0,
+        authorization_code: None,
+        code_verifier: None,
+        enrollment_id: enrollment_id.to_owned(),
+    };
+    device.next_poll_at_ms = now_ms().saturating_add(interval_ms(device.interval_seconds));
+    record["device"] = serde_json::to_value(&device).map_err(internal)?;
+    record["enrollment"] = Value::Null;
+    if !save_credential_record(handle, previous.as_deref(), &record)? {
+        return Err(unavailable("credential changed during enrollment"));
+    }
+    let due = device.next_poll_at_ms;
+    Ok(vec![
+        enrollment_started(&device, cause),
+        enrollment_timer(&device, due, Some(cause)),
+    ])
+}
+
+fn poll_device_enrollment(
+    handle: &str,
+    timer: &Value,
+    cause: &str,
+) -> Result<Vec<Proposal>, Error> {
+    let (previous, mut record) = credential_record(handle)?;
+    let Some(device) = record
+        .get("device")
+        .and_then(|value| serde_json::from_value::<DeviceState>(value.clone()).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    if timer["enrollmentId"].as_str() != Some(device.enrollment_id.as_str()) {
+        return Ok(Vec::new());
+    }
+    if record
+        .get("enrollment")
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| id != device.enrollment_id)
+    {
+        return Ok(Vec::new());
+    }
+    let Some(fired_due_at_ms) = timer.get("dueAtMs").and_then(Value::as_i64) else {
+        return Ok(Vec::new());
+    };
+    if device.next_poll_at_ms != 0 && fired_due_at_ms != device.next_poll_at_ms {
+        return if fired_due_at_ms < device.next_poll_at_ms {
+            Ok(vec![enrollment_timer(
+                &device,
+                device.next_poll_at_ms,
+                Some(cause),
+            )])
+        } else {
+            Ok(Vec::new())
+        };
+    }
+    let now = now_ms();
+    if fired_due_at_ms > now {
+        return Ok(Vec::new());
+    }
+    if device.expires_at_ms <= now {
+        record["completed_enrollment"] = Value::String(device.enrollment_id.clone());
+        record["device"] = Value::Null;
+        if !save_credential_record(handle, previous.as_deref(), &record)? {
+            return Err(unavailable("credential changed during enrollment"));
+        }
+        return Ok(Vec::new());
+    }
+    if let (Some(code), Some(verifier)) = (
+        device.authorization_code.as_deref(),
+        device.code_verifier.as_deref(),
+    ) {
+        let tokens = exchange_device_code(code, verifier)?;
+        if !seal_tokens(handle, previous.as_deref(), record, tokens)? {
+            return Ok(Vec::new());
+        }
+        return Ok(Vec::new());
+    }
+    let body = serde_json::to_vec(&json!({
+        "device_auth_id": device.id,
+        "user_code": device.user_code,
+    }))
+    .map_err(internal)?;
+    let response = http::exchange(&InlineRequest {
+        method: "POST".into(),
+        url: DEVICE_TOKEN_URL.into(),
+        headers: vec![header("content-type", "application/json")],
+        body,
+        timeout_ms: 30_000,
+    })?;
+    if !(200..300).contains(&response.status) {
+        let error = response_error(&response.body);
+        let terminal = matches!(
+            error.as_deref(),
+            Some("slow_down") | Some("access_denied") | Some("expired_token")
+        );
+        if error.as_deref() == Some("deviceauth_authorization_pending")
+            || ((response.status == 403 || response.status == 404) && !terminal)
+        {
+            let mut next = device.clone();
+            next.next_poll_at_ms = now.saturating_add(interval_ms(next.interval_seconds));
+            record["device"] = serde_json::to_value(&next).map_err(internal)?;
+            if !save_credential_record(handle, previous.as_deref(), &record)? {
+                return Err(unavailable("credential changed during enrollment"));
+            }
+            return Ok(vec![enrollment_timer(
+                &next,
+                next.next_poll_at_ms,
+                Some(cause),
+            )]);
+        }
+        if error.as_deref() == Some("slow_down") {
+            let mut next = device.clone();
+            next.interval_seconds = next.interval_seconds.saturating_add(5);
+            next.next_poll_at_ms = now.saturating_add(interval_ms(next.interval_seconds));
+            record["device"] = serde_json::to_value(&next).map_err(internal)?;
+            if !save_credential_record(handle, previous.as_deref(), &record)? {
+                return Err(unavailable("credential changed during enrollment"));
+            }
+            return Ok(vec![enrollment_timer(
+                &next,
+                next.next_poll_at_ms,
+                Some(cause),
+            )]);
+        }
+        if response.status == 429 || response.status >= 500 {
+            let mut next = device.clone();
+            next.next_poll_at_ms = now.saturating_add(interval_ms(next.interval_seconds));
+            record["device"] = serde_json::to_value(&next).map_err(internal)?;
+            if !save_credential_record(handle, previous.as_deref(), &record)? {
+                return Err(unavailable("credential changed during enrollment"));
+            }
+            return Ok(vec![enrollment_timer(
+                &next,
+                next.next_poll_at_ms,
+                Some(cause),
+            )]);
+        }
+        record["completed_enrollment"] = Value::String(device.enrollment_id.clone());
+        record["device"] = Value::Null;
+        if !save_credential_record(handle, previous.as_deref(), &record)? {
+            return Err(unavailable("credential changed during enrollment"));
+        }
+        return Ok(Vec::new());
+    }
+    let value = parse_json(&response.body)?;
+    let code = required_string(&value, "authorization_code")?;
+    let verifier = required_string(&value, "code_verifier")?;
+    let mut pending = device.clone();
+    pending.authorization_code = Some(code.to_owned());
+    pending.code_verifier = Some(verifier.to_owned());
+    record["device"] = serde_json::to_value(&pending).map_err(internal)?;
+    let pending_bytes = serde_json::to_vec(&record).map_err(internal)?;
+    if !credentials::compare_and_swap(handle, previous.as_deref(), &pending_bytes)? {
+        return Err(unavailable("credential changed during enrollment"));
+    }
+    let tokens = exchange_device_code(code, verifier)?;
+    if !seal_tokens(handle, Some(&pending_bytes), record, tokens)? {
+        return Ok(Vec::new());
+    }
+    Ok(Vec::new())
+}
+
+fn response_error(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("error")
+        .and_then(|error| error.as_str().or_else(|| error.get("code")?.as_str()))
+        .map(str::to_owned)
+}
+
+fn integer_field(value: &Value, field: &str) -> Option<i64> {
+    value
+        .get(field)
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn interval_ms(seconds: u64) -> i64 {
+    seconds.saturating_mul(1_000).min(i64::MAX as u64) as i64
+}
+
+fn exchange_device_code(code: &str, verifier: &str) -> Result<Tokens, Error> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("code", code)
+        .append_pair("code_verifier", verifier)
+        .append_pair(
+            "redirect_uri",
+            "https://auth.openai.com/deviceauth/callback",
+        )
+        .finish();
+    let response = http::exchange(&InlineRequest {
+        method: "POST".into(),
+        url: TOKEN_URL.into(),
+        headers: vec![header("content-type", "application/x-www-form-urlencoded")],
+        body: body.into_bytes(),
+        timeout_ms: 30_000,
+    })?;
+    if !(200..300).contains(&response.status) {
+        return Err(unavailable(format!(
+            "Codex device token exchange returned HTTP {}",
+            response.status
+        )));
+    }
+    let value = parse_json(&response.body)?;
+    Ok(Tokens {
+        access_token: required_string(&value, "access_token")?.to_owned(),
+        refresh_token: required_string(&value, "refresh_token")?.to_owned(),
+    })
+}
+
+/// The account the subscription belongs to, from the access token's claims.
+fn account_id(access_token: &str) -> Result<String, Error> {
+    let payload = access_token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| invalid("access token is not a JWT"))?;
+    let claims = parse_json(&base64url(payload)?)?;
+    claims[ACCOUNT_CLAIM]["chatgpt_account_id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("access token names no ChatGPT account"))
+}
+
+fn base64url(input: &str) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::with_capacity(input.len() / 4 * 3);
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u32;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return Err(invalid("access token is not base64url")),
+        };
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((accumulator >> bits) as u8);
+        }
+    }
+    Ok(output)
 }
 
 fn decode_request(event: &Event) -> Result<ModelRequest, Error> {
@@ -944,6 +1562,3 @@ data: {"type":"response.completed","response":{"status":"completed"}}"#,
         assert_eq!(base64(b"foo"), "Zm9v");
     }
 }
-
-#[path = "../../shared/http.rs"]
-pub mod http;

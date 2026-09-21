@@ -1,12 +1,12 @@
 //! Downloading an attachment Telegram holds.
 
 use serde_json::{Value, json};
-use telegram::api::{CREDENTIAL_MARKER, ORIGIN, call_json, invalid, unavailable};
+use telegram::api::{ORIGIN, call_json, invalid, unavailable};
 use telegram::http::{self, Request};
 use telegram::pluribus::plugin::types::{BlobRef, Error};
 
-pub fn download(file_id: &str, credential: &str) -> Result<(BlobRef, Option<String>), Error> {
-    let response = call_json("getFile", &json!({"file_id": file_id}), credential, 30_000)?;
+pub fn download(file_id: &str, token: &str) -> Result<(BlobRef, Option<String>), Error> {
+    let response = call_json("getFile", &json!({"file_id": file_id}), token, 30_000)?;
     let path = response
         .value
         .get("file_path")
@@ -23,10 +23,9 @@ pub fn download(file_id: &str, credential: &str) -> Result<(BlobRef, Option<Stri
     }
     let response = http::send(&Request {
         method: "GET".into(),
-        url: format!("{ORIGIN}/file/{CREDENTIAL_MARKER}/{path}"),
+        url: format!("{ORIGIN}/file/bot{token}/{path}"),
         headers: Vec::new(),
         body: None,
-        credential: Some(credential.into()),
         timeout_ms: 60_000,
     })?;
     if response.status != 200 {

@@ -1,6 +1,6 @@
 # OpenRouter
 
-Serves `model.requested` through the OpenRouter chat-completions API using a host-owned API key. One instance serves the model slugs its configuration lists.
+Serves `model.requested` through the OpenRouter chat-completions API using an enrolled API key. One instance serves the model slugs its configuration lists.
 
 Responses stream as server-sent events. The plugin owns record framing and appends one `model.stream` event per read, so a long completion is observable without a durable event per token.
 
@@ -27,7 +27,7 @@ Configuration:
 }
 ```
 
-Register the instance in `config.json` under `--data-dir`, then enroll the key. The flow performs no HTTP, so it needs no `enrollment_origins`; the injection origin must appear in the `net.http` grant:
+Register the instance in `config.json` under `--data-dir`, then enroll the key. The request origin must appear in the `net.http` grant:
 
 ```json
 {
@@ -65,7 +65,7 @@ Register the instance in `config.json` under `--data-dir`, then enroll the key. 
 pluribus --data-dir ./data auth openrouter
 ```
 
-`credential` is an opaque handle created from the plugin's `static-http@1` flow. The host stores the key and injects `authorization` on requests to `https://openrouter.ai`. Key bytes never enter the component.
+`credentials.api-key` is an opaque handle. The host seals the enrolled key under it; the component reads it back with `credentials.get` and sets `authorization` itself.
 
 A model entry is a slug or a descriptor. The descriptor's `features` narrows what the host advertises for that model.
 

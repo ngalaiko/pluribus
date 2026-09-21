@@ -89,6 +89,7 @@ pub(crate) fn instance(
     for (name, component) in package.components() {
         let manifest = component.manifest();
         let mut access = serde_json::Map::new();
+        let mut streams = serde_json::Map::new();
         for requested in &manifest.requested_capabilities {
             match requested.name.as_str() {
                 "net.http" | "host.http" => {
@@ -110,17 +111,54 @@ pub(crate) fn instance(
                         }),
                     );
                 }
-                "host.stream" => {
-                    access.insert(
-                        "stream".into(),
+                "net.tls" => {
+                    // The plugin names an endpoint, not a destination: the
+                    // name selects among what the operator granted.
+                    //
+                    // A remote endpoint is usually a session held open for
+                    // hours, so its byte budget is closer to a connection
+                    // lifetime than to a per-exchange ceiling: exhausting it
+                    // ends the connection and the plugin reconnects. The
+                    // local-socket default is far too small for that.
+                    let mut tls = json!({
+                        "hostname": requested.constraints["hostname"],
+                        "port": requested.constraints["port"],
+                    });
+                    if let Some(preamble) = requested.constraints.get("starttls") {
+                        tls["starttls"] = preamble.clone();
+                    }
+                    streams.insert(
+                        endpoint_name(requested),
                         json!({
-                            "socket": runtime.join(if name.is_empty() { format!("{id}.sock") } else { format!("{id}-{name}.sock") }),
+                            "tls": tls,
+                            "max_bytes": requested.constraints["max_bytes"].as_u64().unwrap_or(1024 * 1024 * 1024),
+                            "max_timeout_ms": requested.constraints["max_timeout_ms"].as_u64().unwrap_or(15_000),
+                            // One session per endpoint. A component that
+                            // wants more must say so in its manifest.
+                            "max_connections": requested.constraints["max_connections"].as_u64().unwrap_or(1),
+                        }),
+                    );
+                }
+                "host.stream" => {
+                    let socket = match (name.is_empty(), endpoint_name(requested).as_str()) {
+                        (true, "default") => format!("{id}.sock"),
+                        (false, "default") => format!("{id}-{name}.sock"),
+                        (true, endpoint) => format!("{id}-{endpoint}.sock"),
+                        (false, endpoint) => format!("{id}-{name}-{endpoint}.sock"),
+                    };
+                    streams.insert(
+                        endpoint_name(requested),
+                        json!({
+                            "socket": runtime.join(socket),
                             "peer_uids": [own_uid()],
                         }),
                     );
                 }
                 _ => {}
             }
+        }
+        if !streams.is_empty() {
+            access.insert("stream".into(), Value::Object(streams));
         }
         components.insert(name.clone(), Value::Object(access));
     }
@@ -170,17 +208,16 @@ pub(crate) fn resolve_instance(
                 .or_insert_with(|| json!(format!("{id}:{}", credential.id)));
         }
     }
-    if instance.enrollment_overrides.is_none() {
-        instance.enrollment_origins = package
-            .manifest()
-            .credentials
-            .iter()
-            .flat_map(|credential| credential.enrollment_origins.iter().cloned())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-    }
     Ok(())
+}
+
+/// The name `socket.connect` selects this endpoint with. A manifest asking
+/// for one endpoint need not name it; `default` is what the guest then passes.
+fn endpoint_name(requested: &pluribus_plugin_package::RequestedCapability) -> String {
+    requested.constraints["name"]
+        .as_str()
+        .unwrap_or("default")
+        .to_owned()
 }
 
 fn own_uid() -> u32 {
@@ -302,6 +339,140 @@ mod tests {
         }))
         .unwrap();
         assert!(resolve_instance(&package, "personal", root.path(), &mut instance).is_err());
+    }
+
+    fn load(name: &str) -> PluginPackage {
+        PluginPackage::load(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/plugins")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_tls_request_installs_every_endpoint_its_manifest_names() {
+        let package = load("email");
+        assert_eq!(
+            package
+                .components()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [""]
+        );
+        assert_eq!(package.manifest().credentials[0].components, [""]);
+        let root = tempfile::tempdir().unwrap();
+        let mut instance = serde_json::from_value(json!({
+            "package":"bundled:email", "config":{}
+        }))
+        .unwrap();
+        resolve_instance(&package, "mail", root.path(), &mut instance).unwrap();
+        let streams = &instance.components[""].stream;
+        assert_eq!(streams.keys().collect::<Vec<_>>(), ["imap", "smtp"]);
+
+        let imap = &streams["imap"];
+        let tls = imap.tls.as_ref().unwrap();
+        assert_eq!(tls.hostname, "imap.mail.me.com");
+        assert_eq!(tls.port, 993);
+        assert!(!tls.allow_private_network);
+        assert!(tls.starttls.is_none());
+        // A session held open for hours needs a budget sized as a connection
+        // lifetime, not as one request/response exchange.
+        assert_eq!(imap.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(imap.max_connections, 1);
+        // The plugin names no destination, so no local socket is provisioned.
+        assert!(imap.socket.is_none());
+        assert!(imap.peer_uids.is_empty());
+        imap.validate().unwrap();
+
+        // Submission upgrades from plaintext, and the host owns the upgrade.
+        let smtp = &streams["smtp"];
+        let tls = smtp.tls.as_ref().unwrap();
+        assert_eq!(tls.hostname, "smtp.mail.me.com");
+        assert_eq!(tls.port, 587);
+        assert!(matches!(
+            tls.starttls,
+            Some(crate::registry::StartTlsAccess::Smtp)
+        ));
+        assert_eq!(smtp.max_bytes, 32 * 1024 * 1024);
+        smtp.validate().unwrap();
+    }
+
+    /// A local endpoint and a network endpoint are separate authorities: a
+    /// manifest asking for one must not be handed the other.
+    #[test]
+    fn an_endpoint_grant_cannot_exceed_the_manifest() {
+        let email = load("email");
+        let connector = &email.components()[""];
+        let shell = load("shell");
+        let main = &shell.components()["main"];
+        let access = |value: Value| -> crate::registry::StreamAccess {
+            serde_json::from_value(value).unwrap()
+        };
+
+        let granted = access(json!({"tls":{"hostname":"imap.mail.me.com","port":993}}));
+        assert!(crate::allows_stream(connector, "imap", &granted));
+        // The manifest asks for that endpoint under one name and no other.
+        assert!(!crate::allows_stream(connector, "smtp", &granted));
+        assert!(!crate::allows_stream(connector, "default", &granted));
+        assert!(
+            !crate::allows_stream(main, "default", &granted),
+            "host.stream must not reach the network"
+        );
+
+        for elsewhere in [
+            json!({"tls":{"hostname":"imap.example.com","port":993}}),
+            json!({"tls":{"hostname":"imap.mail.me.com","port":143}}),
+            // The preamble is part of the endpoint: a grant may not drop it.
+            json!({"tls":{"hostname":"smtp.mail.me.com","port":587}}),
+        ] {
+            let name = if elsewhere["tls"]["port"] == 587 {
+                "smtp"
+            } else {
+                "imap"
+            };
+            assert!(
+                !crate::allows_stream(connector, name, &access(elsewhere.clone())),
+                "{elsewhere} is a different endpoint"
+            );
+        }
+        assert!(crate::allows_stream(
+            connector,
+            "smtp",
+            &access(json!({"tls":{
+                "hostname":"smtp.mail.me.com","port":587,"starttls":"smtp"
+            }}))
+        ));
+
+        let socket = access(json!({"socket":"/run/pluribus/e.sock","peer_uids":[1001]}));
+        assert!(!crate::allows_stream(connector, "imap", &socket));
+        assert!(crate::allows_stream(main, "default", &socket));
+    }
+
+    #[test]
+    fn the_email_component_asks_for_no_http() {
+        let email = load("email");
+        let manifest = email.components()[""].manifest();
+        for required in [
+            "pluribus:plugin/socket@3.0.0",
+            "pluribus:plugin/credentials@3.0.0",
+            "pluribus:plugin/state@3.0.0",
+            "pluribus:plugin/blobs@3.0.0",
+        ] {
+            assert!(
+                manifest.imports.iter().any(|import| import == required),
+                "{required} is missing"
+            );
+        }
+        // Mail arrives over IMAP. No HTTP grant is requested, so none is
+        // installed.
+        assert!(
+            !manifest
+                .requested_capabilities
+                .iter()
+                .any(|request| matches!(request.name.as_str(), "net.http" | "host.http"))
+        );
     }
 
     #[test]
