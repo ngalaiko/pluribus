@@ -1,10 +1,32 @@
 use super::*;
-use pluribus_core::{EventMetadataSource, InMemoryBlobStore, RegistryError};
+use pluribus_core::{
+    AppendRequest, EventMetadataSource, EventPayload, InMemoryBlobStore,
+    PrincipalKind as CorePrincipalKind, PrincipalRef, RegistryError, StreamId, StreamKind,
+};
 use pluribus_plugin_package::PluginPackage;
 use pluribus_store_sqlite::SqliteEventStore;
 use std::sync::atomic::AtomicU64;
 use wit_component::ComponentEncoder;
 use wit_parser::{ManglingAndAbi, Resolve};
+
+#[test]
+fn runtime_error_exposes_typed_resource_exhaustion() {
+    let error = RuntimeError::resource_limit(
+        ResourceExhaustion {
+            resource: "memory".into(),
+            current_bytes: 65_536,
+            requested_bytes: 131_072,
+            limit_bytes: 65_536,
+            phase: "delivery".into(),
+            job_id: None,
+            session_id: None,
+        },
+        "guest trap",
+    );
+    assert_eq!(error.resource_exhaustion().unwrap().resource, "memory");
+    assert_eq!(error.resource_exhaustion().unwrap().phase, "delivery");
+    assert!(error.trapped());
+}
 
 pub(super) struct Metadata(AtomicU64);
 
@@ -229,6 +251,156 @@ async fn runtime() -> (Runtime, Arc<SqliteEventStore<Metadata>>) {
 }
 
 #[tokio::test]
+async fn source_delivery_preserves_the_original_failure() {
+    let (runtime, _) = runtime().await;
+    let package = PluginPackage::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/echo"),
+    )
+    .unwrap();
+    let mut instance = runtime
+        .instantiate(
+            package.component("").unwrap(),
+            &serde_json::json!({}),
+            delivery(),
+            PluginServices::default(),
+        )
+        .await
+        .unwrap();
+    instance.init().await.unwrap();
+    instance.start();
+    // An empty delivery has no valid checkpoint and makes the source commit fail.
+    let error = tokio::time::timeout(Duration::from_secs(5), instance.handle(&[]))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("checkpoint must identify a delivered event"),
+        "original failure was lost: {error}"
+    );
+    assert!(error.resource_exhaustion().is_none());
+    assert_eq!(instance.checkpoint(), 0);
+}
+
+#[tokio::test]
+async fn packaged_guest_memory_exhaustion_preserves_delivery_cursor() {
+    let store = store().await;
+    let runtime = Runtime::new(
+        RuntimeLimits {
+            memory_bytes: 4 * 1024 * 1024,
+            ..RuntimeLimits::default()
+        },
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&store) as Arc<dyn EventStore>,
+        Arc::new(InMemoryBlobStore::default()),
+        Arc::clone(&store) as Arc<dyn DeliveryStore>,
+    )
+    .unwrap();
+    let package = PluginPackage::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/echo"),
+    )
+    .unwrap();
+    let mut instance = runtime
+        .instantiate(
+            package.component("").unwrap(),
+            &serde_json::json!({}),
+            delivery(),
+            PluginServices::default(),
+        )
+        .await
+        .unwrap();
+    instance.init().await.unwrap();
+    let event = store
+        .append(AppendRequest {
+            stream_id: StreamId::new("personal"),
+            stream_kind: StreamKind::Agent,
+            observed_at_ms: None,
+            event_type: "capability.requested".into(),
+            payload_schema: "pluribus.capability-request/1".into(),
+            payload: EventPayload::CanonicalJson(
+                serde_json::to_vec(&serde_json::json!({
+                    "capability": "system.echo",
+                    "arguments": {"message": "x".repeat(8 * 1024 * 1024)},
+                }))
+                .unwrap(),
+            ),
+            actor: PrincipalRef::new(CorePrincipalKind::Human, "operator"),
+            authority_id: None,
+            activity_id: None,
+            correlation_id: None,
+            causation_id: None,
+            deduplication_key: None,
+        })
+        .await
+        .unwrap();
+    let error = instance.handle(&[event]).await.unwrap_err();
+    let exhaustion = error.resource_exhaustion().expect("memory exhaustion");
+    assert_eq!(exhaustion.resource, "memory");
+    assert_eq!(exhaustion.phase, "delivery");
+    assert!(exhaustion.requested_bytes > exhaustion.current_bytes);
+    assert_eq!(exhaustion.limit_bytes, 4 * 1024 * 1024);
+    assert_eq!(instance.checkpoint(), 0);
+    assert!(error.to_string().contains("handle trapped"));
+}
+
+#[tokio::test]
+async fn skip_with_events_keeps_cursor_atomic_on_failure() {
+    let (runtime, store) = runtime().await;
+    let package = PluginPackage::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/echo"),
+    )
+    .unwrap();
+    let mut instance = runtime
+        .instantiate(
+            package.component("").unwrap(),
+            &serde_json::json!({}),
+            delivery(),
+            PluginServices::default(),
+        )
+        .await
+        .unwrap();
+    let invalid = AppendRequest {
+        stream_id: StreamId::new("other"),
+        stream_kind: StreamKind::Agent,
+        observed_at_ms: None,
+        event_type: "component.failed".into(),
+        payload_schema: "test/1".into(),
+        payload: EventPayload::CanonicalJson(b"{}".to_vec()),
+        actor: PrincipalRef::new(CorePrincipalKind::Component, "shell-1"),
+        authority_id: None,
+        activity_id: None,
+        correlation_id: None,
+        causation_id: None,
+        deduplication_key: Some("deferred-1".into()),
+    };
+    assert!(
+        instance
+            .skip_with_events(1, vec![invalid.clone()])
+            .await
+            .is_err()
+    );
+    assert_eq!(instance.checkpoint(), 0);
+    assert_eq!(
+        DeliveryStore::checkpoint(
+            store.as_ref(),
+            &CursorKey {
+                stream_id: StreamId::new("personal"),
+                namespace: StateNamespace::new("shell-1"),
+            }
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let mut valid = invalid;
+    valid.stream_id = StreamId::new("personal");
+    let outcome = instance.skip_with_events(1, vec![valid]).await.unwrap();
+    assert_eq!(outcome.checkpoint, 1);
+    assert_eq!(outcome.events.len(), 1);
+}
+
+#[tokio::test]
 async fn memory_above_the_abi_maximum_is_refused() {
     let store = store().await;
     let error = Runtime::new(
@@ -336,6 +508,7 @@ async fn provider_http_timeout_cannot_exceed_the_lifecycle_deadline() {
             memory_bytes: 1024 * 1024,
             call_timeout: Duration::from_millis(100),
         },
+        "execution",
     );
     assert!(store.data().call_budget().unwrap() <= 100);
 }

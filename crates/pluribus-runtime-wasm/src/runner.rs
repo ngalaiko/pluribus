@@ -1,10 +1,10 @@
 //! One source task owns Wasm; internal deliveries rendezvous at cooperative waits.
 use super::{
-    Arc, AtomicBool, CancellationHandle, CommitPhase, CommittedEvent, CursorKey, DeliveryCommit,
-    DeliveryStore, Duration, HostState, InstanceCore, InstanceRecipe, Instant, MAX_OUTCOME_EVENTS,
-    Ordering, Outcome, RuntimeError, RuntimeLimits, StateNamespace, StreamId, convert_mutations,
-    execution, host_error, http_request_visible, plugin_failure, prepare_call, stream_denied,
-    system_time_ms, types, wit_event,
+    AppendRequest, Arc, AtomicBool, CancellationHandle, CommitPhase, CommittedEvent, CursorKey,
+    DeliveryCommit, DeliveryStore, Duration, HostState, InstanceCore, InstanceRecipe, Instant,
+    MAX_OUTCOME_EVENTS, Ordering, Outcome, RuntimeError, RuntimeLimits, StateNamespace, StreamId,
+    convert_mutations, execution, host_error, http_request_visible, plugin_failure, prepare_call,
+    stream_denied, system_time_ms, types, wit_event,
 };
 use std::sync::atomic::AtomicU64;
 use tokio::sync::{mpsc, oneshot};
@@ -42,6 +42,7 @@ pub(super) struct RunTask {
     pub context: super::guest::Context,
     pub config: Vec<u8>,
     pub completed: oneshot::Sender<Result<(), RuntimeError>>,
+    pub resource_evidence: Arc<std::sync::Mutex<Option<super::ResourceExhaustion>>>,
 }
 impl wasmtime::component::AccessorTask<HostState> for RunTask {
     async fn run(self, accessor: &Accessor<HostState>) -> wasmtime::Result<()> {
@@ -49,7 +50,12 @@ impl wasmtime::component::AccessorTask<HostState> for RunTask {
             .lifecycle
             .call_run(accessor, self.context, self.config)
             .await
-            .map_err(|e| RuntimeError::trap(format!("run trapped: {e:#}")))
+            .map_err(|e| {
+                super::resource_error_from_evidence(
+                    &self.resource_evidence,
+                    format!("run trapped: {e:#}"),
+                )
+            })
             .and_then(|r| r.map_err(|e| plugin_failure(&e)));
         let _ = self.completed.send(result);
         Ok(())
@@ -183,14 +189,18 @@ impl PluginInstance {
             commit_gate: commit_gate.clone(),
         };
         let task = tokio::spawn(async move {
-            prepare_call(&mut core.store, &core.limits);
+            prepare_call(&mut core.store, &core.limits, "execution");
             core.store.data_mut().emit_call = true;
             let _ = activation.send(());
             let result = core
                 .store
                 .run_concurrent(async |_| completed.await)
                 .await
-                .map_err(|e| RuntimeError::trap(format!("run trapped: {e:#}")))
+                .map_err(|e| {
+                    core.store
+                        .data()
+                        .resource_error(format!("run trapped: {e:#}"))
+                })
                 .and_then(|r| r.map_err(|_| RuntimeError::trap("run task disappeared")))
                 .and_then(|r| r);
             let result = if result.is_ok() && !core.store.data().runner.stopping {
@@ -200,6 +210,9 @@ impl PluginInstance {
             };
             core.interrupted = result.is_err();
             if let Err(error) = result {
+                if let Some((_, reply)) = core.store.data_mut().runner.pending.take() {
+                    let _ = reply.send(Err(error.clone()));
+                }
                 let _ = output.send(Err(error));
             }
             core.checkpoint = core.store.data().runner.checkpoint.load(Ordering::Acquire);
@@ -287,6 +300,46 @@ impl PluginInstance {
             .checkpoint
             .store(receipt.checkpoint, Ordering::Release);
         Ok(())
+    }
+
+    /// Advances the cursor and records host-owned events atomically.
+    ///
+    /// # Errors
+    /// Returns activation-state or storage errors.
+    pub async fn skip_with_events(
+        &mut self,
+        checkpoint: u64,
+        events: Vec<AppendRequest>,
+    ) -> Result<Outcome, RuntimeError> {
+        if let Some(c) = self.core.as_mut() {
+            return c.skip_with_events(checkpoint, events).await;
+        }
+        let running = self
+            .running
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("instance stopped"))?;
+        let _guard = running.commit_gate.lock().await;
+        let receipt = self
+            .recipe
+            .runtime
+            .delivery_store
+            .commit(DeliveryCommit {
+                cursor: CursorKey {
+                    stream_id: StreamId::new(self.recipe.delivery.agent.id.clone()),
+                    namespace: StateNamespace::new(self.instance_id.clone()),
+                },
+                expected_checkpoint: self.checkpoint(),
+                checkpoint: Some(checkpoint),
+                mutations: Vec::new(),
+                events,
+            })
+            .await
+            .map_err(|error| RuntimeError::new(format!("cannot skip delivery: {error}")))?;
+        self.checkpoint.store(receipt.checkpoint, Ordering::Release);
+        Ok(Outcome {
+            events: receipt.events,
+            checkpoint: receipt.checkpoint,
+        })
     }
     /// # Errors
     /// Returns shutdown, deadline, or commit failures.
@@ -527,6 +580,7 @@ impl<T> execution::HostWithStore<T> for HostData {
             let host = access.get();
             match command {
                 Some(Command::Deliver(events, reply)) => {
+                    host.reset_resource_evidence("delivery");
                     let batch = events
                         .iter()
                         .map(|e| {
@@ -543,6 +597,7 @@ impl<T> execution::HostWithStore<T> for HostData {
                     Ok(execution::Wake::Events(batch))
                 }
                 Some(Command::Stop(deadline)) => {
+                    host.reset_resource_evidence("execution");
                     host.runner.stopping = true;
                     host.cancel_notify.notify_waiters();
                     Ok(execution::Wake::Stop(deadline))

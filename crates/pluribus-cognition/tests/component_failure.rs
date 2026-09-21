@@ -14,7 +14,6 @@ use pluribus_runtime_wasm::{
 };
 use pluribus_store_sqlite::SqliteEventStore;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,7 +69,16 @@ impl AuthorityResolver for NoGrants {
                 trusted: true,
             },
             delegation_chain: Vec::new(),
-            grants: BTreeMap::new(),
+            grants: [(
+                pluribus_core::CapabilityName::new("system.echo"),
+                vec![Grant {
+                    capability: pluribus_core::CapabilityName::new("system.echo"),
+                    provider: None,
+                    constraints: pluribus_core::ConstraintSet::canonical_json(b"{}".to_vec()),
+                }],
+            )]
+            .into_iter()
+            .collect(),
             audiences: Vec::<Audience>::new(),
             parent_authority: None,
             issued_at_ms: 0,
@@ -191,6 +199,71 @@ async fn agent_with_limits(
     agent
 }
 
+async fn echo_agent(store: &Arc<SqliteEventStore<Metadata>>) -> Agent<AllowAll, NoGrants> {
+    let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::default());
+    let runtime = Runtime::new(
+        RuntimeLimits::default(),
+        Arc::clone(store) as Arc<dyn StateStore>,
+        Arc::clone(store) as Arc<dyn EventStore>,
+        blobs,
+        Arc::clone(store) as Arc<dyn DeliveryStore>,
+    )
+    .unwrap();
+    let package = PluginPackage::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/echo"),
+    )
+    .unwrap();
+    let router = Router::new(
+        StreamId::new("personal"),
+        PrincipalRef::new(PrincipalKind::Agent, "personal"),
+        Arc::clone(store) as Arc<dyn EventStore>,
+        Arc::new(EventTypeRegistry::core()),
+        AllowAll,
+    );
+    let mut agent = Agent::new(
+        router,
+        NoGrants,
+        runtime,
+        Arc::clone(store) as Arc<dyn EventStore>,
+        StreamId::new("personal"),
+        PrincipalRef::new(PrincipalKind::Agent, "personal"),
+    );
+    agent
+        .install_component(
+            package.component("").unwrap(),
+            &json!({}),
+            Delivery {
+                instance_id: "echo-1".into(),
+                agent: Principal {
+                    kind: RuntimePrincipalKind::Agent,
+                    id: "personal".into(),
+                },
+                actor: Principal {
+                    kind: RuntimePrincipalKind::Agent,
+                    id: "personal".into(),
+                },
+                authority_id: "authority-1".into(),
+                activity_id: "activity-1".into(),
+                correlation_id: "correlation-1".into(),
+                origin_event_id: "origin-1".into(),
+                depth: 0,
+                deadline_at_ms: None,
+                visible_blobs: Vec::new(),
+            },
+            PluginServices {
+                limits: Some(RuntimeLimits {
+                    memory_bytes: 4 * 1024 * 1024,
+                    ..RuntimeLimits::default()
+                }),
+                ..PluginServices::default()
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+    agent
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_trapped_session_component_fails_the_call_and_recovers() {
     let store = Arc::new(
@@ -245,7 +318,7 @@ async fn a_trapped_session_component_fails_the_call_and_recovers() {
                     .collect::<Vec<_>>()
             )
         });
-    assert_eq!(payload(&failure)["instanceId"], json!("code-1"));
+    assert_eq!(payload(failure)["instanceId"], json!("code-1"));
     assert_eq!(
         failure.request.actor.kind,
         PrincipalKind::Node,
@@ -390,4 +463,56 @@ async fn a_fresh_session_component_recovers_persisted_failure() {
             .iter()
             .any(|e| e.request.event_type == "code.completed" && payload(e)["value"] == 42)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resource_failure_survives_restart_and_isolates_following_request() {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1)))
+            .await
+            .unwrap(),
+    );
+    let mut agent = echo_agent(&store).await;
+    append(
+        &store,
+        "capability.requested",
+        &json!({
+            "capability":"system.echo",
+            "arguments":{"message":"x".repeat(8 * 1024 * 1024)}
+        }),
+    )
+    .await;
+    append(
+        &store,
+        "capability.requested",
+        &json!({"capability":"system.echo","arguments":{"message":"small"}}),
+    )
+    .await;
+    agent.tick_wait(1).await.unwrap();
+    drop(agent);
+
+    let mut agent = echo_agent(&store).await;
+    agent.tick_wait(1001).await.unwrap();
+    agent.tick_wait(3001).await.unwrap();
+    agent.tick_wait(5001).await.unwrap();
+    agent.tick_wait(7001).await.unwrap();
+    let recorded = events(&store).await;
+    assert!(recorded.iter().any(|event| {
+        event.request.event_type == "cognition.resource-exhausted"
+            && payload(event)["inputEventId"] == "event-1"
+    }));
+    agent.tick_wait(7002).await.unwrap();
+    let recorded = events(&store).await;
+    let small_id = recorded
+        .iter()
+        .find(|input| {
+            input.request.event_type == "capability.requested"
+                && payload(input)["arguments"]["message"] == "small"
+        })
+        .map(|input| input.event_id.as_str().to_owned())
+        .unwrap();
+    assert!(recorded.iter().any(|event| {
+        event.request.event_type == "capability.completed"
+            && payload(event)["requestEventId"] == small_id
+    }));
 }

@@ -279,6 +279,66 @@ async fn packaged_cognition_recurses_through_events_and_preserves_parent_state()
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packaged_guest_oom_replans_and_completes_smaller_read() {
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(
+            AtomicU64::new(1),
+            Arc::new(AtomicI64::new(1_700_000_000_000)),
+        ))
+        .await
+        .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    let origin = observation(&store, json!({})).await;
+    drive(&mut agent, 1).await;
+    let first = model_requests(&store).await.pop().unwrap();
+    scripted(&store,&first,json!([{"kind":"tool-call","name":"js","call_id":"large","arguments":{"code":"await history.read({after:0,limit:1}); return 'x'.repeat(100000000);"}}])).await;
+    drive(&mut agent, 1).await;
+    let state = projection(&store).await;
+    assert_eq!(
+        state["tasks"][origin.event_id.as_str()]["resource_failures"],
+        1,
+        "{state}"
+    );
+    let retry = model_requests(&store).await.pop().unwrap();
+    assert_ne!(first.event_id, retry.event_id);
+    assert_eq!(
+        state["tasks"][origin.event_id.as_str()]["context"]["resourceRecovery"]["readLimit"],
+        16
+    );
+    scripted(&store,&retry,json!([{"kind":"tool-call","name":"js","call_id":"small","arguments":{"code":"return (await history.read({after:0,limit:1000})).events.length;"}}])).await;
+    drive(&mut agent, 10000).await;
+    let completed = store
+        .read(&StreamId::new("personal"), 0, 10000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.request.event_type == "code.completed")
+        .last()
+        .expect("smaller read completed");
+    assert!(
+        payload(&completed)["value"]
+            .as_u64()
+            .is_some_and(|n| (1..=16).contains(&n)),
+        "{}",
+        payload(&completed)
+    );
+    let request = model_requests(&store).await.pop().unwrap();
+    scripted(
+        &store,
+        &request,
+        yield_control(json!({"action":"complete"})),
+    )
+    .await;
+    drive(&mut agent, 10000).await;
+    assert_eq!(
+        projection(&store).await["jobs"][origin.event_id.as_str()]["status"],
+        "completed"
+    );
+    assert!(agent.failed().is_empty());
+}
+
 struct BlockedHttp {
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -2954,4 +3014,136 @@ async fn a_photo_observation_reaches_the_provider_as_an_image_part() {
             .unwrap(),
         image
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archived_payloads_do_not_expand_cognition_working_set() {
+    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1), clock))
+            .await
+            .unwrap(),
+    );
+    let namespace = pluribus_core::StateNamespace::new("cognition");
+    let mut mutations = vec![];
+    for n in 0..96 {
+        let id = format!("archived-{n}");
+        let record = json!({"field":"jobs","key":id,"value":{
+            "id":id,"objective":"unrelated archive","origin":id,"sources":[id],
+            "revision":1,"incorporated_sequence":0,"status":"completed",
+            "completion_conditions":null,"completed_steps":null,"next_step":null,
+            "blockers":null,"notes":"x".repeat(200_000),"checkpoint":null,
+            "checkpoint_version":0,"cycle_started_ms":0,"retry_count":0,"wake":null
+        }});
+        for (part, bytes) in serde_json::to_vec(&record)
+            .unwrap()
+            .chunks(128 * 1024)
+            .enumerate()
+        {
+            mutations.push(pluribus_core::StateMutation::Set {
+                key: format!("engine/record/jobs/{n:064x}/{part:08}"),
+                value: bytes.to_vec(),
+            });
+        }
+    }
+    StateStore::apply(store.as_ref(), &namespace, 0, &mutations)
+        .await
+        .unwrap();
+    let mut agent = persistent_agent(&store).await;
+    observation(&store, json!({"conversationId":"new-conversation"})).await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        for n in 0..20 {
+            agent.tick_wait(1_700_000_000_000 + n * 5000).await.unwrap();
+            if !model_requests(&store).await.is_empty() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("bounded legacy migration must finish");
+    assert!(
+        !model_requests(&store).await.is_empty(),
+        "unrelated archived payloads blocked cognition"
+    );
+    assert!(agent.failed().is_empty());
+    let unchanged=StateStore::get(store.as_ref(),&namespace,"engine/record/jobs/0000000000000000000000000000000000000000000000000000000000000000/00000000").await.unwrap();
+    assert!(
+        unchanged.value.is_some(),
+        "partial delivery deleted an unrelated archive"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_active_job_recovers_after_restart() {
+    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1), clock))
+            .await
+            .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    let origin = observation(&store, json!({"conversationId":"active"})).await;
+    agent.tick_wait(1).await.unwrap();
+    drop(agent);
+
+    let namespace = pluribus_core::StateNamespace::new("cognition");
+    let mut after = None;
+    let mut target = None;
+    loop {
+        let page = StateStore::scan(
+            store.as_ref(),
+            &namespace,
+            "engine/record/jobs/",
+            after.as_deref(),
+            100,
+        )
+        .await
+        .unwrap();
+        for entry in &page.entries {
+            if let Ok(mut record) = serde_json::from_slice::<Value>(&entry.value)
+                && record["value"]["id"].as_str() == Some(origin.event_id.as_str())
+            {
+                record["value"]["notes"] = json!("x".repeat(600 * 1024));
+                target = Some((entry.key.rsplit_once('/').unwrap().0.to_owned(), record));
+            }
+        }
+        match page.next_key {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    let (prefix, record) = target.expect("active job record");
+    let bytes = serde_json::to_vec(&record).unwrap();
+    let mut mutations = Vec::new();
+    for (part, chunk) in bytes.chunks(128 * 1024).enumerate() {
+        mutations.push(pluribus_core::StateMutation::Set {
+            key: format!("{prefix}/{part:08}"),
+            value: chunk.to_vec(),
+        });
+    }
+    let revision = StateStore::get(store.as_ref(), &namespace, &format!("{prefix}/00000000"))
+        .await
+        .unwrap()
+        .revision;
+    StateStore::apply(store.as_ref(), &namespace, revision, &mutations)
+        .await
+        .unwrap();
+
+    let mut restarted = persistent_agent(&store).await;
+    observation(&store, json!({"conversationId":"new"})).await;
+    for _ in 0..20 {
+        restarted.tick_wait(1).await.unwrap();
+        if !restarted.failed().contains_key("cognition") {
+            break;
+        }
+    }
+    let state = projection(&store).await;
+    assert!(state["jobs"][origin.event_id.as_str()].is_object());
+    assert!(state["tasks"][origin.event_id.as_str()]["context"]["resourceRecovery"].is_object());
+    assert!(state["inbox"].as_object().is_some_and(|inbox| {
+        inbox
+            .values()
+            .any(|value| value["value"]["conversationId"] == "new")
+    }));
+    assert!(!restarted.failed().contains_key("cognition"));
 }

@@ -472,6 +472,93 @@ impl<P: ConstraintPolicy> Router<P> {
             .map_err(|error| RouterError::Storage(error.to_string()))
     }
 
+    /// Records a host-observed cognition resource failure. The event is
+    /// durable before the delivery cursor may move past the input.
+    /// # Errors
+    /// Returns storage or registry errors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_resource_exhaustion(
+        &self,
+        instance_id: &str,
+        source: &CommittedEvent,
+        remaining_attempts: u32,
+        resource: Value,
+        effect_status: &str,
+        checkpoint_status: &str,
+        job_id: Option<String>,
+        session_id: Option<String>,
+    ) -> Result<CommittedEvent, RouterError> {
+        let request = self.resource_exhaustion_request(
+            instance_id,
+            source,
+            remaining_attempts,
+            resource,
+            effect_status,
+            checkpoint_status,
+            job_id,
+            session_id,
+        )?;
+        self.events
+            .append(request)
+            .await
+            .map_err(|error| RouterError::Storage(error.to_string()))
+    }
+
+    /// Builds the host-owned deferred event for an atomic delivery commit.
+    /// # Errors
+    /// Returns a registry or serialization error.
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    pub fn resource_exhaustion_request(
+        &self,
+        instance_id: &str,
+        source: &CommittedEvent,
+        remaining_attempts: u32,
+        resource: Value,
+        effect_status: &str,
+        checkpoint_status: &str,
+        job_id: Option<String>,
+        session_id: Option<String>,
+    ) -> Result<AppendRequest, RouterError> {
+        let payload = json!({
+            "instanceId": instance_id,
+            "requestEventId": source.event_id.as_str(),
+            "inputEventId": source.event_id.as_str(),
+            "input": deferred_input(source),
+            "jobId": job_id.or_else(|| payload_field(source, "jobId")),
+            "sessionId": session_id.or_else(|| payload_field(source, "sessionId")),
+            "code": "resource-exhausted",
+            "resource": resource,
+            "remainingAttempts": remaining_attempts,
+            "effectStatus": effect_status,
+            "checkpointStatus": checkpoint_status,
+            "deferred": true,
+        });
+        let request = AppendRequest {
+            stream_id: self.stream_id.clone(),
+            stream_kind: StreamKind::Agent,
+            observed_at_ms: None,
+            event_type: "cognition.resource-exhausted".into(),
+            payload_schema: "pluribus.cognition-resource-exhausted/1".into(),
+            payload: EventPayload::CanonicalJson(
+                serde_json::to_vec(&payload)
+                    .map_err(|error| RouterError::Storage(error.to_string()))?,
+            ),
+            actor: PrincipalRef::new(PrincipalKind::Node, self.agent.id.as_str()),
+            authority_id: source.request.authority_id.clone(),
+            activity_id: source.request.activity_id.clone(),
+            correlation_id: source.request.correlation_id.clone(),
+            causation_id: Some(source.event_id.clone()),
+            deduplication_key: Some(format!(
+                "cognition-resource-exhausted:{instance_id}:{}",
+                source.event_id.as_str()
+            )),
+        };
+        self.registry
+            .validate(&request)
+            .map_err(|error| RouterError::Storage(error.to_string()))?;
+        Ok(request)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) async fn append_health(
         &self,
@@ -586,6 +673,16 @@ impl<P: ConstraintPolicy> Router<P> {
         provider: &str,
         batch: &[CommittedEvent],
     ) -> Result<(), RouterError> {
+        self.fail_sessions_with_resource(provider, batch, None)
+            .await
+    }
+
+    pub(crate) async fn fail_sessions_with_resource(
+        &self,
+        provider: &str,
+        batch: &[CommittedEvent],
+        resource_error: Option<Value>,
+    ) -> Result<(), RouterError> {
         let mut pending = std::collections::BTreeMap::new();
         let mut after = 0;
         loop {
@@ -635,10 +732,21 @@ impl<P: ConstraintPolicy> Router<P> {
             }
         }
         for (session, source) in pending {
-            self.attempt_event(&source, "code.failed", json!({
+            let mut failure = json!({
                 "requestEventId":source.event_id.as_str(), "sessionId":session,
                 "code":"outcome-unknown", "reason":"session was lost after a component trap; reconcile effects before retrying"
-            }), &format!("session-lost:{}", source.event_id.as_str())).await?;
+            });
+            if let Some(resource_error) = &resource_error {
+                failure["resourceError"] = resource_error.clone();
+                failure["effectStatus"] = json!("outcome-unknown");
+            }
+            self.attempt_event(
+                &source,
+                "code.failed",
+                failure,
+                &format!("session-lost:{}", source.event_id.as_str()),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -674,6 +782,19 @@ impl<P: ConstraintPolicy> Router<P> {
                 .iter()
                 .any(|event| event.request.causation_id.as_ref() == Some(&request.event_id))
             {
+                let inherent = self
+                    .registrations
+                    .iter()
+                    .find(|registration| registration.instance_id == provider)
+                    .and_then(|registration| {
+                        payload_field(request, "capability").and_then(|capability| {
+                            registration.subscriptions.idempotency.get(&capability)
+                        })
+                    })
+                    .is_some_and(|kind| kind == "inherent");
+                if inherent {
+                    return Ok(true);
+                }
                 self.attempt_event(request, "activity.unknown", json!({"requestEventId":request.event_id.as_str(),"provider":provider,"attemptId":key,"status":"unknown"}), &format!("unknown:{}",request.event_id.as_str())).await?;
                 let model = request.request.event_type == "model.requested";
                 let code = request.request.event_type == "code.evaluate-requested";
@@ -807,6 +928,69 @@ impl<P: ConstraintPolicy> Router<P> {
             .await?;
         Ok(projection.timers())
     }
+}
+
+fn deferred_input(source: &CommittedEvent) -> Value {
+    let mut envelope = json!({
+        "eventId": source.event_id.as_str(),
+        "eventType": source.request.event_type,
+        "sequence": source.sequence,
+    });
+    let EventPayload::CanonicalJson(bytes) = &source.request.payload else {
+        return envelope;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return envelope;
+    };
+    let mut compact = serde_json::Map::new();
+    for key in [
+        "provider",
+        "externalSenderId",
+        "conversationId",
+        "jobId",
+        "sessionId",
+        "rlmSession",
+        "call_id",
+        "callId",
+        "requestEventId",
+        "revision",
+    ] {
+        if let Some(value) = value.get(key) {
+            match value {
+                Value::String(text) => {
+                    compact.insert(key.into(), Value::String(text.chars().take(256).collect()));
+                }
+                Value::Number(_) | Value::Bool(_) => {
+                    compact.insert(key.into(), value.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    let message = value
+        .pointer("/message/text")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("text").and_then(Value::as_str))
+        .map(|text| ("text", text))
+        .or_else(|| {
+            value
+                .pointer("/message/caption")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("caption").and_then(Value::as_str))
+                .map(|text| ("caption", text))
+        });
+    if let Some((field, message)) = message {
+        compact.insert(
+            "message".into(),
+            json!({(field):message.chars().take(4096).collect::<String>()}),
+        );
+        compact.insert(
+            "source".into(),
+            json!({"eventId":source.event_id.as_str(),"payloadOmitted":true}),
+        );
+    }
+    envelope["payload"] = Value::Object(compact);
+    envelope
 }
 
 /// Timer requests a plugin proposed and the core has yet to answer.

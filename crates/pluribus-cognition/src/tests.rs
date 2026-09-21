@@ -990,6 +990,56 @@ async fn timer_projection_only_reads_new_events() {
 }
 
 #[tokio::test]
+async fn resource_exhaustion_is_a_host_owned_durable_event() {
+    let store = store().await;
+    let router = router(&store);
+    let source = append(
+        &store,
+        "model.requested",
+        &json!({"requestEventId":"request-1","jobId":"job-1","sessionId":"session-1"}),
+    )
+    .await;
+
+    let recorded = router
+        .append_resource_exhaustion(
+            "rlm-1",
+            &source,
+            1,
+            json!({
+                "resource":"memory",
+                "currentBytes":1024,
+                "requestedBytes":2048,
+                "limitBytes":1536,
+                "phase":"delivery"
+            }),
+            "not-started",
+            "checkpoint-committed",
+            Some("job-from-runtime".into()),
+            Some("session-from-runtime".into()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(recorded.request.event_type, "cognition.resource-exhausted");
+    assert_eq!(recorded.request.actor.kind, PrincipalKind::Node);
+    assert_eq!(recorded.request.actor.id.as_str(), "personal");
+    let payload = match recorded.request.payload {
+        EventPayload::CanonicalJson(bytes) => {
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+        EventPayload::Blob(_) => panic!("resource event must be inline"),
+    };
+    assert_eq!(payload["requestEventId"], "event-1");
+    assert_eq!(payload["inputEventId"], "event-1");
+    assert_eq!(payload["remainingAttempts"], 1);
+    assert_eq!(payload["effectStatus"], "not-started");
+    assert_eq!(payload["jobId"], "job-from-runtime");
+    assert_eq!(payload["sessionId"], "session-from-runtime");
+    assert_eq!(payload["input"]["eventId"], "event-1");
+    assert_eq!(payload["input"]["eventType"], "model.requested");
+}
+
+#[tokio::test]
 async fn untrusted_observations_do_not_inherit_standing_or_reply_grants() {
     use crate::{AuthorityResolver, Connector, OriginAuthority};
     let store = store().await;
@@ -1012,4 +1062,38 @@ async fn untrusted_observations_do_not_inherit_standing_or_reply_grants() {
     assert!(!issued.origin.trusted);
     assert!(issued.grants.is_empty());
     assert!(issued.audiences.is_empty());
+}
+
+#[tokio::test]
+async fn deferred_photo_preserves_caption_and_original_reference() {
+    let store = store().await;
+    let router = router(&store);
+    let source=append(&store,"observation.received",&json!({"provider":"telegram","conversationId":"chat","externalSenderId":"u","message":{"caption":"x".repeat(5000)}})).await;
+    let deferred = router
+        .resource_exhaustion_request(
+            "cognition",
+            &source,
+            0,
+            json!({}),
+            "not-started",
+            "committed",
+            None,
+            None,
+        )
+        .unwrap();
+    let EventPayload::CanonicalJson(bytes) = deferred.payload else {
+        panic!("inline")
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["input"]["payload"]["message"]["caption"]
+            .as_str()
+            .map(str::len),
+        Some(4096)
+    );
+    assert_eq!(
+        value["input"]["payload"]["source"]["eventId"],
+        source.event_id.as_str()
+    );
+    assert_eq!(value["input"]["payload"]["source"]["payloadOmitted"], true);
 }

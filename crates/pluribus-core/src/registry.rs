@@ -12,6 +12,7 @@ pub const RESERVED_EVENT_TYPES: &[&str] = &[
     "component.failed",
     "component.backoff",
     "component.recovered",
+    "cognition.resource-exhausted",
     "operator.job-control",
     "operator.attempt-reconciled",
     // Observations
@@ -133,6 +134,10 @@ impl EventTypeRegistry {
             ),
             ("component.backoff", "pluribus.component-health/1"),
             ("component.recovered", "pluribus.component-health/1"),
+            (
+                "cognition.resource-exhausted",
+                "pluribus.cognition-resource-exhausted/1",
+            ),
             ("credential.lifecycle", "pluribus.credential-lifecycle/1"),
             ("activity.attempted", "pluribus.activity-attempt/1"),
             ("activity.unknown", "pluribus.activity-attempt/1"),

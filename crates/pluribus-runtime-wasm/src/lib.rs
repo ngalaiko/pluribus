@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wasmtime::component::{Component, Linker, Resource};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 
 use bindings::exports::pluribus::plugin::lifecycle as guest;
 use bindings::pluribus::plugin::{
@@ -182,10 +182,27 @@ pub struct Outcome {
     pub checkpoint: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ResourceExhaustion {
+    pub resource: String,
+    #[serde(rename = "currentBytes")]
+    pub current_bytes: usize,
+    #[serde(rename = "requestedBytes")]
+    pub requested_bytes: usize,
+    #[serde(rename = "limitBytes")]
+    pub limit_bytes: usize,
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeError {
     message: String,
     trapped: bool,
+    resource_exhaustion: Option<Box<ResourceExhaustion>>,
 }
 
 impl RuntimeError {
@@ -193,20 +210,33 @@ impl RuntimeError {
         Self {
             message: message.into(),
             trapped: false,
+            resource_exhaustion: None,
         }
     }
 
-    /// The component died mid-call. It returned no outcome, and the same
-    /// input would kill it again.
+    /// Unclassified component termination without a guest outcome.
     fn trap(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             trapped: true,
+            resource_exhaustion: None,
         }
     }
 
-    /// Whether the component died rather than reporting a failure. A
-    /// reported failure is worth retrying; a trap is not.
+    fn resource_limit(resource: ResourceExhaustion, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            trapped: true,
+            resource_exhaustion: Some(Box::new(resource)),
+        }
+    }
+
+    #[must_use]
+    pub fn resource_exhaustion(&self) -> Option<&ResourceExhaustion> {
+        self.resource_exhaustion.as_deref()
+    }
+
+    /// Whether execution terminated without a guest outcome.
     #[must_use]
     pub const fn trapped(&self) -> bool {
         self.trapped
@@ -468,11 +498,15 @@ impl Runtime {
         host.shutdown = Arc::clone(&shutdown);
         let mut store = Store::new(&self.ticker.engine, host);
         store.limiter(|state| &mut state.limits);
-        prepare_call(&mut store, &limits);
-        let instance = linker
-            .instantiate_async(&mut store, &component)
-            .await
-            .map_err(|error| RuntimeError::new(format!("cannot instantiate component: {error}")))?;
+        prepare_call(&mut store, &limits, "startup");
+        let instance = match linker.instantiate_async(&mut store, &component).await {
+            Ok(instance) => instance,
+            Err(error) => {
+                return Err(store
+                    .data()
+                    .resource_error(format!("cannot instantiate component: {error}")));
+            }
+        };
         let plugin = bindings::Plugin::new(&mut store, &instance)
             .map_err(|error| RuntimeError::new(format!("cannot bind component: {error}")))?;
 
@@ -563,7 +597,7 @@ impl InstanceCore {
             return Err(RuntimeError::new("plugin already initialized"));
         }
         let context = self.context();
-        prepare_call(&mut self.store, &self.limits);
+        prepare_call(&mut self.store, &self.limits, "startup");
         let (startup, ready) = tokio::sync::oneshot::channel();
         let (activation, activated) = tokio::sync::oneshot::channel();
         let (completed, mut result) = tokio::sync::oneshot::channel();
@@ -577,6 +611,7 @@ impl InstanceCore {
                     context,
                     config: self.config.clone(),
                     completed,
+                    resource_evidence: self.store.data().resource_evidence.clone(),
                 })
                 .map_err(|e| RuntimeError::trap(e.to_string()))?,
         );
@@ -589,8 +624,8 @@ impl InstanceCore {
                     outcome = ready => outcome.map_err(|_| RuntimeError::trap("run exited before ready")),
                 }
             })
-        ).await.map_err(|_| RuntimeError::trap("startup deadline exceeded"))?
-            .map_err(|e| RuntimeError::trap(format!("startup trapped: {e:#}")))??;
+        ).await.map_err(|_| self.store.data().resource_error("startup deadline exceeded"))?
+            .map_err(|e| self.store.data().resource_error(format!("startup trapped: {e:#}")))??;
         let origin = EventId::new(self.store.data().delivery.origin_event_id.clone());
         let outcome = self
             .commit(&startup, Some(&origin), CommitPhase::Init)
@@ -638,7 +673,7 @@ impl InstanceCore {
             .collect::<Vec<_>>();
         let context = self.context();
         self.store.data_mut().reveal_event_blobs(events);
-        prepare_call(&mut self.store, &self.limits);
+        prepare_call(&mut self.store, &self.limits, "delivery");
         let lifecycle = self.plugin.pluribus_plugin_lifecycle();
         let result = tokio::time::timeout(
             self.limits.call_timeout,
@@ -654,7 +689,11 @@ impl InstanceCore {
             self.store.data_mut().release_handles();
         }
         let outcome = result
-            .map_err(|error| RuntimeError::trap(format!("handle trapped: {error:#}")))?
+            .map_err(|error| {
+                self.store
+                    .data()
+                    .resource_error(format!("handle trapped: {error:#}"))
+            })?
             .map_err(|error| plugin_failure(&error))?;
         if let Some(claimed) = outcome.checkpoint
             && !(lowest..=highest).contains(&claimed)
@@ -732,7 +771,7 @@ impl InstanceCore {
             };
             if !own.is_empty() {
                 let context = self.context();
-                prepare_call(&mut self.store, &self.limits);
+                prepare_call(&mut self.store, &self.limits, "restore");
                 self.store.data_mut().replaying = true;
                 let lifecycle = self.plugin.pluribus_plugin_lifecycle();
                 let result = tokio::time::timeout(
@@ -747,7 +786,11 @@ impl InstanceCore {
                 .and_then(|r| r);
                 self.store.data_mut().replaying = false;
                 outcome = result
-                    .map_err(|e| RuntimeError::trap(format!("replay trapped: {e:#}")))?
+                    .map_err(|e| {
+                        self.store
+                            .data()
+                            .resource_error(format!("replay trapped: {e:#}"))
+                    })?
                     .map_err(|e| plugin_failure(&e))?;
                 if !outcome.events.is_empty()
                     || outcome.checkpoint != own.last().map(|e| e.sequence)
@@ -806,6 +849,41 @@ impl InstanceCore {
         Ok(())
     }
 
+    async fn skip_with_events_inner(
+        &mut self,
+        checkpoint: u64,
+        events: Vec<AppendRequest>,
+    ) -> Result<Outcome, RuntimeError> {
+        self.store.data_mut().release_handles();
+        let receipt = self
+            .delivery_store
+            .commit(DeliveryCommit {
+                cursor: self.cursor.clone(),
+                expected_checkpoint: self.checkpoint,
+                checkpoint: Some(checkpoint),
+                mutations: Vec::new(),
+                events,
+            })
+            .await
+            .map_err(|error| RuntimeError::new(format!("cannot skip delivery: {error}")))?;
+        self.checkpoint = receipt.checkpoint;
+        Ok(Outcome {
+            events: receipt.events,
+            checkpoint: receipt.checkpoint,
+        })
+    }
+
+    async fn skip_with_events(
+        &mut self,
+        checkpoint: u64,
+        events: Vec<AppendRequest>,
+    ) -> Result<Outcome, RuntimeError> {
+        self.begin_lifecycle()?;
+        let result = self.skip_with_events_inner(checkpoint, events).await;
+        self.interrupted = false;
+        result
+    }
+
     /// Final call before teardown. Best-effort: durable correctness must not
     /// depend on it.
     ///
@@ -832,7 +910,7 @@ impl InstanceCore {
         // deadline rather than inheriting that cancellation.
         self.cancellation.reset();
         let context = self.context();
-        prepare_call(&mut self.store, &self.limits);
+        prepare_call(&mut self.store, &self.limits, "execution");
         let result = self
             .plugin
             .pluribus_plugin_lifecycle()
@@ -842,7 +920,11 @@ impl InstanceCore {
             self.store.data_mut().release_handles();
         }
         let outcome = result
-            .map_err(|error| RuntimeError::trap(format!("stop trapped: {error:#}")))?
+            .map_err(|error| {
+                self.store
+                    .data()
+                    .resource_error(format!("stop trapped: {error:#}"))
+            })?
             .map_err(|error| plugin_failure(&error))?;
         self.commit(&outcome, None, CommitPhase::Stop).await
     }
@@ -911,8 +993,9 @@ impl InstanceCore {
 
 /// Arms the wall-clock ceiling for one call. The epoch ticker interrupts the
 /// guest when it runs out.
-fn prepare_call(store: &mut Store<HostState>, limits: &RuntimeLimits) {
+fn prepare_call(store: &mut Store<HostState>, limits: &RuntimeLimits, phase: &str) {
     store.data_mut().emit_call = false;
+    store.data_mut().reset_resource_evidence(phase);
     let deadline = Instant::now() + limits.call_timeout;
     store.data_mut().call_deadline = Some(deadline);
     *store.data().io_completion_deadline.lock().unwrap() = None;
@@ -930,6 +1013,21 @@ fn prepare_call(store: &mut Store<HostState>, limits: &RuntimeLimits) {
         Ok(wasmtime::UpdateDeadline::Yield(1))
     });
     store.set_epoch_deadline(1);
+}
+
+fn resource_error_from_evidence(
+    evidence: &Arc<std::sync::Mutex<Option<ResourceExhaustion>>>,
+    message: impl Into<String>,
+) -> RuntimeError {
+    let message = message.into();
+    evidence
+        .lock()
+        .ok()
+        .and_then(|evidence| evidence.clone())
+        .map_or_else(
+            || RuntimeError::trap(message.clone()),
+            |evidence| RuntimeError::resource_limit(evidence, message.clone()),
+        )
 }
 
 fn convert_mutations(mutations: &[types::Mutation]) -> Result<Vec<StateMutation>, RuntimeError> {
@@ -975,7 +1073,9 @@ struct HostState {
     identity: Option<String>,
     model: Option<String>,
     executor: tokio::runtime::Handle,
-    limits: StoreLimits,
+    limits: RuntimeLimiter,
+    resource_evidence: Arc<std::sync::Mutex<Option<ResourceExhaustion>>>,
+    resource_phase: Arc<std::sync::Mutex<String>>,
     delivery: Delivery,
     cancelled: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -1004,6 +1104,99 @@ struct HostState {
     wasi_hooks: wasi_http::Hooks,
     runner: runner::HostRunner,
     emit_call: bool,
+}
+
+struct RuntimeLimiter {
+    limits: StoreLimits,
+    evidence: Arc<std::sync::Mutex<Option<ResourceExhaustion>>>,
+    phase: Arc<std::sync::Mutex<String>>,
+    memory_limit: usize,
+    table_limit: usize,
+}
+
+impl RuntimeLimiter {
+    fn new(
+        memory_limit: usize,
+        evidence: Arc<std::sync::Mutex<Option<ResourceExhaustion>>>,
+        phase: Arc<std::sync::Mutex<String>>,
+    ) -> Self {
+        Self {
+            limits: StoreLimitsBuilder::new()
+                .memory_size(memory_limit)
+                .memories(4)
+                .tables(8)
+                .trap_on_grow_failure(true)
+                .build(),
+            evidence,
+            phase,
+            memory_limit,
+            table_limit: usize::MAX,
+        }
+    }
+
+    fn record(&self, resource: &str, current: usize, requested: usize, limit: usize) {
+        if let Ok(mut evidence) = self.evidence.lock()
+            && evidence.is_none()
+        {
+            let phase = self
+                .phase
+                .lock()
+                .map_or_else(|_| "unknown".into(), |p| p.clone());
+            *evidence = Some(ResourceExhaustion {
+                resource: resource.into(),
+                current_bytes: current,
+                requested_bytes: requested,
+                limit_bytes: limit,
+                phase,
+                job_id: None,
+                session_id: None,
+            });
+        }
+    }
+}
+
+impl ResourceLimiter for RuntimeLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > self.memory_limit {
+            self.record("memory", current, desired, self.memory_limit);
+        }
+        self.limits.memory_growing(current, desired, maximum)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.limits.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > self.table_limit {
+            self.record("table", current, desired, self.table_limit);
+        }
+        self.limits.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.limits.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        32
+    }
+    fn tables(&self) -> usize {
+        8
+    }
+    fn memories(&self) -> usize {
+        4
+    }
 }
 
 /// One connection and the directions still running over it. The incoming
@@ -1081,18 +1274,20 @@ impl HostState {
     ) -> Self {
         let state_namespace = StateNamespace::new(delivery.instance_id.clone());
         let visible_blobs = delivery.visible_blobs.iter().cloned().collect();
+        let resource_evidence = Arc::new(std::sync::Mutex::new(None));
+        let resource_phase = Arc::new(std::sync::Mutex::new("startup".into()));
         Self {
             credentials: granted.credentials,
             model: granted.model,
             identity: granted.identity,
             executor: tokio::runtime::Handle::current(),
-            limits: StoreLimitsBuilder::new()
-                .memory_size(memory_bytes)
-                .memories(4)
-                .tables(8)
-                .instances(32)
-                .trap_on_grow_failure(true)
-                .build(),
+            limits: RuntimeLimiter::new(
+                memory_bytes,
+                resource_evidence.clone(),
+                resource_phase.clone(),
+            ),
+            resource_evidence,
+            resource_phase,
             delivery,
             cancelled,
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -1122,6 +1317,27 @@ impl HostState {
             runner: runner::HostRunner::default(),
             emit_call: false,
         }
+    }
+
+    fn reset_resource_evidence(&mut self, phase: &str) {
+        if let Ok(mut evidence) = self.resource_evidence.lock() {
+            *evidence = None;
+        }
+        if let Ok(mut current) = self.resource_phase.lock() {
+            *current = phase.into();
+        }
+    }
+
+    fn resource_error(&self, message: impl Into<String>) -> RuntimeError {
+        let message = message.into();
+        self.resource_evidence
+            .lock()
+            .ok()
+            .and_then(|evidence| evidence.clone())
+            .map_or_else(
+                || RuntimeError::trap(message.clone()),
+                |evidence| RuntimeError::resource_limit(evidence, message.clone()),
+            )
     }
 
     fn wit_agent(&self) -> types::Principal {
@@ -2000,7 +2216,20 @@ fn stream_plugin_error(error: StreamError) -> types::Error {
 }
 
 fn plugin_failure(error: &types::Error) -> RuntimeError {
-    RuntimeError::new(format!("{}: {}", error_code(error.code), error.message))
+    let message = format!("{}: {}", error_code(error.code), error.message);
+    if error.code == types::ErrorCode::ResourceExhausted
+        && let Some(details) = error
+            .details
+            .as_ref()
+            .and_then(|details| serde_json::from_slice::<ResourceExhaustion>(details).ok())
+    {
+        return RuntimeError {
+            message,
+            trapped: false,
+            resource_exhaustion: Some(Box::new(details)),
+        };
+    }
+    RuntimeError::new(message)
 }
 
 fn error_code(code: types::ErrorCode) -> &'static str {

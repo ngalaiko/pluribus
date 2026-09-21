@@ -317,6 +317,17 @@ Core-owned, recording what a delivery attempted:
 ```text
 activity.attempted                pluribus.activity-attempt/1
 activity.unknown                  pluribus.activity-attempt/1
+
+Core-owned, recording deferred cognition work after bounded host recovery:
+
+```text
+cognition.resource-exhausted     pluribus.cognition-resource-exhausted/1
+```
+
+The host stamps the node actor. It carries the failing input and request IDs,
+resource measurements, phase, remaining retry allowance, effect status, and
+checkpoint status. Its deduplication key is scoped to the cognition instance
+and failing input.
 ```
 
 See [persistent work](persistent-work.md).

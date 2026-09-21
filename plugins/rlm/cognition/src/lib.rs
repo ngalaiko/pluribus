@@ -2,6 +2,7 @@
 mod compaction;
 mod engine;
 mod jobs;
+mod metadata;
 mod provenance;
 mod storage;
 #[cfg(target_arch = "wasm32")]
@@ -17,6 +18,9 @@ mod component {
     };
     use pluribus::plugin::{events, state};
     thread_local! {static CONFIG:RefCell<Option<Config>>=const {RefCell::new(None)};}
+    mod view {
+        include!("view.rs");
+    }
     struct Cognition;
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../shared/run.rs"));
 
@@ -36,6 +40,7 @@ mod component {
             let outcome = setup(context.clone(), config)?;
             pluribus::plugin::runtime::ready(outcome.events, outcome.mutations).await?;
 
+            view::migrate()?;
             serve::<Self>(context).await
         }
 
@@ -60,11 +65,11 @@ mod component {
                 }
                 engine
             } else {
-                load_engine(&std::collections::BTreeMap::new(), &batch)?
+                view::load(&batch, &config)?
             };
             let mut replay = std::collections::BTreeMap::new();
             let before_sequence = engine.sequence;
-            let before = super::storage::records(&engine).map_err(failure)?;
+            let before = super::storage::records(&engine).map_err(storage_failure)?;
             let mut drafts = vec![];
             for event in &batch {
                 let Payload::Json(bytes) = &event.payload else {
@@ -108,9 +113,12 @@ mod component {
                 }
                 engine.now_ms = event.recorded_at_ms;
                 engine.sequence = event.sequence;
-                if event.event_type.starts_with("operator.")
+                if (event.event_type.starts_with("operator.")
+                    || event.event_type == "cognition.resource-exhausted")
                     && !(matches!(event.actor.kind, PrincipalKind::Node)
-                        && event.actor.id == format!("operator:{}", context.agent.id))
+                        && (event.actor.id == format!("operator:{}", context.agent.id)
+                            || (event.event_type == "cognition.resource-exhausted"
+                                && event.actor.id == context.agent.id)))
                 {
                     continue;
                 }
@@ -154,7 +162,8 @@ mod component {
                             .as_u64()
                             .unwrap_or(100)
                             .min(100)
-                            .min(remaining);
+                            .min(remaining)
+                            .min(u64::from(engine.resource_read_limit(session)));
                         let event_types: Vec<String> = match args.get("eventTypes") {
                             Some(filter) => match serde_json::from_value(filter.clone()) {
                                 Ok(types) => types,
@@ -308,7 +317,7 @@ mod component {
                                     drafts.push(resume(
                                         session,
                                         &value["id"],
-                                        Err(error.into()),
+                                        Err(error),
                                         &event.event_id,
                                     ));
                                     continue;
@@ -333,7 +342,7 @@ mod component {
                                     drafts.push(resume(
                                         session,
                                         &value["id"],
-                                        Err(error.into()),
+                                        Err(error),
                                         &event.event_id,
                                     ));
                                     continue;
@@ -356,7 +365,8 @@ mod component {
                         let limit = requested_limit
                             .unwrap_or(20)
                             .min(100)
-                            .min(u64::from(window.limit));
+                            .min(u64::from(window.limit))
+                            .min(u64::from(engine.resource_read_limit(session)));
                         let page = events::query(
                             &events::Filter {
                                 text_query: Some(text.to_owned()),
@@ -463,7 +473,14 @@ mod component {
                 }
             }
             if !replay_only {
-                let changes = record_changes(&before, &engine)?;
+                let mut changes = record_changes(&before, &engine)?;
+                changes.extend(view::index_changes(&changes)?);
+                changes.sort_by_key(|change| {
+                    change["key"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("engine/record/sequence/")
+                });
                 for group in changes.chunks(4) {
                     drafts.push(super::engine::Draft {
                         kind: "cognition.checkpoint".into(),
@@ -637,7 +654,7 @@ mod component {
         drafts: &mut Vec<super::engine::Draft>,
     ) -> Result<(), Error> {
         let mut record = std::collections::BTreeMap::new();
-        super::storage::insert_record(&mut record, field, id, value).map_err(failure)?;
+        super::storage::insert_record(&mut record, field, id, value).map_err(storage_failure)?;
         if record
             .iter()
             .any(|(key, bytes)| before.get(key) != Some(bytes))
@@ -650,11 +667,19 @@ mod component {
         }
         Ok(())
     }
+    fn storage_failure(error: super::storage::BoundError) -> Error {
+        Error {
+            code: ErrorCode::ResourceExhausted,
+            message: error.to_string(),
+            retryable: false,
+            details: Some(serde_json::to_vec(&super::storage::resource_details(&error)).unwrap()),
+        }
+    }
     fn record_changes(
         old: &std::collections::BTreeMap<String, Vec<u8>>,
         after: &Engine,
     ) -> Result<Vec<Value>, Error> {
-        let new = super::storage::records(after).map_err(failure)?;
+        let new = super::storage::records(after).map_err(storage_failure)?;
         let mut changes = Vec::new();
         for (key, value) in &new {
             if old.get(key) != Some(value) {
@@ -687,59 +712,6 @@ mod component {
             }
         }
         Ok(entries)
-    }
-    fn load_engine(
-        overlay: &std::collections::BTreeMap<String, Vec<u8>>,
-        batch: &[Event],
-    ) -> Result<Engine, Error> {
-        let mut engine = serde_json::to_value(Engine::default()).map_err(failure)?;
-        let mut entries = std::collections::BTreeMap::new();
-        for field in [
-            "jobs", "inbox", "tasks", "calls", "budgets", "queue", "now_ms", "sequence",
-        ] {
-            entries.extend(read_records(&format!("engine/record/{field}/"))?);
-        }
-        for event in batch {
-            if event.event_type == "observation.received" {
-                entries.extend(read_records(&super::storage::record_prefix(
-                    "observations_seen",
-                    &event.event_id,
-                ))?);
-            }
-            if let Payload::Json(bytes) = &event.payload {
-                let value: Value = serde_json::from_slice(bytes).map_err(failure)?;
-                if let Some(key) =
-                    super::engine::result_key(&event.event_type, &event.event_id, &value)
-                {
-                    entries.extend(read_records(&super::storage::record_prefix(
-                        "seen_results",
-                        &key,
-                    ))?);
-                }
-            }
-        }
-        entries.extend(overlay.clone());
-        let mut groups: std::collections::BTreeMap<String, Vec<u8>> =
-            std::collections::BTreeMap::new();
-        for (key, bytes) in entries {
-            let prefix = key
-                .rsplit_once('/')
-                .ok_or_else(|| failure("invalid record key"))?
-                .0
-                .to_owned();
-            // A null record masks the remaining fragments of its prior value.
-            if let Some(current) = groups.get(&prefix)
-                && serde_json::from_slice::<super::storage::Record>(current).is_ok()
-            {
-                continue;
-            }
-            groups.entry(prefix).or_default().extend(bytes);
-        }
-        for bytes in groups.into_values() {
-            let record = serde_json::from_slice(&bytes).map_err(failure)?;
-            super::storage::apply_record(&mut engine, record);
-        }
-        serde_json::from_value(engine).map_err(failure)
     }
     fn failure(e: impl std::fmt::Display) -> Error {
         Error {

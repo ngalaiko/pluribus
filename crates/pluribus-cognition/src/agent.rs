@@ -76,6 +76,7 @@ pub struct Agent<P, R> {
     /// deliveries; restoring one is an operator decision.
     failed: BTreeMap<String, String>,
     backoff: BTreeMap<String, (u32, i64)>,
+    reduced_batches: BTreeSet<String>,
     health_through: u64,
 }
 
@@ -135,6 +136,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             batch: 100,
             failed: BTreeMap::new(),
             backoff: BTreeMap::new(),
+            reduced_batches: BTreeSet::new(),
             health_through: 0,
         }
     }
@@ -620,7 +622,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                     {
                         handle.reset();
                     }
-                    self.recovered(&id).await?;
+                    self.recovered(&id, Some(&worker.batch)).await?;
                     progress.events_committed += outcome.events.len();
                 }
                 Err(_)
@@ -631,7 +633,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                 {
                     self.cancel_worker(&id, &worker.batch).await?;
                 }
-                Err(error) if error.trapped() => {
+                Err(error) if error.trapped() && error.resource_exhaustion().is_none() => {
                     self.quarantine(
                         &id,
                         worker
@@ -643,7 +645,17 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                     )
                     .await?;
                 }
-                Err(error) => self.defer(&id, &error).await?,
+                Err(error) if error.resource_exhaustion().is_some() => {
+                    if let Err(restart) = self
+                        .restart_after_resource(&id, &worker.batch, error.resource_exhaustion())
+                        .await
+                    {
+                        self.mark_resource_restart_failure(&id, &restart).await?;
+                        continue;
+                    }
+                    self.defer_delivery(&id, &worker.batch, &error).await?;
+                }
+                Err(error) => self.defer_delivery(&id, &worker.batch, &error).await?,
             }
         }
         Ok(())
@@ -683,7 +695,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         fresh.start();
         self.cancellations.insert(id.into(), fresh.cancellation());
         self.instances.insert(id.into(), fresh);
-        self.recovered(id).await?;
+        self.recovered(id, None).await?;
         Ok(())
     }
 
@@ -731,16 +743,35 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                 };
                 match event.request.event_type.as_str() {
                     "component.backoff" => {
+                        let request_id = payload["requestEventId"].as_str();
+                        let key = request_id
+                            .map_or_else(|| id.to_owned(), |request| format!("{id}\n{request}"));
+                        if request_id.is_some() {
+                            self.reduced_batches.insert(id.to_owned());
+                        }
+                        let failures = payload["failures"]
+                            .as_u64()
+                            .unwrap_or(1)
+                            .min(if request_id.is_some() { 3 } else { 32 });
                         self.backoff.insert(
-                            id.into(),
+                            key,
                             (
-                                payload["failures"].as_u64().unwrap_or(1).min(32) as u32,
+                                u32::try_from(failures).unwrap_or(32),
                                 payload["retryAtMs"].as_i64().unwrap_or(0),
                             ),
                         );
                     }
                     "component.recovered" => {
                         self.backoff.remove(id);
+                        if let Some(requests) = payload["requestEventIds"].as_array() {
+                            for request in requests.iter().filter_map(Value::as_str) {
+                                self.backoff.remove(&format!("{id}\n{request}"));
+                            }
+                        } else {
+                            self.backoff
+                                .retain(|key, _| key != id && !key.starts_with(&format!("{id}\n")));
+                            self.reduced_batches.remove(id);
+                        }
                         self.failed.remove(id);
                     }
                     "component.failed" => {
@@ -759,27 +790,170 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         Ok(())
     }
 
-    async fn defer(&mut self, id: &str, error: &RuntimeError) -> Result<(), AgentError> {
-        let failures = self
-            .backoff
-            .get(id)
-            .map_or(1, |(n, _)| n.saturating_add(1).min(32));
+    async fn defer_delivery(
+        &mut self,
+        id: &str,
+        batch: &[CommittedEvent],
+        error: &RuntimeError,
+    ) -> Result<(), AgentError> {
+        let resource = error.resource_exhaustion();
+        let request_id = resource.and_then(|_| batch.first().map(|event| event.event_id.as_str()));
+        let key = request_id.map_or_else(|| id.to_owned(), |request| format!("{id}\n{request}"));
+        let failures = self.backoff.get(&key).map_or(1, |(n, _)| {
+            n.saturating_add(1)
+                .min(if resource.is_some() { 3 } else { 32 })
+        });
+        if resource.is_some() {
+            self.reduced_batches.insert(id.to_owned());
+        }
+        if resource.is_some() && batch.is_empty() && failures >= 3 {
+            self.mark_resource_restart_failure(id, error).await?;
+            self.backoff.remove(&key);
+            return Ok(());
+        }
+        if let Some(resource) = resource
+            && failures >= 3
+            && batch.len() == 1
+        {
+            let source = &batch[0];
+            let effect_status = if matches!(
+                source.request.event_type.as_str(),
+                "model.requested" | "capability.requested" | "code.evaluate-requested"
+            ) {
+                "outcome-unknown"
+            } else {
+                "not-started"
+            };
+            let deferred = self
+                .router
+                .resource_exhaustion_request(
+                    id,
+                    source,
+                    0,
+                    serde_json::json!({
+                        "resource": resource.resource,
+                        "currentBytes": resource.current_bytes,
+                        "requestedBytes": resource.requested_bytes,
+                        "limitBytes": resource.limit_bytes,
+                        "phase": resource.phase,
+                    }),
+                    effect_status,
+                    "deferred-before-cursor",
+                    resource.job_id.clone(),
+                    resource.session_id.clone(),
+                )
+                .map_err(AgentError::Router)?;
+            self.instances
+                .get_mut(id)
+                .ok_or_else(|| AgentError::UnknownInstance(id.to_owned()))?
+                .skip_with_events(source.sequence, vec![deferred])
+                .await
+                .map_err(AgentError::Runtime)?;
+            self.backoff.remove(&key);
+            return Ok(());
+        }
         let delay = (1000_i64 << failures.saturating_sub(1).min(6)).min(60_000);
         let retry_at = self.admission_now_ms.saturating_add(delay);
-        self.router.append_health("component.backoff", serde_json::json!({
-            "instanceId": id, "reason": error.to_string(), "failures": failures, "retryAtMs": retry_at
-        })).await.map_err(AgentError::Router)?;
-        self.backoff.insert(id.into(), (failures, retry_at));
+        self.router
+            .append_health(
+                "component.backoff",
+                serde_json::json!({
+                    "instanceId": id, "requestEventId": request_id,
+                "phase": resource.map(|r| r.phase.clone()), "reason": error.to_string(),
+                    "failures": failures, "retryAtMs": retry_at
+                }),
+            )
+            .await
+            .map_err(AgentError::Router)?;
+        self.backoff.insert(key, (failures, retry_at));
         Ok(())
     }
 
-    async fn recovered(&mut self, id: &str) -> Result<(), AgentError> {
-        if self.backoff.contains_key(id) {
+    async fn restart_after_resource(
+        &mut self,
+        id: &str,
+        batch: &[CommittedEvent],
+        resource: Option<&pluribus_runtime_wasm::ResourceExhaustion>,
+    ) -> Result<(), AgentError> {
+        let old = self
+            .instances
+            .remove(id)
+            .ok_or_else(|| AgentError::UnknownInstance(id.to_owned()))?;
+        let pinned = old.pinned_session();
+        let checkpoint = if pinned {
+            batch
+                .last()
+                .map_or(old.checkpoint(), |event| event.sequence)
+        } else {
+            old.checkpoint()
+        };
+        if pinned {
             self.router
-                .append_health("component.recovered", serde_json::json!({"instanceId": id}))
+                .fail_sessions_with_resource(
+                    id,
+                    batch,
+                    resource.map(|resource| serde_json::to_value(resource).unwrap_or_default()),
+                )
+                .await
+                .map_err(AgentError::Router)?;
+        }
+        let mut fresh = old.restart().await.map_err(AgentError::Runtime)?;
+        fresh.init().await.map_err(AgentError::Runtime)?;
+        fresh.skip(checkpoint).await.map_err(AgentError::Runtime)?;
+        fresh.start();
+        self.cancellations
+            .insert(id.to_owned(), fresh.cancellation());
+        self.instances.insert(id.to_owned(), fresh);
+        Ok(())
+    }
+
+    async fn mark_resource_restart_failure(
+        &mut self,
+        id: &str,
+        error: &(dyn fmt::Display + Sync),
+    ) -> Result<(), AgentError> {
+        self.router
+            .append_health(
+                "component.failed",
+                serde_json::json!({
+                    "instanceId": id,
+                    "reason": error.to_string(),
+                    "code": "resource-exhausted",
+                    "health": "unhealthy",
+                }),
+            )
+            .await
+            .map_err(AgentError::Router)?;
+        self.failed.insert(id.to_owned(), error.to_string());
+        Ok(())
+    }
+
+    async fn recovered(
+        &mut self,
+        id: &str,
+        batch: Option<&[CommittedEvent]>,
+    ) -> Result<(), AgentError> {
+        let request_ids: Vec<_> = batch
+            .unwrap_or_default()
+            .iter()
+            .map(|event| event.event_id.as_str().to_owned())
+            .collect();
+        let has_matching = self.backoff.contains_key(id)
+            || request_ids
+                .iter()
+                .any(|request| self.backoff.contains_key(&format!("{id}\n{request}")));
+        if has_matching {
+            self.router
+                .append_health(
+                    "component.recovered",
+                    serde_json::json!({"instanceId": id, "requestEventIds": request_ids}),
+                )
                 .await
                 .map_err(AgentError::Router)?;
             self.backoff.remove(id);
+            for request in request_ids {
+                self.backoff.remove(&format!("{id}\n{request}"));
+            }
         }
         Ok(())
     }
@@ -923,10 +1097,10 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
     #[allow(clippy::too_many_lines)]
     async fn deliver(&mut self, instance_id: &str) -> Result<Option<usize>, AgentError> {
         if self.failed.contains_key(instance_id)
-            || self
-                .backoff
-                .get(instance_id)
-                .is_some_and(|(_, until)| *until > self.admission_now_ms)
+            || self.backoff.iter().any(|(key, (_, until))| {
+                (key == instance_id || key.starts_with(&format!("{instance_id}\n")))
+                    && *until > self.admission_now_ms
+            })
         {
             return Ok(None);
         }
@@ -946,7 +1120,9 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                 .poll(
                     instance_id,
                     checkpoint,
-                    if self.external.contains(instance_id) {
+                    if self.reduced_batches.contains(instance_id)
+                        || self.external.contains(instance_id)
+                    {
                         1
                     } else if whole_stream {
                         self.batch.min(MAX_COGNITION_BATCH)
@@ -979,7 +1155,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
                     );
                     return Ok(Some(0));
                 }
-                self.recovered(instance_id).await?;
+                self.recovered(instance_id, Some(&pending)).await?;
                 return Ok(None);
             }
             checkpoint = pending.last().unwrap().sequence;
@@ -1151,18 +1327,30 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             .await;
         match handled {
             Ok(outcome) => {
-                self.recovered(instance_id).await?;
+                self.recovered(instance_id, Some(&pending)).await?;
                 Ok(Some(outcome.events.len()))
             }
             // A reported failure leaves the instance alive and the batch
             // unchecked, so it is retried. A trap is not retryable.
-            Err(error) if error.trapped() => {
+            Err(error) if error.trapped() && error.resource_exhaustion().is_none() => {
                 self.quarantine(instance_id, checkpoint, &pending, &error)
                     .await?;
                 Ok(None)
             }
+            Err(error) if error.resource_exhaustion().is_some() => {
+                if let Err(restart) = self
+                    .restart_after_resource(instance_id, &pending, error.resource_exhaustion())
+                    .await
+                {
+                    self.mark_resource_restart_failure(instance_id, &restart)
+                        .await?;
+                    return Ok(None);
+                }
+                self.defer_delivery(instance_id, &pending, &error).await?;
+                Ok(None)
+            }
             Err(error) => {
-                self.defer(instance_id, &error).await?;
+                self.defer_delivery(instance_id, &pending, &error).await?;
                 Ok(None)
             }
         }
