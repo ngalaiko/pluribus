@@ -1,5 +1,8 @@
 //! A pinned session must keep its interpreter heap across deliveries.
 
+#[path = "support/memory_eval_scoring.rs"]
+mod memory_eval_scoring;
+
 use pluribus_cognition::{Agent, AuthorityResolver, Router};
 use pluribus_core::{
     AppendRequest, Audience, Authority, AuthorityId, CapabilityName, CommittedEvent,
@@ -14,7 +17,9 @@ use pluribus_runtime_wasm::{
 };
 use pluribus_store_sqlite::SqliteEventStore;
 use serde_json::{Value, json};
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -1199,6 +1204,393 @@ fn yield_control(arguments: Value) -> Value {
     let mut content = json!([{"kind":"tool-call","name":"yield","call_id":"decision"}]);
     content[0]["arguments"] = arguments;
     content
+}
+
+struct MemoryEvalCase {
+    id: &'static str,
+    key: &'static str,
+    initial: &'static str,
+    expected: &'static str,
+    stale: &'static [&'static str],
+}
+
+fn memory_eval_cases() -> [MemoryEvalCase; 5] {
+    [
+        MemoryEvalCase {
+            id: "recall-after-distraction",
+            key: "launch codename",
+            initial: "northstar",
+            expected: "northstar",
+            stale: &[],
+        },
+        MemoryEvalCase {
+            id: "correction-resists-stale-fact",
+            key: "deployment region",
+            initial: "us-east",
+            expected: "eu-north",
+            stale: &["us-east"],
+        },
+        MemoryEvalCase {
+            id: "compaction-preserves-memory",
+            key: "storage decision",
+            initial: "sqlite",
+            expected: "sqlite",
+            stale: &[],
+        },
+        MemoryEvalCase {
+            id: "restart-restores-memory",
+            key: "reply style",
+            initial: "terse replies",
+            expected: "terse replies",
+            stale: &[],
+        },
+        MemoryEvalCase {
+            id: "source-validity",
+            key: "retained object",
+            initial: "blue kettle",
+            expected: "blue kettle",
+            stale: &[],
+        },
+    ]
+}
+
+fn run_memory_provider(request: &CommittedEvent) -> Value {
+    let command = std::env::var("PLURIBUS_MEMORY_EVAL_PROVIDER_CMD").unwrap();
+    let mut body = payload(request);
+    body["model"] =
+        json!(std::env::var("PLURIBUS_MEMORY_EVAL_MODEL").expect("set PLURIBUS_MEMORY_EVAL_MODEL"));
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        serde_json::to_writer(&mut input, &body).unwrap();
+        input.write_all(b"\n").unwrap();
+    });
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let read = |stream: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stream.take(1_048_577).read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let out = read(Box::new(stdout));
+    let err = read(Box::new(stderr));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("provider bridge exceeded 120 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    writer.join().unwrap();
+    let output = out.join().unwrap();
+    let error = err.join().unwrap();
+    assert!(
+        status.success(),
+        "provider bridge failed: {}",
+        String::from_utf8_lossy(&error)
+    );
+    assert!(
+        output.len() <= 1_048_576,
+        "provider completion exceeds 1 MiB"
+    );
+    let completion: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        completion["call_id"],
+        payload(request)["call_id"],
+        "provider returned wrong call_id"
+    );
+    let _: pluribus_model::Completion =
+        serde_json::from_value(completion.clone()).expect("canonical provider completion");
+    completion
+}
+
+#[derive(Default)]
+struct MemoryEvalRun {
+    handled: std::collections::BTreeSet<String>,
+    completions: Vec<Value>,
+    forced_cells: usize,
+    compacted: bool,
+    live: bool,
+}
+
+async fn drive_eval(agent: &mut Agent<AllowAll, TestAuthority>) {
+    tokio::time::timeout(std::time::Duration::from_mins(1), drive(agent, 1))
+        .await
+        .expect("memory evaluation runtime did not become idle within 60 seconds");
+}
+
+async fn finish_eval_turn(
+    store: &Arc<SqliteEventStore<Metadata>>,
+    agent: &mut Agent<AllowAll, TestAuthority>,
+    run: &mut MemoryEvalRun,
+    origin: &CommittedEvent,
+    scripted_reply: &str,
+    force_compaction: bool,
+) -> String {
+    let mut compact_call = false;
+    for step in 0..48 {
+        drive_eval(agent).await;
+        if compact_call {
+            let state = projection(store).await;
+            run.compacted |= state["tasks"].as_object().is_some_and(|tasks| {
+                tasks.values().any(|task| {
+                    task["context"]["workingSummaryProvenance"]["verified"] == true
+                        && task["context"]["workingSummary"].is_object()
+                })
+            });
+        }
+        let events = store
+            .read(&StreamId::new("personal"), origin.sequence, 10000)
+            .await
+            .unwrap();
+        if let Some(reply) = events.iter().rev().find_map(|event| {
+            let value = payload(event);
+            (event.request.event_type == "capability.requested"
+                && value["capability"] == "telegram.reply")
+                .then(|| value["arguments"]["text"].as_str().map(str::to_owned))
+                .flatten()
+        }) {
+            return reply;
+        }
+        let Some(request) = model_requests(store)
+            .await
+            .into_iter()
+            .find(|event| !run.handled.contains(event.event_id.as_str()))
+        else {
+            panic!("evaluation stalled without reply or model request at step {step}");
+        };
+        run.handled.insert(request.event_id.as_str().to_owned());
+        let body = payload(&request);
+        let tools = body["tools"].as_array().unwrap();
+        let compact = tools.iter().any(|tool| tool["name"] == "compact");
+        let routing = tools.iter().any(|tool| tool["name"] == "associate");
+        compact_call |= compact;
+        let force_cell =
+            force_compaction && !routing && !compact && !run.compacted && run.forced_cells < 12;
+        let completion = if force_cell {
+            run.forced_cells += 1;
+            json!({"call_id":body["call_id"],"message":{"role":"assistant","content":[{"kind":"tool-call","name":"js","call_id":format!("pressure-{}",run.forced_cells),"arguments":{"code":format!("/*{}*/ return {{step:{}}};", "x".repeat(6000), run.forced_cells)}}]},"stop_reason":{"kind":"tool-call"}})
+        } else if run.live {
+            let request = request.clone();
+            let completion = tokio::task::spawn_blocking(move || run_memory_provider(&request))
+                .await
+                .unwrap();
+            run.completions.push(completion.clone());
+            completion
+        } else {
+            let content = if routing {
+                json!([{"kind":"tool-call","name":"associate","call_id":"route","arguments":{"action":"new","jobId":null}}])
+            } else if compact {
+                json!([{"kind":"tool-call","name":"compact","call_id":"compact","arguments":{"version":1,"objective":"answer the memory question","constraints":[],"decisions":[],"completedWork":[],"unresolvedQuestions":[],"durableFacts":[],"corrections":[],"sourceIds":[origin.event_id.as_str()]}}])
+            } else {
+                yield_control(json!({"action":"complete","reply":scripted_reply}))
+            };
+            json!({"call_id":body["call_id"],"message":{"role":"assistant","content":content},"stop_reason":{"kind":"tool-call"}})
+        };
+        let mut event = event_request("model.completed", &completion);
+        event.causation_id = Some(request.event_id.clone());
+        store.append(event).await.unwrap();
+    }
+    panic!("memory evaluation exceeded 48 model steps");
+}
+
+async fn run_memory_eval_case(case: &MemoryEvalCase, live: bool) -> Value {
+    let started = std::time::Instant::now();
+    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1), clock))
+            .await
+            .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    let mut run = MemoryEvalRun {
+        live,
+        ..Default::default()
+    };
+    let source = observation(&store, json!({"message":{"chat":{"id":42},"text":format!("Remember this decision: {} is {}. Acknowledge briefly.",case.key,case.initial)}})).await;
+    finish_eval_turn(&store, &mut agent, &mut run, &source, "acknowledged", false).await;
+    let mut evidence = source.event_id.as_str().to_owned();
+    if !case.stale.is_empty() {
+        let correction = observation(&store, json!({"message":{"chat":{"id":42},"text":format!("Correction: {} is {}. This replaces the earlier decision. Acknowledge briefly.",case.key,case.expected)}})).await;
+        finish_eval_turn(
+            &store,
+            &mut agent,
+            &mut run,
+            &correction,
+            "corrected",
+            false,
+        )
+        .await;
+        evidence = correction.event_id.as_str().to_owned();
+    }
+    for index in 0..8 {
+        let distraction = observation(&store, json!({"message":{"chat":{"id":42},"text":format!("Unrelated task {index}: what is {} plus 1? Reply with the number.",index+10)}})).await;
+        finish_eval_turn(
+            &store,
+            &mut agent,
+            &mut run,
+            &distraction,
+            &(index + 11).to_string(),
+            false,
+        )
+        .await;
+    }
+    let restarted = case.id == "restart-restores-memory";
+    if restarted {
+        drop(agent);
+        agent = persistent_agent(&store).await;
+    }
+    let question = observation(&store, json!({"message":{"chat":{"id":42},"text":format!("What is the current {}? Recover the original observation as evidence. Reply only with JSON: {{\"answer\":\"the exact value\",\"sourceIds\":[\"the supporting observation event ID\"]}}. Cite the correction when one exists.",case.key)}})).await;
+    let fixture_reply = json!({"answer":case.expected,"sourceIds":[evidence]}).to_string();
+    let requires_compaction = case.id == "compaction-preserves-memory";
+    let reply = finish_eval_turn(
+        &store,
+        &mut agent,
+        &mut run,
+        &question,
+        &fixture_reply,
+        requires_compaction,
+    )
+    .await;
+    let mut result = memory_eval_scoring::score_case(
+        case.id,
+        &reply,
+        case.expected,
+        case.stale,
+        &[evidence],
+        memory_eval_scoring::Transitions {
+            requires_compaction,
+            compacted: run.compacted,
+            requires_restart: restarted,
+            restarted,
+        },
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        &run.completions,
+    );
+    result["scriptedPressureCells"] = json!(run.forced_cells);
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires explicit live provider bridge and model configuration"]
+async fn memory_evaluation_uses_packaged_cognition_and_provider_path() {
+    if std::env::var("PLURIBUS_MEMORY_EVAL_LIVE").as_deref() != Ok("1") {
+        eprintln!("memory evaluation disabled; set PLURIBUS_MEMORY_EVAL_LIVE=1");
+        return;
+    }
+    for key in [
+        "PLURIBUS_MEMORY_EVAL_PROVIDER_CMD",
+        "PLURIBUS_MEMORY_EVAL_MODEL",
+    ] {
+        assert!(
+            std::env::var(key).is_ok_and(|value| !value.trim().is_empty()),
+            "set {key}"
+        );
+    }
+    let mut cases = Vec::new();
+    for case in memory_eval_cases() {
+        cases.push(run_memory_eval_case(&case, true).await);
+    }
+    let report = json!({"schema":"pluribus.memory-evaluation/1","mode":"live","cases":cases});
+    let encoded = serde_json::to_string_pretty(&report).unwrap();
+    if let Ok(path) = std::env::var("PLURIBUS_MEMORY_EVAL_OUTPUT") {
+        std::fs::write(path, &encoded).unwrap();
+    }
+    println!("{encoded}");
+    assert!(
+        cases.iter().all(|case| case["valid"] == true),
+        "memory evaluation failed; inspect report"
+    );
+}
+
+macro_rules! memory_workflow_test {
+    ($name:ident, $index:expr) => {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn $name() {
+            let result = run_memory_eval_case(&memory_eval_cases()[$index], false).await;
+            assert_eq!(result["valid"], true, "{result}");
+        }
+    };
+}
+
+memory_workflow_test!(memory_evaluation_recall_workflow, 0);
+memory_workflow_test!(memory_evaluation_correction_workflow, 1);
+memory_workflow_test!(memory_evaluation_compaction_workflow, 2);
+memory_workflow_test!(memory_evaluation_restart_workflow, 3);
+memory_workflow_test!(memory_evaluation_citation_workflow, 4);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packaged_summary_sources_are_host_verified_without_mutating_checkpoint_state() {
+    let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let store = Arc::new(
+        SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1), clock.clone()))
+            .await
+            .unwrap(),
+    );
+    let mut agent = persistent_agent(&store).await;
+    let origin = observation(&store, json!({})).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), drive(&mut agent, 1))
+        .await
+        .expect("initial drive timeout");
+    let request = model_requests(&store).await.pop().unwrap();
+    let summary = |source: &str| json!({"version":1,"objective":"x","constraints":[],"decisions":[],"completedWork":[],"unresolvedQuestions":[],"durableFacts":[],"corrections":[],"sourceIds":[source]});
+    let bad = summary("fabricated-source");
+    scripted(&store, &request, json!([{"kind":"tool-call","call_id":"bad-js","name":"js","arguments":{"code":format!("var summary={}; checkpoint({{workingSummary:summary}}); return 1;", bad)}}])).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), drive(&mut agent, 1))
+        .await
+        .expect("bad drive timeout");
+    let events = store
+        .read(&StreamId::new("personal"), 0, 10000)
+        .await
+        .unwrap();
+    let checkpoint = events
+        .iter()
+        .find(|event| {
+            event.request.event_type == "code.completed"
+                && payload(event)["checkpoint"]["state"]["workingSummary"] == bad
+        })
+        .expect("checkpoint preserved");
+    assert_eq!(
+        payload(checkpoint)["checkpoint"]["state"]["workingSummary"],
+        bad
+    );
+    let state = projection(&store).await;
+    assert!(
+        state["tasks"][origin.event_id.as_str()]["context"]
+            .get("workingSummary")
+            .is_none()
+    );
+    assert!(state["tasks"][origin.event_id.as_str()]["context"]["workingSummaryError"].is_string());
+    let request = model_requests(&store).await.last().unwrap().clone();
+    let good = summary(origin.event_id.as_str());
+    scripted(&store, &request, json!([{"kind":"tool-call","call_id":"good-js","name":"js","arguments":{"code":format!("var summary={}; checkpoint({{workingSummary:summary}}); return 1;", good)}}])).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), drive(&mut agent, 1))
+        .await
+        .expect("good drive timeout");
+    assert_eq!(
+        projection(&store).await["tasks"][origin.event_id.as_str()]["context"]["workingSummary"],
+        good
+    );
+    drop(agent);
+    let _restored = persistent_agent(&store).await;
+    assert_eq!(
+        projection(&store).await["tasks"][origin.event_id.as_str()]["context"]["workingSummary"],
+        good
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

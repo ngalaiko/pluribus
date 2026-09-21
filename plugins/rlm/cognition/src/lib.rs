@@ -2,6 +2,7 @@
 mod compaction;
 mod engine;
 mod jobs;
+mod provenance;
 mod storage;
 #[cfg(target_arch = "wasm32")]
 mod component {
@@ -21,6 +22,7 @@ mod component {
 
     fn setup(_: Context, config: Vec<u8>) -> Result<Outcome, Error> {
         let parsed: Config = serde_json::from_slice(&config).map_err(failure)?;
+        parsed.budget.validate().map_err(failure)?;
         CONFIG.with_borrow_mut(|slot| *slot = Some(parsed));
         Ok(Outcome {
             events: vec![],
@@ -68,7 +70,7 @@ mod component {
                 let Payload::Json(bytes) = &event.payload else {
                     continue;
                 };
-                let value: Value = serde_json::from_slice(bytes).map_err(failure)?;
+                let mut value: Value = serde_json::from_slice(bytes).map_err(failure)?;
                 if event.actor.id == context.instance_id
                     && ["cognition.job-updated", "cognition.observation-associated"]
                         .contains(&event.event_type.as_str())
@@ -114,6 +116,12 @@ mod component {
                 }
                 if engine.result_seen(&event.event_type, &event.event_id, &value) {
                     continue;
+                }
+                if event.event_type == "model.completed" {
+                    validate_summary_provenance(&mut engine, &value)?;
+                }
+                if event.event_type == "code.completed" {
+                    validate_checkpoint_provenance(&mut engine, &mut value)?;
                 }
                 let generated = engine.event(
                     &config,
@@ -513,6 +521,111 @@ mod component {
             Value::String(encoded) => STANDARD.decode(encoded).map(Some).map_err(failure),
             _ => serde_json::from_value(value.clone()).map_err(failure),
         }
+    }
+
+    fn validate_summary_provenance(engine: &mut Engine, value: &Value) -> Result<(), Error> {
+        let Some(call_id) = value["call_id"].as_str() else {
+            return Ok(());
+        };
+        let Some(content) = value["message"]["content"].as_array() else {
+            return Ok(());
+        };
+        let Some(arguments) = content
+            .iter()
+            .find(|part| part["kind"] == "tool-call" && part["name"] == "compact")
+            .map(|part| &part["arguments"])
+        else {
+            return Ok(());
+        };
+        engine.begin_compaction_provenance(call_id);
+        let Ok(summary) = super::compaction::validate(arguments) else {
+            return Ok(());
+        };
+        let Some(scope) = engine.compaction_scope(call_id) else {
+            return Ok(());
+        };
+        let scope = match scope {
+            Ok(scope) => scope,
+            Err(error) => {
+                engine.set_compaction_provenance_error(call_id, error);
+                return Ok(());
+            }
+        };
+        let mut events = std::collections::BTreeMap::new();
+        for source_id in &summary.source_ids {
+            let event = match events::get(source_id) {
+                Ok(event) => event,
+                Err(_) => {
+                    engine.set_compaction_provenance_error(
+                        call_id,
+                        "working summary references an inaccessible source event".into(),
+                    );
+                    return Ok(());
+                }
+            };
+            events.insert(
+                source_id.clone(),
+                super::provenance::SourceEvent {
+                    sequence: event.sequence,
+                    original: event.event_type != "cognition.checkpoint",
+                },
+            );
+        }
+        if let Err(error) = super::provenance::validate(&summary, &events, scope) {
+            engine.set_compaction_provenance_error(call_id, error);
+        } else {
+            engine.set_compaction_provenance_verified(call_id);
+        }
+        Ok(())
+    }
+
+    fn validate_checkpoint_provenance(engine: &mut Engine, value: &mut Value) -> Result<(), Error> {
+        let Some(session) = value["sessionId"].as_str() else {
+            return Ok(());
+        };
+        engine.begin_checkpoint_provenance(session);
+        let Some(summary) = value.pointer("/checkpoint/state/workingSummary") else {
+            return Ok(());
+        };
+        let Ok(summary) = super::compaction::validate(summary) else {
+            return Ok(());
+        };
+        let Some(scope) = engine.checkpoint_scope(session) else {
+            return Ok(());
+        };
+        let scope = match scope {
+            Ok(scope) => scope,
+            Err(error) => {
+                engine.set_checkpoint_provenance_error(session, error);
+                return Ok(());
+            }
+        };
+        let mut events = std::collections::BTreeMap::new();
+        for source_id in &summary.source_ids {
+            let event = match events::get(source_id) {
+                Ok(event) => event,
+                Err(_) => {
+                    engine.set_checkpoint_provenance_error(
+                        session,
+                        "working summary references an inaccessible source event".into(),
+                    );
+                    return Ok(());
+                }
+            };
+            events.insert(
+                source_id.clone(),
+                super::provenance::SourceEvent {
+                    sequence: event.sequence,
+                    original: event.event_type != "cognition.checkpoint",
+                },
+            );
+        }
+        if let Err(error) = super::provenance::validate(&summary, &events, scope) {
+            engine.set_checkpoint_provenance_error(session, error);
+        } else {
+            engine.set_checkpoint_provenance_verified(session);
+        }
+        Ok(())
     }
     fn project_change(
         before: &std::collections::BTreeMap<String, Vec<u8>>,

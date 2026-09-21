@@ -95,8 +95,8 @@ coordinated at section boundaries; agents must not overwrite one another.
 
 ## Deferred evaluation
 
-Embeddings, semantic reranking, background extraction, and live-model quality
-benchmarks require evidence from the deterministic baseline first. Recursion is
+Embeddings, semantic reranking, and background extraction require evidence from
+evaluations first. The live-model harness is described in `memory-evaluations.md`. Recursion is
 available for large evidence sets; it is not mandatory for simple recall.
 
 ## Implementation contracts
@@ -104,15 +104,15 @@ available for large evidence sets; it is not mandatory for simple recall.
 | Area | Implementation | Acceptance |
 | --- | --- | --- |
 | History | `EventQuery`, SQLite schema 10/FTS5, one WIT `events.query` operation, cognition handler, REPL bridge | Literal search; newest-first sequence cursor; conversation/time/type filters; JS read behavior preserved |
-| Compaction | `cognition/src/compaction.rs` and engine transitions | Trigger above 48 KiB; summary at most 12 KiB; whole request at most 64 KiB; three malformed-response attempts; restart and amendment handling |
+| Compaction | `cognition/src/compaction.rs` and engine transitions | Trigger at configured token headroom or above 48 KiB; summary at most 12 KiB; whole request at most 64 KiB; three malformed-response attempts; restart and amendment handling |
 | State | REPL bootstrap serializer and restore path | At most 32 KiB UTF-8; JSON-only; automatic/explicit modes; legacy explicit restore; no source replay |
 | Invalid state | Cognition completion handling | Unsaved successful cells invalidate automatic snapshots; failed cells and explicit snapshots retain existing semantics |
 | Persistence | `cognition/src/jobs.rs` result references | Results above 1 KiB become event references; uncertain outcomes remain visible; 32 results of 8 KiB keep the job below 20 KiB |
 | Integration | Cognition memory and RLM tests | Older evidence retrieval, rejected arguments, exhausted cursors, correction, restart, automatic restore, and blocked execution after unsaved state |
 
 Search indexes at most 8,192 Unicode characters per source payload. Large records
-require reading the original event. Summary citations are model claims, not
-independently verified provenance. Deterministic scripts verify the mechanisms;
+require reading the original event. Summary citations are checked against accessible original events. This verifies
+existence and access, not semantic support. Deterministic scripts verify the mechanisms;
 live-model retention and recall remain unmeasured.
 
 Before deployment, time the schema migration against a database copy and measure

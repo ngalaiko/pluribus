@@ -16,6 +16,16 @@
       "items": {
         "type": "object"
       }
+    },
+    "budget": {
+      "type": "object",
+      "description": "Admission budget for the model bound to cognition. Token values are conservative estimates; configure them from the provider model descriptor.",
+      "properties": {
+        "contextTokens": {"type":"integer","minimum":1},
+        "outputReserveTokens": {"type":"integer","minimum":1},
+        "headroomTokens": {"type":"integer","minimum":0}
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

@@ -43,3 +43,15 @@ Continue until `nextBefore` is `null`, including after an empty filtered page.
 Empty queries are rejected; punctuation-only queries return an empty page.
 Queries are limited to 4,096 UTF-8 bytes. A conversation filter narrows results;
 it does not confer authority. Existing stream and delegated-range grants apply.
+
+# Working-summary provenance
+
+Working-summary source IDs are provenance claims. Acceptance requires each ID
+to resolve through the host event API in the current visibility context, to
+refer to an original event rather than a cognition checkpoint, and, for a
+delegated child, to fall inside that child’s authorized sequence window.
+Existence and scope checks do not establish that an event semantically
+supports a cited fact; semantic support remains a model claim and must be
+treated as untrusted. Restored summaries are exposed only when engine metadata
+records a successful verification; checkpoint payload fields cannot grant that
+status.

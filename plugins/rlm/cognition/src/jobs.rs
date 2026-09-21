@@ -85,6 +85,7 @@ mod tests {
         let config = Config {
             tools: vec![],
             components: vec![],
+            budget: Default::default(),
         };
         engine.event(
             &config,

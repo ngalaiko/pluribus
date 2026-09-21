@@ -11,6 +11,8 @@ pub struct Config {
     pub tools: Vec<Value>,
     #[serde(default)]
     pub components: Vec<Value>,
+    #[serde(default)]
+    pub budget: compaction::BudgetConfig,
 }
 #[derive(Default, Serialize, Deserialize)]
 pub struct Engine {
@@ -75,6 +77,12 @@ struct Task {
     compacting: bool,
     #[serde(default)]
     compaction_errors: u8,
+    #[serde(default)]
+    compaction_provenance_error: Option<String>,
+    #[serde(default)]
+    checkpoint_provenance_error: Option<String>,
+    #[serde(default)]
+    checkpoint_provenance_verified: bool,
 }
 
 /// A named slice of the event log. Passing one costs tens of bytes where
@@ -205,7 +213,9 @@ fn turn_context(task: &Task, now_ms: i64) -> Value {
                 put(key, value, &format!("/{key}"));
             }
         }
-        if let Some(summary) = task.context.get("workingSummary") {
+        if task.context["workingSummaryProvenance"]["verified"] == true
+            && let Some(summary) = task.context.get("workingSummary")
+        {
             put("workingSummary", summary, "/workingSummary");
         }
     } else {
@@ -241,7 +251,9 @@ fn turn_context(task: &Task, now_ms: i64) -> Value {
         if let Some(checkpoint) = task.context.get("checkpoint") {
             put("checkpoint", checkpoint, "/checkpoint");
         }
-        if let Some(summary) = task.context.get("workingSummary") {
+        if task.context["workingSummaryProvenance"]["verified"] == true
+            && let Some(summary) = task.context.get("workingSummary")
+        {
             put("workingSummary", summary, "/workingSummary");
         }
         put("input", &task.context[input], &format!("/{input}"));
@@ -421,6 +433,72 @@ fn unresolved(activity: &Value) -> bool {
 }
 
 impl Engine {
+    pub fn set_compaction_provenance_error(&mut self, call_id: &str, error: String) {
+        if let Some(session) = self.calls.get(call_id).cloned()
+            && let Some(task) = self.tasks.get_mut(&session)
+            && task.compacting
+        {
+            task.compaction_provenance_error = Some(error);
+        }
+    }
+
+    pub fn begin_compaction_provenance(&mut self, call_id: &str) {
+        if let Some(session) = self.calls.get(call_id).cloned()
+            && let Some(task) = self.tasks.get_mut(&session)
+            && task.compacting
+        {
+            task.compaction_provenance_error = None;
+        }
+    }
+
+    pub fn set_compaction_provenance_verified(&mut self, call_id: &str) {
+        if let Some(session) = self.calls.get(call_id).cloned()
+            && let Some(task) = self.tasks.get_mut(&session)
+            && task.compacting
+        {
+            task.compaction_provenance_error = None;
+        }
+    }
+
+    pub fn begin_checkpoint_provenance(&mut self, session: &str) {
+        if let Some(task) = self.tasks.get_mut(session) {
+            task.checkpoint_provenance_error = None;
+            task.checkpoint_provenance_verified = false;
+        }
+    }
+
+    pub fn set_checkpoint_provenance_error(&mut self, session: &str, error: String) {
+        if let Some(task) = self.tasks.get_mut(session) {
+            task.checkpoint_provenance_verified = false;
+            task.checkpoint_provenance_error = Some(error);
+        }
+    }
+
+    pub fn set_checkpoint_provenance_verified(&mut self, session: &str) {
+        if let Some(task) = self.tasks.get_mut(session) {
+            task.checkpoint_provenance_error = None;
+            task.checkpoint_provenance_verified = true;
+        }
+    }
+
+    pub fn compaction_scope(&self, call_id: &str) -> Option<Result<Option<(u64, u32)>, String>> {
+        let session = self.calls.get(call_id)?;
+        let task = self.tasks.get(session)?;
+        Some(if task.parent.is_some() && task.window.is_none() {
+            Err("working summary has no authorized delegated history range".into())
+        } else {
+            Ok(task.window.map(|window| (window.after, window.limit)))
+        })
+    }
+
+    pub fn checkpoint_scope(&self, session: &str) -> Option<Result<Option<(u64, u32)>, String>> {
+        let task = self.tasks.get(session)?;
+        Some(if task.parent.is_some() && task.window.is_none() {
+            Err("working summary has no authorized delegated history range".into())
+        } else {
+            Ok(task.window.map(|window| (window.after, window.limit)))
+        })
+    }
     pub fn records(&self) -> Result<BTreeMap<String, Vec<u8>>, serde_json::Error> {
         use crate::storage::insert_record;
         let mut records = BTreeMap::new();
@@ -1052,19 +1130,30 @@ impl Engine {
                     task.context["checkpoint"] = checkpoint.clone();
                     let changed_summary = checkpoint.pointer("/state/workingSummary")
                         != previous_checkpoint.pointer("/state/workingSummary");
+                    let verified = task.checkpoint_provenance_verified;
+                    task.checkpoint_provenance_verified = false;
                     if changed_summary
                         && let Some(summary) = checkpoint.pointer("/state/workingSummary")
                     {
-                        match compaction::validate(summary) {
-                            Ok(summary) => {
+                        let provenance_error = task.checkpoint_provenance_error.take();
+                        match (provenance_error, verified, compaction::validate(summary)) {
+                            (Some(error), _, _) => {
+                                task.context["workingSummaryError"] = json!(error);
+                            }
+                            (None, false, _) => {
+                                task.context["workingSummaryError"] =
+                                    json!("working summary provenance was not verified");
+                            }
+                            (None, true, Ok(summary)) => {
                                 task.context["workingSummary"] =
                                     serde_json::to_value(summary).unwrap();
+                                task.context["workingSummaryProvenance"] = json!({"verified":true});
                                 task.context
                                     .as_object_mut()
                                     .unwrap()
                                     .remove("workingSummaryError");
                             }
-                            Err(error) => {
+                            (None, true, Err(error)) => {
                                 task.context["workingSummaryError"] = json!(error);
                             }
                         }
@@ -1334,6 +1423,9 @@ impl Engine {
                 window,
                 compacting: false,
                 compaction_errors: 0,
+                compaction_provenance_error: None,
+                checkpoint_provenance_error: None,
+                checkpoint_provenance_verified: false,
                 messages: vec![
                     json!({"role":"system","content":[{"kind":"text","text":PROMPT}]}),
                     json!({"role":"user","content":[{"kind":"text","text":question} ]}),
@@ -1512,13 +1604,12 @@ impl Engine {
         let mut content = vec![json!({"kind":"text","text":envelope.to_string()})];
         content.extend(images);
         task.messages[1] = json!({"role":"user","content":content});
-        if serde_json::to_vec(&task.messages)
-            .is_ok_and(|bytes| bytes.len() > compaction::SOFT_LIMIT)
-        {
-            return self.compaction_request(session, call, cause);
-        }
-        if serde_json::to_vec(&task.messages).unwrap().len() > compaction::HARD_LIMIT {
+        let message_bytes = serde_json::to_vec(&task.messages).unwrap_or_default().len();
+        if message_bytes > compaction::HARD_LIMIT {
             return self.finish(session, Err("model context limit".into()), cause);
+        }
+        if compaction::admission(message_bytes, &config.budget) == compaction::Admission::Compact {
+            return self.compaction_request(config, session, call, cause);
         }
         if !valid_tool_history(&task.messages) {
             let reason =
@@ -1537,17 +1628,41 @@ impl Engine {
         } else {
             model_tools(task.parent.is_some())
         };
-        let mut payload = json!({"call_id":call,"messages":task.messages,"tools":tools,"max_output_tokens":4096,"jobId":task.root,"revision":task.revision});
+        let output_reserve = config
+            .budget
+            .output_reserve_tokens
+            .unwrap_or(compaction::DEFAULT_OUTPUT_RESERVE_TOKENS);
+        let mut payload = json!({"call_id":call,"messages":task.messages,"tools":tools,"max_output_tokens":output_reserve,"jobId":task.root,"revision":task.revision});
         if vision {
             payload["required_features"] = json!(["vision"]);
         }
-        if serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > compaction::HARD_LIMIT) {
+        let payload_bytes = serde_json::to_vec(&payload).map_or(usize::MAX, |bytes| bytes.len());
+        if payload_bytes > compaction::HARD_LIMIT {
             return self.finish(session, Err("model context limit".into()), cause);
+        }
+        match compaction::admission(payload_bytes, &config.budget) {
+            compaction::Admission::Compact => {
+                return self.compaction_request(config, session, call, cause);
+            }
+            compaction::Admission::Reject => {
+                return self.finish(
+                    session,
+                    Err("model context token budget exhausted".into()),
+                    cause,
+                );
+            }
+            compaction::Admission::Continue => {}
         }
         self.calls.insert(call.clone(), session.into());
         vec![draft("model.requested", payload, &task.origin)]
     }
-    fn compaction_request(&mut self, session: &str, call: String, cause: &str) -> Vec<Draft> {
+    fn compaction_request(
+        &mut self,
+        config: &Config,
+        session: &str,
+        call: String,
+        cause: &str,
+    ) -> Vec<Draft> {
         let task = &self.tasks[session];
         let Some(history) = compaction::bounded_messages(&task.messages) else {
             return self.finish(
@@ -1587,12 +1702,24 @@ impl Engine {
         }
         let origin = task.origin.clone();
         let tools = compaction::tools();
-        let payload = json!({"call_id":call,"messages":messages,"tools":tools,"max_output_tokens":4096,"jobId":root,"revision":revision});
+        let output_reserve = config
+            .budget
+            .output_reserve_tokens
+            .unwrap_or(compaction::DEFAULT_OUTPUT_RESERVE_TOKENS);
+        let payload = json!({"call_id":call,"messages":messages,"tools":tools,"max_output_tokens":output_reserve,"jobId":root,"revision":revision});
         let _ = task;
-        if serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > compaction::HARD_LIMIT) {
+        let payload_bytes = serde_json::to_vec(&payload).map_or(usize::MAX, |bytes| bytes.len());
+        if payload_bytes > compaction::HARD_LIMIT {
             return self.finish(
                 session,
                 Err("compaction request exceeds the hard context ceiling".into()),
+                cause,
+            );
+        }
+        if !compaction::token_budget_ok(payload_bytes, &config.budget) {
+            return self.finish(
+                session,
+                Err("compaction request exceeds the configured input token budget".into()),
                 cause,
             );
         }
@@ -1617,13 +1744,20 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
-        let error = if calls.len() != 1 || calls[0]["name"] != "compact" {
+        let provenance_error = self
+            .tasks
+            .get_mut(session)
+            .and_then(|task| task.compaction_provenance_error.take());
+        let error = if let Some(error) = provenance_error {
+            error
+        } else if calls.len() != 1 || calls[0]["name"] != "compact" {
             "compaction requires exactly one compact tool call".to_owned()
         } else {
             match compaction::validate(&calls[0]["arguments"]) {
                 Ok(summary) => {
                     let task = self.tasks.get_mut(session).unwrap();
                     task.context["workingSummary"] = serde_json::to_value(&summary).unwrap();
+                    task.context["workingSummaryProvenance"] = json!({"verified":true});
                     task.context
                         .as_object_mut()
                         .unwrap()
@@ -2110,6 +2244,7 @@ mod tests {
         Config {
             tools: vec![],
             components: vec![],
+            budget: compaction::BudgetConfig::default(),
         }
     }
     #[test]
@@ -2419,6 +2554,38 @@ mod tests {
         assert_eq!(e.tasks["one"].control_errors, 1);
     }
     #[test]
+    fn configured_context_compacts_below_transport_limit_and_reserves_output() {
+        let mut c = config();
+        c.budget.context_tokens = Some(40_000);
+        c.budget.output_reserve_tokens = Some(2048);
+        let mut e = Engine::default();
+        let request = observe(&mut e, &c, "one", json!({})).remove(0);
+        assert_eq!(request.payload["max_output_tokens"], 2048);
+        let messages = &mut e.tasks.get_mut("one").unwrap().messages;
+        messages.push(json!({"role":"assistant","content":[{"kind":"tool-call","name":"js","call_id":"old","arguments":{"code":"x".repeat(28_000)}}]}));
+        messages.push(json!({"role":"tool","content":[{"kind":"tool-result","call_id":"old","output":{"value":"decision"}}]}));
+        let out = e.event(
+            &c,
+            "plain",
+            "model.completed",
+            &completion(
+                request.payload["call_id"].as_str().unwrap(),
+                json!([{"kind":"text","text":"continue"}]),
+            ),
+            None,
+        );
+        let compact = out
+            .iter()
+            .find(|draft| draft.kind == "model.requested")
+            .unwrap();
+        assert_eq!(compact.payload["tools"][0]["name"], "compact");
+        assert_eq!(compact.payload["max_output_tokens"], 2048);
+        let size = serde_json::to_vec(&compact.payload).unwrap().len();
+        assert!(size < compaction::SOFT_LIMIT);
+        assert!(compaction::token_budget_ok(size, &c.budget));
+    }
+
+    #[test]
     fn history_compaction_handoff_does_not_emit_partial_tool_history() {
         let c = config();
         let mut e = Engine::default();
@@ -2525,6 +2692,74 @@ mod tests {
         ));
         assert!(next.payload["messages"].to_string().contains("source-1"));
     }
+
+    #[test]
+    fn compaction_rejects_sources_not_verified_by_the_host() {
+        let c = config();
+        let mut e = Engine::default();
+        let first = observe(&mut e, &c, "one", json!({})).remove(0);
+        e.tasks.get_mut("one").unwrap().messages.push(json!({
+            "role":"assistant","content":[{"kind":"tool-call","name":"js","call_id":"old","arguments":{"code":"x".repeat(50000)}}]
+        }));
+        e.tasks.get_mut("one").unwrap().messages.push(json!({
+            "role":"tool","content":[{"kind":"tool-result","call_id":"old","output":{}}]
+        }));
+        let compact = e
+            .event(
+                &c,
+                "plain",
+                "model.completed",
+                &completion(
+                    first.payload["call_id"].as_str().unwrap(),
+                    json!([{"kind":"text","text":"pong"}]),
+                ),
+                None,
+            )
+            .into_iter()
+            .find(|draft| draft.kind == "model.requested")
+            .unwrap();
+        let call_id = compact.payload["call_id"].as_str().unwrap().to_owned();
+        e.set_compaction_provenance_error(
+            &call_id,
+            "working summary references an inaccessible source event".into(),
+        );
+        let summary = json!({
+            "version":1,"objective":"work","constraints":[],"decisions":[],
+            "completedWork":[],"unresolvedQuestions":[],"durableFacts":[],"corrections":[],
+            "sourceIds":["fabricated"]
+        });
+        e.event(&c, "compact-result", "model.completed", &completion(
+            &call_id,
+            json!([{"kind":"tool-call","name":"compact","call_id":"summary","arguments":summary}]),
+        ), None);
+        assert!(e.tasks["one"].context.get("workingSummary").is_none());
+        assert_eq!(
+            e.tasks["one"].context["compactionError"],
+            "working summary references an inaccessible source event"
+        );
+    }
+
+    #[test]
+    fn fresh_compaction_verification_clears_stale_error() {
+        let mut e = Engine::default();
+        e.start(&config(), "one", "one", "origin", json!({}), None, 0);
+        let task = e.tasks.get_mut("one").unwrap();
+        task.compacting = true;
+        task.compaction_provenance_error = Some("stale".into());
+        e.calls.insert("call".into(), "one".into());
+        e.set_compaction_provenance_verified("call");
+        assert!(e.tasks["one"].compaction_provenance_error.is_none());
+    }
+
+    #[test]
+    fn fresh_checkpoint_verification_clears_stale_error() {
+        let mut e = Engine::default();
+        e.start(&config(), "one", "one", "origin", json!({}), None, 0);
+        let task = e.tasks.get_mut("one").unwrap();
+        task.checkpoint_provenance_error = Some("stale".into());
+        e.set_checkpoint_provenance_verified("one");
+        assert!(e.tasks["one"].checkpoint_provenance_error.is_none());
+    }
     #[test]
     fn pending_compaction_and_summary_survive_engine_restart() {
         let c = config();
@@ -2592,8 +2827,12 @@ mod tests {
         );
         e.tasks.get_mut("root").unwrap().context["workingSummary"] =
             json!({"sourceIds":["root-source"]});
+        e.tasks.get_mut("root").unwrap().context["workingSummaryProvenance"] =
+            json!({"verified":true});
         e.tasks.get_mut("root:child").unwrap().context["workingSummary"] =
             json!({"sourceIds":["child-source"]});
+        e.tasks.get_mut("root:child").unwrap().context["workingSummaryProvenance"] =
+            json!({"verified":true});
         e.budgets.insert("root".into(), 0);
         e.scheduling = true;
         let request = e.request(&c, "root:child", "cause").remove(0);

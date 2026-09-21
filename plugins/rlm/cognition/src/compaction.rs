@@ -3,10 +3,98 @@ use serde_json::{Value, json};
 
 pub const SOFT_LIMIT: usize = 48 * 1024;
 pub const HARD_LIMIT: usize = 64 * 1024;
+pub const DEFAULT_OUTPUT_RESERVE_TOKENS: usize = 4096;
+pub const DEFAULT_HEADROOM_TOKENS: usize = 1024;
 const MAX_SUMMARY_BYTES: usize = 12 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_ITEMS: usize = 32;
 const MAX_SOURCES: usize = 64;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetConfig {
+    /// Provider model context window, when the selected model advertises one.
+    #[serde(default)]
+    pub context_tokens: Option<usize>,
+    /// Reserved completion budget. This is an admission reserve, not a tokenizer limit.
+    #[serde(default)]
+    pub output_reserve_tokens: Option<usize>,
+    /// Extra conservative headroom for provider framing and estimation error.
+    #[serde(default)]
+    pub headroom_tokens: Option<usize>,
+}
+
+impl BudgetConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.output_reserve_tokens == Some(0) {
+            return Err("budget outputReserveTokens must be positive".into());
+        }
+        if let Some(context) = self.context_tokens {
+            let output = self
+                .output_reserve_tokens
+                .unwrap_or(DEFAULT_OUTPUT_RESERVE_TOKENS);
+            let headroom = self.headroom_tokens.unwrap_or(DEFAULT_HEADROOM_TOKENS);
+            if context == 0 || context <= output.saturating_add(headroom) {
+                return Err(
+                    "budget contextTokens must exceed outputReserveTokens and headroomTokens"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Admission {
+    Continue,
+    Compact,
+    Reject,
+}
+
+/// Conservative UTF-8 admission estimate. Providers may tokenize differently.
+pub fn estimated_tokens(bytes: usize) -> usize {
+    bytes
+}
+
+pub fn token_budget_ok(request_bytes: usize, config: &BudgetConfig) -> bool {
+    let Some(context_tokens) = config.context_tokens else {
+        return true;
+    };
+    let output = config
+        .output_reserve_tokens
+        .unwrap_or(DEFAULT_OUTPUT_RESERVE_TOKENS);
+    let headroom = config.headroom_tokens.unwrap_or(DEFAULT_HEADROOM_TOKENS);
+    context_tokens
+        .checked_sub(output.saturating_add(headroom))
+        .is_some_and(|budget| estimated_tokens(request_bytes) <= budget)
+}
+
+pub fn admission(request_bytes: usize, config: &BudgetConfig) -> Admission {
+    if request_bytes > HARD_LIMIT || config.validate().is_err() {
+        return Admission::Reject;
+    }
+    let Some(context_tokens) = config.context_tokens else {
+        return if request_bytes > SOFT_LIMIT {
+            Admission::Compact
+        } else {
+            Admission::Continue
+        };
+    };
+    let output = config
+        .output_reserve_tokens
+        .unwrap_or(DEFAULT_OUTPUT_RESERVE_TOKENS);
+    let headroom = config.headroom_tokens.unwrap_or(DEFAULT_HEADROOM_TOKENS);
+    let input_budget = context_tokens - output - headroom;
+    // Leave space for the compaction prompt and one bounded tool result.
+    let threshold = input_budget / 100 * 85 + input_budget % 100 * 85 / 100;
+    if request_bytes > SOFT_LIMIT || estimated_tokens(request_bytes) >= threshold {
+        Admission::Compact
+    } else {
+        Admission::Continue
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -181,5 +269,68 @@ mod tests {
             json!({"role":"tool","content":[{"kind":"tool-result","call_id":"old","output":{}}]}),
         ];
         assert!(bounded_messages(&messages).is_none());
+    }
+
+    #[test]
+    fn token_admission_reserves_output_and_headroom() {
+        let config = BudgetConfig {
+            context_tokens: Some(100),
+            output_reserve_tokens: Some(20),
+            headroom_tokens: Some(10),
+        };
+        assert_eq!(admission(150, &config), Admission::Compact);
+        assert_eq!(admission(50, &config), Admission::Continue);
+    }
+
+    #[test]
+    fn unicode_estimate_counts_utf8_bytes_conservatively() {
+        assert_eq!(estimated_tokens("😀".len()), 4);
+    }
+
+    #[test]
+    fn compaction_starts_before_input_capacity_is_exhausted() {
+        let config = BudgetConfig {
+            context_tokens: Some(1000),
+            output_reserve_tokens: Some(100),
+            headroom_tokens: Some(100),
+        };
+        assert_eq!(admission(679, &config), Admission::Continue);
+        assert_eq!(admission(681, &config), Admission::Compact);
+        assert!(token_budget_ok(790, &config));
+        assert!(!token_budget_ok(801, &config));
+    }
+
+    #[test]
+    fn unusable_budget_configuration_is_rejected() {
+        for config in [
+            BudgetConfig {
+                context_tokens: Some(5),
+                output_reserve_tokens: Some(4),
+                headroom_tokens: Some(1),
+            },
+            BudgetConfig {
+                context_tokens: Some(100),
+                output_reserve_tokens: Some(0),
+                headroom_tokens: Some(1),
+            },
+            BudgetConfig {
+                context_tokens: None,
+                output_reserve_tokens: Some(0),
+                headroom_tokens: None,
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_small_context_rejects() {
+        let config = BudgetConfig {
+            context_tokens: Some(4),
+            output_reserve_tokens: Some(4),
+            headroom_tokens: Some(1),
+        };
+        assert_eq!(admission(1, &config), Admission::Reject);
+        assert!(config.validate().is_err());
     }
 }
