@@ -13,7 +13,8 @@
           "enum": [
             "HOME",
             "PATH",
-            "LANG"
+            "LANG",
+            "PLURIBUS_CORE_SOCKET"
           ]
         }
       },

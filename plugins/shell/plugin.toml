@@ -11,11 +11,11 @@ config_schema = "config.schema.json"
 world = "pluribus:plugin/plugin@3.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
-imports = ["pluribus:plugin/runtime@3.0.0", "pluribus:plugin/credentials@3.0.0", "pluribus:plugin/socket@3.0.0", "wasi:clocks/monotonic-clock@0.3.0"]
+imports = ["pluribus:plugin/runtime@3.0.0", "pluribus:plugin/credentials@3.0.0", "pluribus:plugin/socket@3.0.0", "pluribus:plugin/blobs@3.0.0", "wasi:clocks/monotonic-clock@0.3.0"]
 emits = ["capability.completed", "capability.failed"]
 [[components.main.provides]]
 capability = "shell.execute"
-description = "Runs /bin/sh in the workspace account. Returns stdout, stderr, exit code, and truncation. Commands may have irreversible effects; do not retry automatically."
+description = "Runs /bin/sh in the workspace; do not retry irreversible commands. The RLM runtime forwards ready refs as `attachments`. Use `pluribus-shell-cli attachment SHA256_DIGEST` to read one, `pluribus-shell-cli upload PATH [MEDIA_TYPE]` to return a file as a blob reference, and `pluribus-shell-cli secret BINDING` for a granted export. Parse upload stdout as JSON and pass the reference as `blob` to telegram.send-media. Help: `pluribus-shell-cli --help`. Keep secrets out of logs."
 arguments_schema = "schemas/execute.arguments.json"
 result_schema = "schemas/execute.result.json"
 constraints_schema = "schemas/execute.constraints.json"

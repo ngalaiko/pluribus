@@ -1,5 +1,5 @@
 use crate::{peer_uid, verify_peer};
-use protocol::{MAX_MESSAGES, MAX_REQUEST, Message, Request, Response};
+use protocol::{MAX_MESSAGES, MAX_REQUEST, MAX_RESPONSE, MAX_TEXT, Message, Request, Response};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 struct Inbox {
     messages: Vec<Message>,
     next: u64,
+    session_id: String,
 }
 
 type Shared = Arc<(Mutex<Inbox>, Condvar)>;
@@ -38,7 +39,13 @@ pub fn serve(socket: &Path, runtime_uid: u32) -> io::Result<()> {
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
 
-    let shared: Shared = Arc::new((Mutex::new(Inbox::default()), Condvar::new()));
+    let shared: Shared = Arc::new((
+        Mutex::new(Inbox {
+            session_id: new_session_id()?,
+            ..Inbox::default()
+        }),
+        Condvar::new(),
+    ));
     let typing = Arc::clone(&shared);
     thread::spawn(move || read_terminal(&typing));
 
@@ -85,11 +92,20 @@ fn spawn_connection(mut stream: UnixStream, shared: Shared, active: Arc<AtomicUs
             message: error.to_string(),
         });
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        if let Ok(mut bytes) = serde_json::to_vec(&response) {
-            bytes.push(b'\n');
-            let _ = stream.write_all(&bytes);
-        }
+        let _ = stream.write_all(&encode_response(response));
     });
+}
+
+fn encode_response(response: Response) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
+    if bytes.len() + 1 > MAX_RESPONSE {
+        bytes = serde_json::to_vec(&Response::Unavailable {
+            message: "bridge response exceeds limit".into(),
+        })
+        .unwrap_or_default();
+    }
+    bytes.push(b'\n');
+    bytes
 }
 
 fn handle(stream: &mut UnixStream, shared: &Shared) -> io::Result<Response> {
@@ -106,14 +122,25 @@ fn handle(stream: &mut UnixStream, shared: &Shared) -> io::Result<Response> {
     request.validate().map_err(io::Error::other)?;
     Ok(match request {
         Request::Poll {
-            after, timeout_ms, ..
+            session_id,
+            after,
+            timeout_ms,
+            ..
         } => {
-            let messages = wait_for_input(shared, after, Duration::from_millis(timeout_ms.into()));
+            let (session_id, messages) = wait_for_input(
+                shared,
+                session_id.as_deref(),
+                after,
+                Duration::from_millis(timeout_ms.into()),
+            );
             // Counts only: the text is the conversation, not a transport detail.
             if !messages.is_empty() {
                 debug!(count = messages.len(), after, "poll returning input");
             }
-            Response::Messages { messages }
+            Response::Messages {
+                session_id,
+                messages,
+            }
         }
         Request::Reply { text, .. } => {
             print_reply(&text);
@@ -123,33 +150,67 @@ fn handle(stream: &mut UnixStream, shared: &Shared) -> io::Result<Response> {
 }
 
 /// Waits for input newer than `after`, up to `timeout`.
-fn wait_for_input(shared: &Shared, after: u64, timeout: Duration) -> Vec<Message> {
+fn wait_for_input(
+    shared: &Shared,
+    requested_session: Option<&str>,
+    after: u64,
+    timeout: Duration,
+) -> (String, Vec<Message>) {
     let (inbox, signal) = &**shared;
     let deadline = Instant::now() + timeout;
     let mut guard = inbox
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
-        let pending: Vec<Message> = guard
+        let effective_after = if requested_session == Some(guard.session_id.as_str()) {
+            after
+        } else {
+            0
+        };
+        let mut pending = Vec::new();
+        for message in guard
             .messages
             .iter()
-            .filter(|message| message.sequence > after)
+            .filter(|message| message.sequence > effective_after)
             .take(MAX_MESSAGES)
-            .cloned()
-            .collect();
+        {
+            pending.push(message.clone());
+            if !response_fits(&guard.session_id, &pending) {
+                pending.pop();
+                break;
+            }
+        }
         if !pending.is_empty() {
-            // Everything the agent has read can go.
-            guard.messages.retain(|message| message.sequence > after);
-            return pending;
+            let last = pending
+                .last()
+                .map_or(effective_after, |message| message.sequence);
+            guard.messages.retain(|message| message.sequence > last);
+            return (guard.session_id.clone(), pending);
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Vec::new();
+            return (guard.session_id.clone(), Vec::new());
         };
         guard = signal
             .wait_timeout(guard, remaining)
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .0;
     }
+}
+
+fn response_fits(session_id: &str, messages: &[Message]) -> bool {
+    serde_json::to_vec(&Response::Messages {
+        session_id: session_id.to_owned(),
+        messages: messages.to_vec(),
+    })
+    .is_ok_and(|bytes| bytes.len() + 1 <= MAX_RESPONSE)
+}
+
+fn new_session_id() -> io::Result<String> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| {
+        io::Error::other(format!("random session identifier unavailable: {error}"))
+    })?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn print_reply(text: &str) {
@@ -163,21 +224,24 @@ fn print_reply(text: &str) {
 fn read_terminal(shared: &Shared) {
     let (inbox, signal) = &**shared;
     let stdin = io::stdin();
-    let mut line = String::new();
+    let mut reader = stdin.lock();
     loop {
         {
             let mut out = io::stdout().lock();
             let _ = write!(out, "you: ");
             let _ = out.flush();
         }
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
+        let text = match read_terminal_line(&mut reader) {
+            Ok(Some(text)) => text.trim().to_owned(),
             // A closed terminal stops the typing, not the agent: polls keep
             // waiting out their timeout rather than spinning.
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
-        let text = line.trim().to_owned();
+            Ok(None) => return,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("input line exceeds {MAX_TEXT} bytes or is not UTF-8");
+                continue;
+            }
+            Err(_) => return,
+        };
         if text.is_empty() {
             continue;
         }
@@ -192,6 +256,50 @@ fn read_terminal(shared: &Shared) {
             text,
         });
         signal.notify_all();
+    }
+}
+
+fn read_terminal_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let read = reader
+        .take((MAX_TEXT + 2) as u64)
+        .read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if bytes.last() != Some(&b'\n') && read >= MAX_TEXT + 2 {
+        discard_line(reader)?;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > MAX_TEXT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "line is not UTF-8"))
+}
+
+fn discard_line(reader: &mut impl BufRead) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let found_newline = available.get(consumed.wrapping_sub(1)) == Some(&b'\n');
+        reader.consume(consumed);
+        if found_newline {
+            return Ok(());
+        }
     }
 }
 

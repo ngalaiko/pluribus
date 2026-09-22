@@ -7,11 +7,12 @@ use telegram::pluribus::plugin::blobs;
 use telegram::pluribus::plugin::types::{BlobRef, Error};
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobArgument {
     pub algorithm: String,
     pub digest: String,
     pub size: u64,
-    #[serde(rename = "media_type", alias = "mediaType")]
+    #[serde(rename = "media_type", alias = "mediaType", alias = "media-type")]
     pub media_type: String,
 }
 
@@ -100,5 +101,112 @@ fn safe_file_name(name: &str) -> String {
         "file".into()
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlobArgument;
+
+    #[test]
+    fn accepts_blob_reference_media_type_spellings() {
+        for key in ["media_type", "mediaType", "media-type"] {
+            let value = serde_json::json!({
+                "algorithm": "sha256",
+                "digest": "a".repeat(64),
+                "size": 4,
+                key: "image/png"
+            });
+            let blob: BlobArgument = serde_json::from_value(value).unwrap();
+            assert_eq!(blob.media_type, "image/png");
+        }
+    }
+
+    #[test]
+    fn media_capability_schemas_accept_supported_blob_refs() {
+        for schema in [
+            include_str!("../../schemas/send-media.arguments.json"),
+            include_str!("../../schemas/send-media-group.arguments.json"),
+        ] {
+            let schema: serde_json::Value = serde_json::from_str(schema).unwrap();
+            let validator = jsonschema::validator_for(&schema).unwrap();
+            for field in ["media_type", "mediaType", "media-type"] {
+                let blob = serde_json::json!({
+                    "algorithm": "sha256",
+                    "digest": "a".repeat(64),
+                    "size": 4,
+                    field: "image/png"
+                });
+                let arguments = if schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&"items".into())
+                {
+                    serde_json::json!({"chat_id":1,"items":[{"kind":"photo","blob":blob},{"kind":"document","blob":blob}]})
+                } else {
+                    serde_json::json!({"chat_id":1,"kind":"photo","blob":blob})
+                };
+                assert!(validator.is_valid(&arguments), "{field}: {arguments}");
+            }
+
+            let bad_blob = serde_json::json!({
+                "algorithm": "sha256",
+                "digest": "bad",
+                "size": 4,
+                "media_type": "image/png"
+            });
+            let missing_type = serde_json::json!({
+                "algorithm": "sha256",
+                "digest": "a".repeat(64),
+                "size": 4
+            });
+            let wrap = |blob| {
+                if schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&"items".into())
+                {
+                    serde_json::json!({"chat_id":1,"items":[{"kind":"photo","blob":blob},{"kind":"document","blob":blob}]})
+                } else {
+                    serde_json::json!({"chat_id":1,"kind":"photo","blob":blob})
+                }
+            };
+            assert!(!validator.is_valid(&wrap(bad_blob)));
+            assert!(!validator.is_valid(&wrap(missing_type)));
+        }
+    }
+
+    #[test]
+    fn manifest_requests_media_sized_http_grants() {
+        let manifest: toml::Value = toml::from_str(include_str!("../../plugin.toml")).unwrap();
+        for (component, request_bytes, response_bytes) in [
+            ("receive", 1024 * 1024, 8 * 1024 * 1024),
+            ("send", 8 * 1024 * 1024, 1024 * 1024),
+        ] {
+            let requested = &manifest["components"][component]["requested_capabilities"][0];
+            assert_eq!(requested["name"].as_str(), Some("net.http"));
+            let constraints = &requested["constraints"];
+            assert_eq!(
+                constraints
+                    .get("max_request_bytes")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(1024 * 1024),
+                request_bytes
+            );
+            assert_eq!(
+                constraints
+                    .get("max_response_bytes")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(1024 * 1024),
+                response_bytes
+            );
+            assert_eq!(
+                constraints
+                    .get("max_timeout_ms")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(30_000),
+                120_000
+            );
+        }
     }
 }

@@ -68,6 +68,7 @@ rustPlatform.buildRustPackage {
     cargo build --locked --release -p pluribus-plugin-http --bin pluribus-http-listener
     cargo build --locked --release -p pluribus-cli
     cargo build --locked --release -p pluribus-plugin-shell --bin pluribus-shell-executor
+    cargo build --locked --release -p pluribus-plugin-shell --bin pluribus-shell-cli
     cargo build --locked --release -p pluribus-plugin-cli --bin pluribus-cli-bridge
     cargo build --locked --release -p pluribus-plugin-package --bin pluribus-package
 
@@ -78,7 +79,8 @@ rustPlatform.buildRustPackage {
     runHook preInstall
     install -Dm755 target/release/pluribus $out/bin/pluribus
     install -Dm755 -t $helpers/bin \
-      target/release/pluribus-shell-executor target/release/pluribus-cli-bridge \
+      target/release/pluribus-shell-executor target/release/pluribus-shell-cli \
+      target/release/pluribus-cli-bridge \
       target/release/pluribus-http-listener
     install -Dm755 target/release/pluribus-package $packager/bin/pluribus-package
     mkdir -p $components

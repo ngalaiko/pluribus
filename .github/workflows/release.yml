@@ -32,7 +32,10 @@ jobs:
           persist-credentials: false
       - uses: cachix/install-nix-action@v31
       # The catalog URLs name the workspace version; the tag must be it.
-      - run: test "${{ inputs.tag }}" = "v$(nix-instantiate --eval --strict --expr '(import ./. { }).pluribus.version' | tr -d '\"')"
+      - name: Check release tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: test "$TAG" = "v$(nix-instantiate --eval --strict --expr '(import ./. { }).pluribus.version' | tr -d '\"')"
       - run: nix-build -A release --out-link result
       - run: mkdir release && cp -L result/* release/
       - uses: actions/upload-artifact@v4

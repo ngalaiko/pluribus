@@ -27,6 +27,7 @@ async-trait.workspace = true
 pluribus-store-sqlite = { path = "../pluribus-store-sqlite" }
 wit-component.workspace = true
 wit-parser.workspace = true
+jsonschema.workspace = true
 
 [lints]
 workspace = true

@@ -25,4 +25,33 @@ Outbound capabilities:
 - `telegram.edit-message`
 - `telegram.delete-message`
 
+`telegram.send-media` uploads a visible blob as one file. Use `kind: "photo"`
+for image delivery as a photo, or `kind: "document"` to preserve the original
+file. The `blob` value is the reference exposed by an observation or by a tool
+that produced the file:
+
+```json
+{
+  "chat_id": 123456789,
+  "kind": "photo",
+  "blob": {
+    "algorithm": "sha256",
+    "digest": "<64 lowercase hex characters>",
+    "size": 12345,
+    "media_type": "image/png"
+  },
+  "file_name": "chart.png",
+  "caption": "Processed chart"
+}
+```
+
+The reference must be visible to the current delivery. The plugin streams its
+bytes from the host blob store into Telegram multipart upload; it does not
+inline file bytes into the capability request.
+
+The manifest grants the receiver up to 8 MiB per HTTP response and the sender
+up to 8 MiB per HTTP request, with 120-second timeouts. Sent-file limits include
+multipart headers and fields, so the file itself must be smaller than 8 MiB.
+An album shares that request budget across all its files.
+
 Each component is its own crate, `receive` and `send`, over the transport and configuration code in `core` (`pluribus-plugin-telegram-core`). `poll_timeout_seconds` applies only to `receive`.

@@ -101,8 +101,9 @@ A binding grants no access to the underlying record or other exports.
 
 Providers publish `exports[name] = {value, expires_at_ms}` in their private record.
 The host rejects missing values and values expiring within 30 seconds. Plugins
-assign meaning to binding names: shell uses them as environment variable names
-and sends values directly over its executor socket, outside the event log.
+assign meaning to binding names: shell names the binding in a
+`pluribus-shell-cli secret BINDING` request. Values are resolved on
+demand and never enter the shell command environment or event log.
 
 The `credentials` interface offers scoped get and compare-and-swap. Clocks and
 secure randomness use WASI. WASI HTTP bodies remain transient unless the guest

@@ -17,6 +17,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
@@ -192,18 +193,22 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             registrations.push(prepared.registration.clone());
             staged.push(prepared);
         }
-        for prepared in &mut staged {
-            prepared
-                .instance
-                .init()
-                .await
-                .map_err(AgentError::Runtime)?;
-            prepared
+        staged = run_independent(staged, |mut prepared| async move {
+            let result = prepared.instance.init().await.map(|_| ());
+            (prepared, result)
+        })
+        .await
+        .map_err(AgentError::Runtime)?;
+        staged = run_independent(staged, |mut prepared| async move {
+            let result = prepared
                 .instance
                 .rebuild(&prepared.rebuilds)
                 .await
-                .map_err(AgentError::Runtime)?;
-        }
+                .map(|_| ());
+            (prepared, result)
+        })
+        .await
+        .map_err(AgentError::Runtime)?;
         let ids = staged
             .iter()
             .map(|s| s.registration.instance_id.clone())
@@ -1486,6 +1491,116 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             .result_for(request)
             .await
             .map_err(AgentError::Router)
+    }
+}
+
+/// Runs independent lifecycle work concurrently while retaining input order.
+async fn run_independent<T, E, F, Fut>(items: Vec<T>, run: F) -> Result<Vec<T>, E>
+where
+    F: Fn(T) -> Fut,
+    Fut: Future<Output = (T, Result<(), E>)>,
+{
+    let results = futures_util::future::join_all(items.into_iter().map(run)).await;
+    let mut completed = Vec::with_capacity(results.len());
+    let mut first_error = None;
+    for (item, result) in results {
+        completed.push(item);
+        if first_error.is_none() {
+            first_error = result.err();
+        }
+    }
+    first_error.map_or(Ok(completed), Err)
+}
+
+#[cfg(test)]
+mod independent_tests {
+    use super::run_independent;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn independent_lifecycle_work_overlaps_and_keeps_each_order() {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let barrier = Arc::new(Barrier::new(2));
+        let initialized = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_independent(vec![1_u8, 2], {
+                let barrier = Arc::clone(&barrier);
+                let phases = Arc::clone(&phases);
+                move |id| {
+                    let barrier = Arc::clone(&barrier);
+                    let phases = Arc::clone(&phases);
+                    async move {
+                        phases.lock().unwrap().push((id, "init"));
+                        barrier.wait().await;
+                        (id, Ok::<_, ()>(()))
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("independent work should overlap")
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_independent(initialized, {
+                let barrier = Arc::clone(&barrier);
+                let phases = Arc::clone(&phases);
+                move |id| {
+                    let barrier = Arc::clone(&barrier);
+                    let phases = Arc::clone(&phases);
+                    async move {
+                        phases.lock().unwrap().push((id, "rebuild"));
+                        barrier.wait().await;
+                        (id, Ok::<_, ()>(()))
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("independent rebuilds should overlap")
+        .unwrap();
+
+        assert_eq!(result, [1, 2]);
+        let phases = phases.lock().unwrap();
+        for id in [1, 2] {
+            let init = phases
+                .iter()
+                .position(|phase| *phase == (id, "init"))
+                .unwrap();
+            let rebuild = phases
+                .iter()
+                .position(|phase| *phase == (id, "rebuild"))
+                .unwrap();
+            assert!(init < rebuild);
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_work_finishes_all_items_before_returning_an_error() {
+        let barrier = Arc::new(Barrier::new(2));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let result = run_independent(vec![1_u8, 2], {
+            let barrier = Arc::clone(&barrier);
+            let completed = Arc::clone(&completed);
+            move |id| {
+                let barrier = Arc::clone(&barrier);
+                let completed = Arc::clone(&completed);
+                async move {
+                    barrier.wait().await;
+                    completed.lock().unwrap().push(id);
+                    let result = if id == 1 { Err("init failed") } else { Ok(()) };
+                    (id, result)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap_err(), "init failed");
+        let mut completed = completed.lock().unwrap().clone();
+        completed.sort_unstable();
+        assert_eq!(completed, [1, 2]);
     }
 }
 

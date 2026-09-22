@@ -1,4 +1,4 @@
-//! Telegram polling through the packaged receiver source loop and real event store.
+//! Packaged Telegram polling and media uploads with a real event and blob store.
 
 use pluribus_core::{
     BlobRef, BlobStore, CommittedEvent, DeliveryStore, EventId, EventMetadataSource, EventPayload,
@@ -66,13 +66,13 @@ fn delivery() -> Delivery {
     }
 }
 
-/// Serves the fixture batch once, then empty long polls. Anything but
-/// `getUpdates` is recorded and refused.
+/// Serves one update batch and captures media uploads; refuses downloads.
 struct FakeHttp {
     blobs: Arc<dyn BlobStore>,
     polls: AtomicU64,
     downloads: AtomicU64,
     requested_offsets: Mutex<Vec<Value>>,
+    sent_media: Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl FakeHttp {
@@ -99,6 +99,26 @@ impl FakeHttp {
 #[async_trait::async_trait]
 impl HttpService for FakeHttp {
     async fn send(&self, _: &HttpGrant, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request.url.ends_with("/sendPhoto") || request.url.ends_with("/sendDocument") {
+            let body = request.body.as_ref().unwrap();
+            let bytes = self
+                .blobs
+                .read(body, 0, usize::try_from(body.size).unwrap())
+                .await
+                .unwrap()
+                .bytes;
+            self.sent_media
+                .lock()
+                .unwrap()
+                .push((request.url.clone(), bytes));
+            return Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: self
+                    .blob(br#"{"ok":true,"result":{"message_id":42}}"#)
+                    .await,
+            });
+        }
         if !request.url.ends_with("/getUpdates") {
             self.downloads.fetch_add(1, Ordering::SeqCst);
             return Err(HttpError::NotFound(request.url.clone()));
@@ -171,6 +191,7 @@ async fn harness() -> Harness {
         polls: AtomicU64::new(0),
         downloads: AtomicU64::new(0),
         requested_offsets: Mutex::new(Vec::new()),
+        sent_media: Mutex::new(Vec::new()),
     });
     let credentials = Arc::new(InMemoryCredentialStore::default());
     credentials
@@ -377,4 +398,106 @@ async fn mixed_poll_exposes_only_admitted_updates() {
     assert_eq!(observation["externalSenderId"], "2");
     assert!(observation.get("raw").is_none());
     assert_eq!(h.pending_media().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telegram_uploads_photo_and_document_blobs_without_changing_bytes() {
+    let h = harness().await;
+    let installed = package();
+    let media_grant = &installed
+        .component("send")
+        .unwrap()
+        .manifest()
+        .requested_capabilities[0]
+        .constraints;
+    let mut context = delivery();
+    context.instance_id = "telegram/send".into();
+    let mut sender = h
+        .runtime
+        .instantiate(
+            package().component("send").unwrap(),
+            &json!({"credentials":{"bot-token":"fixture"}}),
+            context,
+            PluginServices {
+                credentials: Some(CredentialAccess {
+                    store: h.credentials.clone(),
+                    provider: package().manifest().id.clone(),
+                    handles: ["fixture".to_owned()].into(),
+                    exports: std::collections::BTreeMap::new(),
+                }),
+                http: Some(h.http.clone()),
+                http_grant: Some(HttpGrant {
+                    component: PrincipalRef::new(PrincipalKind::Component, "telegram/send"),
+                    origins: vec!["https://api.telegram.org".into()],
+                    methods: vec!["POST".into()],
+                    allow_http: false,
+                    allow_private_network: false,
+                    max_request_bytes: media_grant["max_request_bytes"]
+                        .as_u64()
+                        .unwrap_or(1024 * 1024),
+                    max_response_bytes: 1024 * 1024,
+                    max_redirects: 0,
+                    max_timeout_ms: 60_000,
+                }),
+                ..PluginServices::default()
+            },
+        )
+        .await
+        .unwrap();
+    sender.init().await.unwrap();
+    for (kind, mime, file_name, method) in [
+        ("photo", "image/png", "result.png", "sendPhoto"),
+        ("document", "application/pdf", "result.pdf", "sendDocument"),
+    ] {
+        let bytes: Vec<u8> = (0_u8..=255).cycle().take(1024 * 1024 + 73).collect();
+        let upload = h
+            .http
+            .blobs
+            .begin_put(mime, Some(bytes.len() as u64))
+            .await
+            .unwrap();
+        h.http.blobs.write(&upload, 0, &bytes).await.unwrap();
+        let blob = h.http.blobs.finish_put(&upload).await.unwrap();
+        let event = h.store.append(pluribus_core::AppendRequest {
+            stream_id: StreamId::new("personal"),
+            stream_kind: pluribus_core::StreamKind::Agent,
+            observed_at_ms: None,
+            event_type: "capability.requested".into(),
+            payload_schema: "pluribus.capability-request/1".into(),
+            payload: EventPayload::CanonicalJson(serde_json::to_vec(&json!({
+                "capability":"telegram.send-media",
+                "arguments": {"chat_id":1,"kind":kind,"blob":{
+                    "algorithm":blob.algorithm,"digest":blob.digest,"size":blob.size,"media_type":blob.media_type
+                },"file_name":file_name,"caption":"Processed attachment"}
+            })).unwrap()),
+            actor: PrincipalRef::new(PrincipalKind::Component, "rlm/cognition"),
+            authority_id: None,
+            activity_id: None,
+            correlation_id: None,
+            causation_id: None,
+            deduplication_key: None,
+        }).await.unwrap();
+        let outcome = sender.handle(&[event]).await.unwrap();
+        assert_eq!(outcome.events.len(), 1);
+        assert_eq!(
+            outcome.events[0].request.event_type, "capability.completed",
+            "{:?}",
+            outcome.events[0]
+        );
+        let captures = h.http.sent_media.lock().unwrap();
+        let (url, body) = captures.last().expect("Telegram upload");
+        assert!(url.ends_with(method));
+        assert!(body.windows(bytes.len()).any(|window| window == bytes));
+        for field in [
+            format!("filename=\"{file_name}\""),
+            format!("Content-Type: {mime}"),
+            "Processed attachment".into(),
+        ] {
+            assert!(
+                body.windows(field.len())
+                    .any(|window| window == field.as_bytes()),
+                "missing multipart field: {field}"
+            );
+        }
+    }
 }

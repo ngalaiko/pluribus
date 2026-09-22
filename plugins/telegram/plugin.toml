@@ -29,7 +29,7 @@ emits = ["observation.received"]
 name = "net.http"
 required = true
 reason = "Poll Telegram updates and download received media"
-constraints = { origins = ["https://api.telegram.org"], methods = ["GET", "POST"] }
+constraints = { origins = ["https://api.telegram.org"], methods = ["GET", "POST"], max_response_bytes = 8388608, max_timeout_ms = 120000 }
 
 [components.send]
 world = "pluribus:plugin/plugin@3.0.0"
@@ -44,7 +44,7 @@ emits = ["capability.completed", "capability.failed"]
 name = "net.http"
 required = true
 reason = "Send Telegram messages and media"
-constraints = { origins = ["https://api.telegram.org"], methods = ["GET", "POST"] }
+constraints = { origins = ["https://api.telegram.org"], methods = ["GET", "POST"], max_request_bytes = 8388608, max_timeout_ms = 120000 }
 
 [[components.send.provides]]
 capability = "telegram.reply"
@@ -117,4 +117,3 @@ arguments_schema = "schemas/delete-message.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
-

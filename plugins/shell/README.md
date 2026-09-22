@@ -14,6 +14,7 @@ Commands are non-idempotent. The transport makes one attempt and does not retry.
 cargo build --release -p pluribus-cli
 cargo build --locked --release --target wasm32-unknown-unknown --lib -p pluribus-plugin-shell
 cargo build --locked --release -p pluribus-plugin-shell --bin pluribus-shell-executor
+cargo build --locked --release -p pluribus-plugin-shell --bin pluribus-shell-cli
 ```
 
 ## Deployment
@@ -22,7 +23,7 @@ The executor runs on any host with a Unix peer-credential call: Linux via `SO_PE
 
 Use distinct non-root accounts, for example `pluribus-personal` and `pluribus-workspace`. The workspace account must have no access to the runtime's files, process inspection, credentials, sudo privileges, or administrative sockets. Keep runtime state at mode 0700 and runtime binaries, plugin packages, and service definitions owned by the administrator. The executor has the workspace account's full authority.
 
-Install `pluribus` and `pluribus-shell-executor` under `/usr/local/bin`, the shell package under `/opt/pluribus/plugins/shell`, and create `/srv/pluribus-workspace` owned by `pluribus-workspace`. Give the runtime account membership in the workspace group for socket access; do not give the workspace account membership in the runtime group.
+Install `pluribus`, `pluribus-shell-executor`, and `pluribus-shell-cli` under `/usr/local/bin`, the shell package under `/opt/pluribus/plugins/shell`, and create `/srv/pluribus-workspace` owned by `pluribus-workspace`. Give the runtime account membership in the workspace group for socket access; do not give the workspace account membership in the runtime group.
 
 The executor is a plain foreground process:
 
@@ -109,7 +110,7 @@ pluribus --data-dir /var/lib/pluribus-personal run --resume
 
 `stop` persists a STOP marker, halts further cognition, and signals active components. Shell cancellation closes the socket and kills the process group. Existing model/connector requests may take their configured timeout to return. `run --resume` clears the marker; use it only after the previous runner exits.
 
-## Credential environment
+## Core access from commands
 
 Set the shell instance's `config`:
 
@@ -125,11 +126,41 @@ Set the shell instance's `config`:
 }
 ```
 
-Shell Wasm resolves each binding through the core before connecting to the
-executor. The executor receives values over the existing socket and adds them
-to the command's cleared environment. Missing or expiring exports fail the
-request before execution. `HOME`, `PATH`, and `LANG` cannot be overridden.
+Commands request a granted export only when needed:
 
-Bindings contain references only. Resolved values stay out of events and
-transport logs; commands can read them and must avoid printing them.
-The executor's `--path` controls where tools such as `gh` are found.
+```sh
+pluribus-shell-cli secret GH_TOKEN | gh auth login --with-token
+```
+
+The helper is a separate installed `pluribus-shell-cli` binary. Its directory is
+added to the command PATH. The shell component resolves the binding through
+core for each request; values never enter the command environment or event
+log. Only names in `credential_exports` are accepted, and missing or expiring
+exports fail the helper call. Keep secrets out of command output and logs.
+
+The RLM runtime automatically forwards ready attachment references from the
+current input to `shell.execute`; the model does not need to supply metadata.
+The helper resolves a digest only among those references visible in the
+current delivery and streams the bytes to stdout in chunks:
+
+```sh
+pluribus-shell-cli attachment SHA256_DIGEST | pdftotext - -
+```
+
+Pass only the attachment's lowercase 64-character SHA-256 digest. Core resolves it against the
+current delivery's visible blobs; hidden blobs cannot be read. Redirect the
+output to a workspace file to use it with local tools.
+
+Upload a processed or generated file with `pluribus-shell-cli upload PATH
+[MEDIA_TYPE]`. It prints a JSON blob reference on stdout. Parse that JSON and
+pass the reference as `blob` to `telegram.send-media`, for example with
+`kind: "photo"` or `kind: "document"`. A helper upload remains available only
+when its returned reference is included in a later capability request.
+
+The default shell stream grant is 16 MiB shared by both directions. Core
+messages encode byte chunks as JSON arrays, so the practical file ceiling is
+lower (roughly 4 MiB, less framing overhead). A larger grant raises that
+ceiling. Shell command output still has a separate 1 MiB cap.
+
+Bindings contain references only. The executor's `--path` controls where tools
+such as `gh` are found; its own directory is added automatically.

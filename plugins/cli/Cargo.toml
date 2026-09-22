@@ -29,6 +29,7 @@ clap = { workspace = true }
 pluribus-log = { path = "../../crates/pluribus-log" }
 pluribus-paths = { path = "../../crates/pluribus-paths" }
 rustix = { workspace = true }
+getrandom = { workspace = true }
 tracing = { workspace = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(any(target_os = "linux", target_os = "android"))))'.dependencies]

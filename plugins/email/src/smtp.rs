@@ -83,10 +83,10 @@ impl Session {
             ));
         }
         let mechanisms = self.extension("AUTH").unwrap_or_default();
-        let reply = if mechanisms.contains("PLAIN") {
+        let reply = if supports_auth(&mechanisms, "PLAIN") {
             let secret = encode(&format!("\0{user}\0{password}"));
             self.command(&format!("AUTH PLAIN {secret}")).await?
-        } else if mechanisms.contains("LOGIN") {
+        } else if supports_auth(&mechanisms, "LOGIN") {
             let reply = self
                 .command(&format!("AUTH LOGIN {}", encode(user)))
                 .await?;
@@ -186,8 +186,16 @@ impl Session {
     async fn read_reply(&mut self) -> Result<Reply, Error> {
         let mut code = None;
         let mut lines = Vec::new();
+        let mut size = 0;
         loop {
             let line = self.read_line().await?;
+            if reply_exceeds_limit(size, line.len()) {
+                return Err(failure(
+                    ErrorCode::ResourceExhausted,
+                    "endpoint reply exceeds the reply ceiling",
+                ));
+            }
+            size = size.saturating_add(line.len()).saturating_add(2);
             let digits = line
                 .get(..3)
                 .and_then(|digits| digits.parse::<u16>().ok())
@@ -201,12 +209,6 @@ impl Session {
                     code: digits,
                     lines,
                 });
-            }
-            if lines.len() * 4 > MAX_REPLY {
-                return Err(failure(
-                    ErrorCode::ResourceExhausted,
-                    "endpoint reply exceeds the reply ceiling",
-                ));
             }
         }
     }
@@ -240,6 +242,10 @@ impl Session {
     }
 }
 
+fn reply_exceeds_limit(current_size: usize, line_size: usize) -> bool {
+    current_size.saturating_add(line_size).saturating_add(2) > MAX_REPLY
+}
+
 /// Escapes a leading `.` on every line and appends the terminator.
 ///
 /// RFC 5321 §4.5.2: a message line beginning with `.` would otherwise end the
@@ -271,6 +277,12 @@ pub fn dot_stuff(message: &[u8]) -> Vec<u8> {
 
 fn encode(value: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+}
+
+fn supports_auth(mechanisms: &str, requested: &str) -> bool {
+    mechanisms
+        .split_whitespace()
+        .any(|mechanism| mechanism.eq_ignore_ascii_case(requested))
 }
 
 /// Maps a refusal onto an error the caller can act on.
@@ -338,5 +350,18 @@ mod tests {
             ErrorCode::InvalidArgument
         );
         assert!(!refused("RCPT TO", &reply(550)).retryable);
+    }
+
+    #[test]
+    fn continuation_reply_limit_counts_line_bytes() {
+        let line_size = MAX_REPLY / 2;
+        let current_size = line_size + 2;
+        assert!(reply_exceeds_limit(current_size, line_size));
+    }
+
+    #[test]
+    fn auth_mechanisms_match_whole_tokens() {
+        assert!(!supports_auth("XPLAIN", "PLAIN"));
+        assert!(supports_auth("LOGIN PLAIN", "PLAIN"));
     }
 }

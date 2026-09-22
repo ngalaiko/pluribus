@@ -103,6 +103,7 @@ fn reasoning_changed_output_is_progress_and_js_resets_corrections() {
 #[test]
 fn plugin_boundary_uses_only_generic_capability_dispatch() {
     assert!(!PROMPT.contains("memory."));
+    assert!(PROMPT.contains("Use yield reply for user-facing text; invoke media capabilities through JS only for requested file or media sends."));
     let mut e = Engine::default();
     let c = config();
     observe(&mut e, &c, "one", json!({}));

@@ -87,8 +87,11 @@ rec {
     shell = package {
       name = "shell";
       components = [ "main" ];
-      # The executor is the shell plugin's native half.
-      binaries = [ "${workspace.helpers}/bin/pluribus-shell-executor" ];
+      # The executor and core RPC helper are the shell plugin's native half.
+      binaries = [
+        "${workspace.helpers}/bin/pluribus-shell-executor"
+        "${workspace.helpers}/bin/pluribus-shell-cli"
+      ];
     };
     telegram = package {
       name = "telegram";

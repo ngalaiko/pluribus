@@ -13,6 +13,10 @@ path = "client/src/lib.rs"
 name = "pluribus-shell-executor"
 path = "executor/src/main.rs"
 
+[[bin]]
+name = "pluribus-shell-cli"
+path = "executor/src/shell_cli_main.rs"
+
 [dependencies]
 pluribus-plugin-sdk.workspace = true
 futures-util = { workspace = true }

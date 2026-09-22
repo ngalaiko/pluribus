@@ -44,9 +44,14 @@ let
     if stdenv.hostPlatform.isDarwin then
       ''
         for binary in tree/bin/*; do
-          otool -L "$binary" | awk 'NR > 1 { print $1 }' | grep '^/nix/store' | while read -r library; do
-            install_name_tool -change "$library" "/usr/lib/$(basename "$library")" "$binary"
-          done
+          libraries=$(otool -L "$binary" | awk 'NR > 1 { print $1 }')
+          while IFS= read -r library; do
+            case "$library" in
+              /nix/store/*)
+                install_name_tool -change "$library" "/usr/lib/$(basename "$library")" "$binary"
+                ;;
+            esac
+          done <<< "$libraries"
           codesign --force --sign - "$binary"
           if otool -L "$binary" | tail -n +2 | grep -q /nix/store; then
             echo "$binary loads a store library" >&2
@@ -108,6 +113,7 @@ rustPlatform.buildRustPackage {
     cargo build --locked --release -p pluribus-plugin-http --bin pluribus-http-listener
     cargo build --locked --release -p pluribus-cli
     cargo build --locked --release -p pluribus-plugin-shell --bin pluribus-shell-executor
+    cargo build --locked --release -p pluribus-plugin-shell --bin pluribus-shell-cli
     cargo build --locked --release -p pluribus-plugin-cli --bin pluribus-cli-bridge
     runHook postBuild
   '';
@@ -119,6 +125,7 @@ rustPlatform.buildRustPackage {
 
     built=target/$CARGO_BUILD_TARGET/release
     install -m755 "$built/pluribus" "$built/pluribus-shell-executor" \
+      "$built/pluribus-shell-cli" \
       "$built/pluribus-cli-bridge" "$built/pluribus-http-listener" \
       tree/bin/
     ${portable}
@@ -146,6 +153,7 @@ rustPlatform.buildRustPackage {
 
     binary=$smoke/bin/pluribus
     pluribus init
+    "$smoke/bin/pluribus-shell-cli" --help > /dev/null
 
     # An agent starts with no plugins.
     jq -e '.plugin_instances == {}' "$config" > /dev/null

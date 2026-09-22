@@ -1165,11 +1165,15 @@ impl StreamService for CliSubscriptionFixture {
             return Ok(());
         };
         let after = request["after"].as_u64().unwrap();
+        assert_eq!(request["version"], 2);
+        if after > 0 {
+            assert_eq!(request["session_id"], "fixture");
+        }
         self.offsets.lock().unwrap().push(after);
         let frame = if after == 0 {
-            b"{\"status\":\"messages\",\"messages\":[{\"sequence\":1,\"at_ms\":1,\"text\":\"hello\"}]}\n".to_vec()
+            b"{\"status\":\"messages\",\"session_id\":\"fixture\",\"messages\":[{\"sequence\":1,\"at_ms\":1,\"text\":\"hello\"}]}\n".to_vec()
         } else {
-            b"{\"status\":\"messages\",\"messages\":[]}\n".to_vec()
+            b"{\"status\":\"messages\",\"session_id\":\"fixture\",\"messages\":[]}\n".to_vec()
         };
         let middle = frame.len() / 2;
         self.frames.lock().unwrap().insert(
@@ -1276,7 +1280,7 @@ async fn packaged_cli_run_frames_input_and_commits_offsets() {
         .unwrap()
         .value
         .unwrap(),
-        b"1"
+        b"{\"session_id\":\"fixture\",\"sequence\":1}"
     );
     stream.idle.store(true, Ordering::Release);
     tokio::time::sleep(Duration::from_millis(250)).await;

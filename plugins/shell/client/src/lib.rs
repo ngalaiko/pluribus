@@ -10,9 +10,12 @@ pub use pluribus_plugin_sdk::{exports, pluribus, wasi};
 
 use channel::Socket;
 use exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
-use pluribus::plugin::credentials;
 use pluribus::plugin::types::{Error, ErrorCode, Event, Payload, Proposal};
-use protocol::{MAX_RESPONSE, MAX_TIMEOUT_MS, Request, Response, VERSION};
+use pluribus::plugin::{blobs, credentials};
+use protocol::{
+    ComponentFrame, CoreOperation, CoreReply, ExecutorFrame, MAX_RESPONSE, MAX_TIMEOUT_MS, Request,
+    Response, VERSION,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -34,6 +37,8 @@ struct Arguments {
     command: String,
     #[serde(default = "default_timeout")]
     timeout_ms: u32,
+    #[serde(default)]
+    attachments: Vec<serde_json::Value>,
 }
 
 fn default_timeout() -> u32 {
@@ -141,14 +146,8 @@ async fn run(
         ));
     }
 
-    let env = EXPORTS.with_borrow(|names| {
-        names
-            .iter()
-            .map(|name| credentials::resolve_export(name).map(|value| (name.clone(), value)))
-            .collect::<Result<std::collections::BTreeMap<_, _>, Error>>()
-    })?;
     let request = Request {
-        env,
+        env: std::collections::BTreeMap::new(),
         version: VERSION,
         command: arguments.command,
         timeout_ms: arguments.timeout_ms,
@@ -168,6 +167,12 @@ async fn run(
             .clone()
             .unwrap_or_else(|| event.event_id.clone()),
     };
+    if arguments.attachments.len() > 32 {
+        return Err(failure(
+            ErrorCode::ResourceExhausted,
+            "too many attachment references",
+        ));
+    }
     request
         .validate()
         .map_err(|message| failure(ErrorCode::InvalidArgument, message))?;
@@ -209,8 +214,26 @@ async fn exchange(
                 "executor response exceeds limit",
             ));
         }
-        if bytes.last() == Some(&b'\n') {
-            break;
+        while let Some(end) = bytes.iter().position(|byte| *byte == b'\n') {
+            let frame = bytes.drain(..=end).collect::<Vec<_>>();
+            match serde_json::from_slice::<ExecutorFrame>(&frame)
+                .map_err(|_| failure(ErrorCode::Unavailable, "malformed executor frame"))?
+            {
+                ExecutorFrame::Result { response } => return Ok(response),
+                ExecutorFrame::CoreRequest { request } => {
+                    let reply = core_operation(request);
+                    let mut encoded = serde_json::to_vec(&ComponentFrame::CoreReply(reply))
+                        .map_err(|_| failure(ErrorCode::Internal, "cannot encode core reply"))?;
+                    encoded.push(b'\n');
+                    channel.send(&encoded).await?;
+                }
+            }
+        }
+        if bytes.len() > MAX_RESPONSE {
+            return Err(failure(
+                ErrorCode::ResourceExhausted,
+                "executor frame exceeds limit",
+            ));
         }
         if chunk.closed {
             return Err(failure(ErrorCode::Unavailable, "executor disconnected"));
@@ -222,8 +245,63 @@ async fn exchange(
             ));
         }
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| failure(ErrorCode::Unavailable, "malformed executor response"))
+}
+
+fn core_operation(request: protocol::CoreRequest) -> CoreReply {
+    let mut closed = None;
+    let reply = (|| -> Result<Vec<u8>, Error> {
+        request
+            .operation
+            .validate()
+            .map_err(|message| failure(ErrorCode::InvalidArgument, message))?;
+        match request.operation {
+            CoreOperation::Secret { binding } => {
+                credentials::resolve_export(&binding).map(String::into_bytes)
+            }
+            CoreOperation::Attachment {
+                digest,
+                offset,
+                max_bytes,
+            } => {
+                let blob = blobs::resolve_visible(&digest)?;
+                let chunk = blobs::read(&blob, offset, max_bytes)?;
+                closed = Some(chunk.closed);
+                Ok(chunk.bytes)
+            }
+            CoreOperation::AttachmentOpen { media_type, size } => {
+                blobs::open_write(&media_type, Some(size)).map(String::into_bytes)
+            }
+            CoreOperation::AttachmentWrite {
+                handle,
+                offset,
+                bytes,
+            } => blobs::write(&handle, offset, &bytes).map(|next| next.to_string().into_bytes()),
+            CoreOperation::AttachmentFinish { handle } => {
+                let blob = blobs::finish(&handle)?;
+                serde_json::to_vec(&json!({
+                    "algorithm": blob.algorithm,
+                    "digest": blob.digest,
+                    "size": blob.size,
+                    "media_type": blob.media_type,
+                }))
+                .map_err(|_| failure(ErrorCode::Internal, "cannot encode uploaded attachment"))
+            }
+        }
+    })();
+    match reply {
+        Ok(bytes) => CoreReply {
+            id: request.id,
+            bytes: Some(bytes),
+            error: None,
+            closed,
+        },
+        Err(error) => CoreReply {
+            id: request.id,
+            bytes: None,
+            error: Some(error.message),
+            closed: None,
+        },
+    }
 }
 
 /// Turns the executor's response into a terminal event. A non-completion is a
@@ -318,6 +396,18 @@ const fn code_name(code: ErrorCode) -> &'static str {
         ErrorCode::Cancelled => "cancelled",
         ErrorCode::DeadlineExceeded => "deadline-exceeded",
         ErrorCode::Internal => "internal",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn capability_description_documents_runtime_helpers() {
+        let manifest = include_str!("../../plugin.toml");
+        assert!(manifest.contains("pluribus-shell-cli attachment SHA256_DIGEST"));
+        assert!(manifest.contains("pluribus-shell-cli secret BINDING"));
+        assert!(manifest.contains("pluribus-shell-cli --help"));
+        assert!(manifest.contains("The RLM runtime forwards ready refs"));
     }
 }
 

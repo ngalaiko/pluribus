@@ -50,9 +50,17 @@ fn captures_output_exit_status_and_workspace_without_ambient_environment() {
     let environment = fs::read_to_string(dir.path().join("environment")).unwrap();
     for line in environment.lines() {
         assert!(
-            ["HOME=", "PATH=", "LANG=", "PWD=", "SHLVL=", "_="]
-                .iter()
-                .any(|prefix| line.starts_with(prefix)),
+            [
+                "HOME=",
+                "PATH=",
+                "LANG=",
+                "PWD=",
+                "SHLVL=",
+                "_=",
+                "PLURIBUS_CORE_SOCKET=",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix)),
             "{line}"
         );
     }

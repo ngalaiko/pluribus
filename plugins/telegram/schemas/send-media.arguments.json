@@ -26,7 +26,7 @@
       ]
     },
     "blob": {
-      "type": "object"
+      "$ref": "#/$defs/blobRef"
     },
     "file_name": {
       "type": "string"
@@ -42,6 +42,26 @@
     },
     "reply_to_message_id": {
       "type": "integer"
+    }
+  },
+  "$defs": {
+    "blobRef": {
+      "type": "object",
+      "required": ["algorithm", "digest", "size"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size": { "type": "integer", "minimum": 0 },
+        "media_type": { "type": "string", "minLength": 1 },
+        "mediaType": { "type": "string", "minLength": 1 },
+        "media-type": { "type": "string", "minLength": 1 }
+      },
+      "oneOf": [
+        { "required": ["media_type"] },
+        { "required": ["mediaType"] },
+        { "required": ["media-type"] }
+      ],
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

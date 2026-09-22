@@ -88,7 +88,7 @@ Blob GC leaves package caches intact. Package-cache pruning is not implemented.
 
 | Asset | Contents |
 | --- | --- |
-| `pluribus-<version>-<target>.tar.gz` | `pluribus`, `pluribus-shell-executor`, and `pluribus-cli-bridge` in `bin/` |
+| `pluribus-<version>-<target>.tar.gz` | `pluribus`, `pluribus-shell-executor`, `pluribus-shell-cli`, `pluribus-cli-bridge`, and `pluribus-http-listener` in `bin/` |
 | `pluribus-plugin-<name>-<version>.tar.gz` | Complete WASM package |
 | `plugins.json` | Versioned map of plugin names to URL/SHA-256 references |
 | `<asset>.sha256` | The digest of the archive it sits beside |
@@ -123,10 +123,10 @@ nix-build -A release
 ```
 
 One command per target. It builds every plugin package, archives each one,
-writes `plugins.json` with their URLs and hashes, builds `pluribus`,
-`pluribus-shell-executor`, and `pluribus-cli-bridge` with that catalog embedded,
-and archives them under the build's Rust target triple. The catalog is a build input: the assets are
-the archives and a `.sha256` beside each.
+writes `plugins.json` with their URLs and hashes, then builds the CLI and bridge
+with that catalog embedded plus the shell executor, shell CLI, and HTTP listener.
+It archives these binaries under the build's Rust target triple. The catalog is a
+build input; the release also contains each plugin archive and its `.sha256` file.
 
 Plugin components build with remapped source paths, so every runner in the
 release matrix writes byte-identical plugin assets and the same catalog.

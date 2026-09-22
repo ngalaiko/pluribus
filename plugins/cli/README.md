@@ -21,6 +21,12 @@ pluribus-cli-bridge
 The bridge owns the terminal: it numbers each line typed, hands them to the
 agent through long polling, and prints replies. Empty responses create no events;
 input waits run independently of reply connections. It listens; the component connects.
+Each bridge run has its own session ID, so restarting it resets the saved input
+cursor and accepts new lines even though sequence numbers start again at one.
+Input lines are limited to 16 KiB. Poll batches include only messages whose
+fully escaped JSON response fits the 256 KiB frame limit; remaining lines are
+sent by later polls.
+Protocol v2 requires upgrading the bridge and component together.
 
 Its endpoint is `cli-main.sock` in the agent's data directory,
 `$XDG_DATA_HOME/pluribus` unless `--data-dir` says otherwise; `--socket` names

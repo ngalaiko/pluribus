@@ -1850,6 +1850,35 @@ impl blobs::Host for HostState {
         Ok(wit_blob_ref(&blob))
     }
 
+    async fn resolve_visible(&mut self, digest: String) -> Result<types::BlobRef, types::Error> {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(host_error(
+                types::ErrorCode::InvalidArgument,
+                "invalid SHA-256 digest",
+            ));
+        }
+        let mut matches = self.visible_blobs.iter().filter(|blob| {
+            blob.algorithm == pluribus_core::SHA256_ALGORITHM && blob.digest == digest
+        });
+        let Some(blob) = matches.next() else {
+            return Err(host_error(
+                types::ErrorCode::PermissionDenied,
+                "blob is not visible to this delivery",
+            ));
+        };
+        if matches.any(|candidate| candidate != blob) {
+            return Err(host_error(
+                types::ErrorCode::InvalidArgument,
+                "visible blob digest is ambiguous",
+            ));
+        }
+        Ok(wit_blob_ref(blob))
+    }
+
     async fn read(
         &mut self,
         blob: types::BlobRef,
@@ -2052,6 +2081,7 @@ fn blob_ref_from(map: &serde_json::Map<String, Value>) -> Option<BlobRef> {
         size: map.get("size")?.as_u64()?,
         media_type: map
             .get("media_type")
+            .or_else(|| map.get("media-type"))
             .or_else(|| map.get("mediaType"))?
             .as_str()?
             .to_owned(),

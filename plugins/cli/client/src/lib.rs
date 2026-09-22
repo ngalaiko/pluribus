@@ -82,8 +82,9 @@ impl Guest for Cli {
             INPUT.with_borrow_mut(Vec::clear);
             let result: Result<bool, Error> = async {
                 let mut input = Socket::connect("default").await?;
+                let current_cursor = cursor()?;
                 input
-                    .send(&poll_request(&configuration()?, cursor()?)?)
+                    .send(&poll_request(&configuration()?, &current_cursor)?)
                     .await?;
                 loop {
                     let Some(chunk) =
@@ -156,10 +157,17 @@ impl Guest for Cli {
     }
 }
 
-fn poll_request(config: &Config, after: u64) -> Result<Vec<u8>, Error> {
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, serde::Serialize)]
+struct Cursor {
+    session_id: Option<String>,
+    sequence: u64,
+}
+
+fn poll_request(config: &Config, cursor: &Cursor) -> Result<Vec<u8>, Error> {
     let mut request = serde_json::to_vec(&Request::Poll {
         version: VERSION,
-        after,
+        after: cursor.sequence,
+        session_id: cursor.session_id.clone(),
         timeout_ms: config.poll_timeout_seconds.saturating_mul(1000),
     })
     .map_err(|e| internal(e.to_string()))?;
@@ -264,7 +272,7 @@ async fn send(channel: &mut Socket, request: &[u8], timeout_ms: u32) -> Result<R
         .map_err(|error| unavailable(format!("invalid response: {error}")))
 }
 
-fn observation(config: &Config, message: &Message) -> Result<Proposal, Error> {
+fn observation(config: &Config, session_id: &str, message: &Message) -> Result<Proposal, Error> {
     let mut proposal = proposal(
         "observation.received",
         "dev.pluribus.cli.observation.v1",
@@ -277,7 +285,7 @@ fn observation(config: &Config, message: &Message) -> Result<Proposal, Error> {
         }),
         None,
     )?;
-    proposal.idempotency_key = Some(format!("cli:input:{}", message.sequence));
+    proposal.idempotency_key = Some(format!("cli:input:{session_id}:{}", message.sequence));
     Ok(proposal)
 }
 
@@ -296,14 +304,38 @@ fn proposal(
     })
 }
 
-fn cursor() -> Result<u64, Error> {
+fn cursor() -> Result<Cursor, Error> {
     let Some(bytes) = state::get(CURSOR_KEY)? else {
-        return Ok(0);
+        return Ok(Cursor::default());
     };
+    decode_cursor(&bytes)
+}
+
+fn decode_cursor(bytes: &[u8]) -> Result<Cursor, Error> {
+    if let Ok(cursor) = serde_json::from_slice(&bytes) {
+        return Ok(cursor);
+    }
+    // Older releases persisted only the sequence. It cannot identify a
+    // restarted bridge, so the next response establishes a fresh session.
     std::str::from_utf8(&bytes)
         .map_err(|_| invalid("stored cursor is not UTF-8"))?
-        .parse()
-        .map_err(|_| invalid("stored cursor is not an integer"))
+        .parse::<u64>()
+        .map(|sequence| Cursor {
+            session_id: None,
+            sequence,
+        })
+        .map_err(|_| invalid("stored cursor is invalid"))
+}
+
+fn cursor_after(current: &Cursor, session_id: &str, messages: &[Message]) -> Cursor {
+    let same_session = current.session_id.as_deref() == Some(session_id);
+    Cursor {
+        session_id: Some(session_id.to_owned()),
+        sequence: messages.last().map_or_else(
+            || if same_session { current.sequence } else { 0 },
+            |m| m.sequence,
+        ),
+    }
 }
 
 // Configuration arrives in `init` and no import returns it later, so the
@@ -399,19 +431,25 @@ impl Cli {
             return Ok(out);
         };
         let config = configuration()?;
-        let after = cursor()?;
+        let current_cursor = cursor()?;
         let response: Response =
             serde_json::from_slice(&frame).map_err(|e| invalid(e.to_string()))?;
         match response {
-            Response::Messages { messages } => {
-                let next = messages.last().map_or(after, |message| message.sequence);
+            Response::Messages {
+                session_id,
+                messages,
+            } => {
+                let next_cursor = cursor_after(&current_cursor, &session_id, &messages);
                 for message in &messages {
-                    out.events.push(observation(&config, message)?);
+                    out.events.push(observation(&config, &session_id, message)?);
                 }
-                if next != after {
+                if next_cursor.session_id != current_cursor.session_id
+                    || next_cursor.sequence != current_cursor.sequence
+                {
                     out.mutations.push(Mutation::Set(StateEntry {
                         key: CURSOR_KEY.into(),
-                        value: next.to_string().into_bytes(),
+                        value: serde_json::to_vec(&next_cursor)
+                            .map_err(|_| internal("cannot encode input cursor"))?,
                     }));
                 }
             }
@@ -421,6 +459,55 @@ impl Cli {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cursor, cursor_after, decode_cursor, observation};
+    use protocol::Message;
+    use serde_json::Value;
+
+    #[test]
+    fn old_sequence_cursor_migrates_without_assuming_a_bridge_session() {
+        assert_eq!(
+            decode_cursor(b"12").unwrap(),
+            Cursor {
+                session_id: None,
+                sequence: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_response_from_new_session_resets_old_cursor() {
+        let next = cursor_after(
+            &Cursor {
+                session_id: Some("old".into()),
+                sequence: 42,
+            },
+            "new",
+            &[],
+        );
+        assert_eq!(next.session_id.as_deref(), Some("new"));
+        assert_eq!(next.sequence, 0);
+    }
+
+    #[test]
+    fn input_idempotency_keys_are_scoped_to_bridge_session() {
+        let config = super::Config {
+            conversation_id: "local".into(),
+            sender: "operator".into(),
+            poll_timeout_seconds: 20,
+        };
+        let message = Message {
+            sequence: 1,
+            at_ms: 0,
+            text: "hello".into(),
+        };
+        let old = observation(&config, "old", &message).unwrap();
+        let new = observation(&config, "new", &message).unwrap();
+        assert_ne!(old.idempotency_key, new.idempotency_key);
     }
 }
 

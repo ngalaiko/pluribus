@@ -10,6 +10,65 @@ fn service() -> (TempDir, LocalStreamService) {
     (dir, service)
 }
 
+#[tokio::test]
+async fn concurrent_reads_cannot_overdraw_the_grant_budget() {
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let stream = Stream {
+        transport: Transport::Unix(AsyncFd::new(socket).unwrap()),
+        remaining: Mutex::new(5),
+        writes: tokio::sync::Mutex::new(()),
+    };
+    let first = stream.take_read_budget(4).unwrap();
+    let second = stream.take_read_budget(4).unwrap();
+    assert_eq!((first, second), (4, 4));
+    assert_eq!(
+        stream
+            .finish_read(vec![1; first], first, first)
+            .unwrap()
+            .bytes
+            .len(),
+        4
+    );
+    assert_eq!(
+        stream.finish_read(vec![1; second], second, second),
+        Err(StreamError::LimitExceeded)
+    );
+    assert_eq!(stream.take_read_budget(1), Err(StreamError::LimitExceeded));
+}
+
+#[tokio::test]
+async fn a_pending_read_does_not_block_a_write() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (_dir, service) = service();
+    let (client, peer) = UnixStream::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    peer.set_nonblocking(true).unwrap();
+    service.streams.lock().unwrap().insert(
+        "duplex".into(),
+        Arc::new(Stream {
+            transport: Transport::Unix(AsyncFd::new(client).unwrap()),
+            remaining: Mutex::new(32),
+            writes: tokio::sync::Mutex::new(()),
+        }),
+    );
+    let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
+    let peer_task = tokio::spawn(async move {
+        let mut request = [0; 4];
+        peer.read_exact(&mut request).await.unwrap();
+        peer.write_all(b"pong").await.unwrap();
+    });
+    let (sent, page) = tokio::time::timeout(Duration::from_millis(100), async {
+        tokio::join!(service.send("duplex", b"ping"), service.next("duplex", 16))
+    })
+    .await
+    .unwrap();
+    sent.unwrap();
+    assert_eq!(page.unwrap().bytes, b"pong");
+    peer_task.await.unwrap();
+}
+
 fn grant(path: &Path, peer_uid: u32) -> StreamGrant {
     StreamGrant {
         endpoint: StreamEndpoint::Unix {

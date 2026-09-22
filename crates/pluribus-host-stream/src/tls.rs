@@ -22,16 +22,16 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 const MAX_PREAMBLE_LINE: u64 = 8 * 1024;
 /// Ceiling on lines in one multiline preamble reply.
 const MAX_PREAMBLE_LINES: usize = 128;
+const TLS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// One established TLS connection.
 ///
 /// The halves are separately locked so a read parked on an idle connection
-/// never blocks a write. `socket` is a second descriptor for the same TCP
-/// connection, held only to force a shutdown from a synchronous teardown
-/// path; nothing reads or writes through it.
+/// never blocks a write. `socket` is a second descriptor used for synchronous
+/// teardown and to finish the TCP half-close.
 pub struct Connection {
     reader: tokio::sync::Mutex<ReadHalf<TlsStream<TcpStream>>>,
-    writer: tokio::sync::Mutex<WriteHalf<TlsStream<TcpStream>>>,
+    writer: Arc<tokio::sync::Mutex<WriteHalf<TlsStream<TcpStream>>>>,
     socket: std::net::TcpStream,
 }
 
@@ -58,8 +58,7 @@ impl Connection {
     /// this side keeps reading.
     ///
     /// The shutdown needs the writer, and the caller is synchronous, so it
-    /// runs detached. Without a runtime to detach into it degrades to a bare
-    /// FIN, which every peer still reads as end of input.
+    /// runs detached. A stalled writer degrades to a bare FIN after a bound.
     pub fn shutdown_write(&self) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             let _ = self.socket.shutdown(Shutdown::Write);
@@ -68,9 +67,10 @@ impl Connection {
         let Ok(socket) = self.socket.try_clone() else {
             return;
         };
-        // Cloning the lock is not possible, so the detached task takes the
-        // descriptor and the writer half is left to close with the connection.
-        handle.spawn_blocking(move || {
+        let writer = Arc::clone(&self.writer);
+        handle.spawn(async move {
+            let shutdown = async { writer.lock().await.shutdown().await };
+            let _ = tokio::time::timeout(TLS_SHUTDOWN_TIMEOUT, shutdown).await;
             let _ = socket.shutdown(Shutdown::Write);
         });
     }
@@ -135,9 +135,85 @@ pub async fn connect(
     let (reader, writer) = tokio::io::split(stream);
     Ok(Connection {
         reader: tokio::sync::Mutex::new(reader),
-        writer: tokio::sync::Mutex::new(writer),
+        writer: Arc::new(tokio::sync::Mutex::new(writer)),
         socket: handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn shutdown_write_sends_close_notify_and_keeps_reads_open() {
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::{
+            ServerConfig,
+            pki_types::{CertificateDer, PrivateKeyDer},
+        };
+
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = CertificateDer::from(key.cert.der().to_vec());
+        let server_config = ServerConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.clone()],
+            PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap(),
+        )
+        .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = TlsAcceptor::from(Arc::new(server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut bytes = [0; 8];
+            let result = stream.read(&mut bytes).await;
+            stream.write_all(b"still-readable").await.unwrap();
+            result
+        });
+        let socket = TcpStream::connect(address).await.unwrap();
+        let std_socket = socket.into_std().unwrap();
+        let shutdown_socket = std_socket.try_clone().unwrap();
+        let socket = TcpStream::from_std(std_socket).unwrap();
+        let stream = TlsConnector::from(Arc::new(client_config))
+            .connect(
+                ServerName::try_from("localhost".to_owned()).unwrap(),
+                socket,
+            )
+            .await
+            .unwrap();
+        let (reader, writer) = tokio::io::split(stream);
+        let connection = Connection {
+            reader: tokio::sync::Mutex::new(reader),
+            writer: Arc::new(tokio::sync::Mutex::new(writer)),
+            socket: shutdown_socket,
+        };
+        connection.shutdown_write();
+        assert_eq!(peer.await.unwrap().unwrap(), 0);
+        let mut incoming = [0; 14];
+        let count = tokio::time::timeout(Duration::from_secs(2), connection.read(&mut incoming))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&incoming[..count], b"still-readable");
+    }
 }
 
 /// Speaks RFC 3207 up to the `220` after which the next byte is a handshake.

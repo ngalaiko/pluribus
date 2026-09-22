@@ -148,6 +148,12 @@ pluribus run
 Observations, raw payloads, media descriptors, model deltas, capability calls,
 and delivery outcomes persist under the data directory.
 
+Ready images enter model requests as vision inputs. Other attachments remain
+in blob storage; their contents are not inserted into the model context.
+The [shell helper](plugins/shell/README.md) reads attachments into the workspace
+and uploads generated files. [Telegram](plugins/telegram/README.md) can send
+those files as photos, documents, or other supported media.
+
 Receive [HTTP requests](plugins/http/README.md) and [GitHub observations](plugins/github/README.md), with App tokens available to the shell executor.
 
 Observe [arriving mail over IMAP](plugins/email/README.md) and answer it over

@@ -20,8 +20,8 @@ enrollment reference → GitHub Wasm validates App → installation approval URL
 
 Shell authentication:
 GitHub Wasm refreshes an installation token and exposes the webhook secret →
-core credential storage → shell Wasm resolves `GH_TOKEN` and
-`GITHUB_WEBHOOK_SECRET` → executor socket → command environment → `gh`.
+core credential storage → shell commands request `GH_TOKEN` or
+`GITHUB_WEBHOOK_SECRET` through `pluribus-shell-cli secret`.
 
 Repository setup uses the same `/events` URL as App deliveries. `gh` lists
 hooks with `--paginate`, updates the hook whose URL matches the configured

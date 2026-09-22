@@ -2312,6 +2312,7 @@ version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64",
+ "futures-util",
  "pluribus-core",
  "pluribus-model",
  "pluribus-plugin-package",
@@ -2397,6 +2398,7 @@ version = "1.0.0"
 dependencies = [
  "clap",
  "futures-util",
+ "getrandom 0.3.4",
  "nix",
  "pluribus-log",
  "pluribus-paths",
@@ -2611,10 +2613,12 @@ name = "pluribus-plugin-telegram-send"
 version = "1.0.0"
 dependencies = [
  "futures-util",
+ "jsonschema",
  "pluribus-plugin-sdk",
  "pluribus-plugin-telegram-core",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -2628,6 +2632,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "jsonschema",
  "pluribus-core",
  "pluribus-host-http",
  "pluribus-plugin-bindings",

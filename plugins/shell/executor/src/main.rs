@@ -1,6 +1,5 @@
 //! Runs shell commands under the workspace account, one connection at a time.
 
-// Each side uses a subset of the shared wire constants.
 #[path = "../../protocol/src/lib.rs"]
 #[allow(dead_code)]
 mod protocol;
@@ -74,8 +73,20 @@ fn main() {
                 Some(workspace) => workspace,
                 None => directory(Path::new("."), "workspace")?,
             };
-            let config =
+            let mut config =
                 config::Config::from_flags(args.path.clone()).map_err(|error| error.to_string())?;
+            if let Ok(executable) = std::env::current_exe()
+                && let Some(directory) = executable.parent()
+            {
+                let directory = directory.to_string_lossy();
+                if !config
+                    .path
+                    .split(':')
+                    .any(|entry| entry == directory.as_ref())
+                {
+                    config.path = format!("{directory}:{}", config.path);
+                }
+            }
             executor::serve(
                 &socket,
                 runtime_uid,

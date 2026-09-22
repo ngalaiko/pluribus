@@ -868,9 +868,7 @@ async fn connectors(
     data: &Paths,
     config: &Config,
 ) -> Result<Vec<pluribus_cognition::Connector>, Box<dyn Error>> {
-    let mut ingress: BTreeMap<String, String> = BTreeMap::new();
-    let mut replies: BTreeMap<String, (String, Vec<pluribus_core::CapabilityName>)> =
-        BTreeMap::new();
+    let mut connectors = Vec::new();
     for (id, instance) in &config.plugin_instances {
         let package = PluginPackage::load(resolve_plugin(data, &instance.package).await?)?;
         let manifest_id = &package.manifest().id;
@@ -880,6 +878,9 @@ async fn connectors(
             .unwrap_or(manifest_id)
             .to_owned();
         let reply = format!("{provider}.reply");
+        let mut ingress = None;
+        let mut reply_component = None;
+        let mut reply_capabilities = Vec::new();
         for (name, component) in package.components() {
             if !instance.components.contains_key(name) {
                 continue;
@@ -891,7 +892,7 @@ async fn connectors(
                 .iter()
                 .any(|event| event == "observation.received")
             {
-                ingress.insert(provider.clone(), selector.clone());
+                ingress = Some(selector.clone());
             }
             if manifest
                 .provides
@@ -903,22 +904,52 @@ async fn connectors(
                     .iter()
                     .map(|capability| pluribus_core::CapabilityName::new(&capability.capability))
                     .collect();
-                replies.insert(provider.clone(), (selector, capabilities));
+                reply_component = Some(selector);
+                reply_capabilities = capabilities;
             }
         }
-    }
-    Ok(ingress
-        .into_iter()
-        .map(|(provider, ingress)| {
-            let (reply, reply_capabilities) = replies.remove(&provider).unwrap_or_default();
-            pluribus_cognition::Connector {
+        if let Some(ingress) = ingress {
+            connectors.push(pluribus_cognition::Connector {
                 provider,
                 ingress,
-                reply,
+                reply: reply_component.unwrap_or_default(),
                 reply_capabilities,
-            }
+            });
+        }
+    }
+    Ok(connectors)
+}
+
+fn selected_model_component(config: &Config) -> Result<Option<String>, String> {
+    config
+        .model_instance
+        .as_deref()
+        .map(|selector| config.component(selector).map(|(id, _, _)| id))
+        .transpose()
+}
+
+fn configured_models(
+    component: &pluribus_plugin_package::PluginComponent,
+    config: &Value,
+    selected: bool,
+) -> Vec<String> {
+    if !selected {
+        return Vec::new();
+    }
+    component
+        .manifest()
+        .model_provider
+        .as_ref()
+        .and_then(|provider| config.pointer(&provider.models_pointer))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().or_else(|| v["id"].as_str()))
+                .map(str::to_owned)
+                .collect()
         })
-        .collect())
+        .unwrap_or_default()
 }
 
 const IDLE_MIN: Duration = Duration::from_millis(50);
@@ -987,6 +1018,7 @@ async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
         agent_principal.clone(),
     );
 
+    let model_component = selected_model_component(&config)?;
     let mut cognition = false;
     for (id, instance) in &config.plugin_instances {
         let package = PluginPackage::load(resolve_plugin(data, &instance.package).await?)?;
@@ -1050,25 +1082,11 @@ async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
                     .collect::<Result<_, Box<dyn Error>>>()?,
                 limits: access.limits.map(InstanceLimits::runtime),
             };
-            let models = component
-                .manifest()
-                .model_provider
-                .as_ref()
-                .map(|provider| {
-                    instance
-                        .config
-                        .pointer(&provider.models_pointer)
-                        .and_then(Value::as_array)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|v| v.as_str().or_else(|| v["id"].as_str()))
-                                .map(str::to_owned)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
+            let models = configured_models(
+                component,
+                &instance.config,
+                model_component.as_deref() == Some(component_id.as_str()),
+            );
             installs.insert(name.clone(), ComponentInstall { services, models });
         }
         agent
@@ -1206,6 +1224,92 @@ fn system_now_ns() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn connectors_keep_same_plugin_instances_paired() {
+        let mut config = crate::fixtures::config();
+        let telegram = config.plugin_instances["telegram-1"].clone();
+        config
+            .plugin_instances
+            .insert("telegram-2".into(), telegram);
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = super::connectors(&super::Paths::under(temp.path()), &config)
+            .await
+            .unwrap();
+        assert_eq!(resolved.len(), 2);
+        for id in ["telegram-1", "telegram-2"] {
+            assert!(resolved.iter().any(|c| {
+                c.ingress == format!("{id}/receive") && c.reply == format!("{id}/send")
+            }));
+        }
+    }
+
+    #[test]
+    fn model_selector_routes_only_selected_provider() {
+        use pluribus_core::{
+            AppendRequest, CommittedEvent, EventId, EventPayload, PrincipalKind, PrincipalRef,
+            StreamId, StreamKind,
+        };
+
+        let mut config = crate::fixtures::config();
+        config.model_instance = Some("codex/main".into());
+        assert_eq!(
+            super::selected_model_component(&config).unwrap().as_deref(),
+            Some("codex-1/main")
+        );
+        let request = CommittedEvent {
+            schema: CommittedEvent::SCHEMA.into(),
+            event_id: EventId::new("request"),
+            sequence: 1,
+            recorded_at_ms: 0,
+            request: AppendRequest {
+                stream_id: StreamId::new("personal"),
+                stream_kind: StreamKind::Agent,
+                observed_at_ms: None,
+                event_type: "model.requested".into(),
+                payload_schema: "pluribus.model-request/1".into(),
+                payload: EventPayload::CanonicalJson(
+                    serde_json::to_vec(&serde_json::json!({"model":"gpt-5.6-luna"})).unwrap(),
+                ),
+                actor: PrincipalRef::new(PrincipalKind::Agent, "personal"),
+                authority_id: None,
+                activity_id: None,
+                correlation_id: None,
+                causation_id: None,
+                deduplication_key: None,
+            },
+        };
+        let load = |name: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/plugins")
+                .join(name);
+            pluribus_plugin_package::PluginPackage::load(path).unwrap()
+        };
+        let codex = load("openai-codex");
+        let codex_component = &codex.components()["main"];
+        let codex_models = super::configured_models(
+            codex_component,
+            &config.plugin_instances["codex-1"].config,
+            true,
+        );
+        let codex_subscriptions = pluribus_cognition::Subscriptions::from_manifest(
+            codex_component.manifest(),
+            &codex_models,
+        );
+        assert!(codex_subscriptions.accepts(&request));
+
+        let openrouter = load("openrouter");
+        let openrouter_component = &openrouter.components()["main"];
+        let other_models = super::configured_models(
+            openrouter_component,
+            &serde_json::json!({"models":["gpt-5.6-luna"]}),
+            false,
+        );
+        let other_subscriptions = pluribus_cognition::Subscriptions::from_manifest(
+            openrouter_component.manifest(),
+            &other_models,
+        );
+        assert!(!other_subscriptions.accepts(&request));
+    }
     /// A static plugin credential is the record, not a staging area: the
     /// component reads exactly what was enrolled, and re-enrolling replaces it.
     #[tokio::test]

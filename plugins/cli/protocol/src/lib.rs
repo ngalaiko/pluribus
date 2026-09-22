@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_REQUEST: usize = 64 * 1024;
 pub const MAX_RESPONSE: usize = 256 * 1024;
 pub const MAX_TEXT: usize = 16 * 1024;
@@ -20,6 +20,8 @@ pub enum Request {
     Poll {
         version: u32,
         after: u64,
+        #[serde(default)]
+        session_id: Option<String>,
         timeout_ms: u32,
     },
     /// Delivers an agent reply to the terminal.
@@ -37,6 +39,7 @@ impl Request {
         match self {
             Self::Poll {
                 version,
+                session_id,
                 timeout_ms,
                 ..
             } => {
@@ -45,6 +48,12 @@ impl Request {
                 }
                 if *timeout_ms == 0 || *timeout_ms > MAX_TIMEOUT_MS {
                     return Err("invalid timeout");
+                }
+                if session_id
+                    .as_ref()
+                    .is_some_and(|session| session.is_empty() || session.len() > 128)
+                {
+                    return Err("invalid session");
                 }
             }
             Self::Reply {
@@ -72,6 +81,7 @@ impl Request {
 pub enum Response {
     /// Input the person typed, oldest first. Empty when the poll timed out.
     Messages {
+        session_id: String,
         messages: Vec<Message>,
     },
     Delivered,

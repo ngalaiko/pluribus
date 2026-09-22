@@ -208,7 +208,8 @@ event commits; plugins must make external exchanges replay-safe.
 
 `resolve-export(binding)` returns only the export selected by the operator's
 `config.credential_exports` binding. It grants no raw-record access. Missing
-exports and exports expiring within 30 seconds fail.
+exports and exports expiring within 30 seconds fail. The shell resolves an
+export only when `pluribus-shell-cli secret BINDING` is invoked.
 
 ### WASI clocks and randomness
 

@@ -264,7 +264,7 @@ impl StreamService for LocalStreamService {
 }
 
 impl Stream {
-    /// Reserves the smaller of the caller's request and the grant's remainder.
+    /// Caps a read at the grant's current remainder.
     fn take_read_budget(&self, max_bytes: u32) -> Result<usize, StreamError> {
         let remaining = *self.remaining.lock().map_err(|_| poisoned())?;
         let limit = usize::try_from(remaining)
@@ -284,7 +284,13 @@ impl Stream {
         read: usize,
     ) -> Result<StreamPage, StreamError> {
         debug_assert!(read <= limit);
-        *self.remaining.lock().map_err(|_| poisoned())? -= read as u64;
+        let mut remaining = self.remaining.lock().map_err(|_| poisoned())?;
+        if read as u64 > *remaining {
+            *remaining = 0;
+            return Err(StreamError::LimitExceeded);
+        }
+        *remaining -= read as u64;
+        drop(remaining);
         bytes.truncate(read);
         Ok(StreamPage {
             bytes,

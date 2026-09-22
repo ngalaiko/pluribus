@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 tokio.workspace = true
 pluribus-core = { path = "../pluribus-core" }
 pluribus-plugin-package = { path = "../pluribus-plugin-package" }

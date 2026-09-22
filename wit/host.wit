@@ -90,6 +90,9 @@ interface blobs {
   /// deduplicate.
   finish: func(handle: string) -> result<blob-ref, error>;
 
+  /// Resolves a SHA-256 digest only among references visible to this delivery.
+  resolve-visible: func(digest: string) -> result<blob-ref, error>;
+
   /// Returns at most `max-bytes`. The plugin MUST verify that the
   /// cumulative length equals `blob-ref.size`.
   read: func(blob: blob-ref, offset: u64, max-bytes: u32)

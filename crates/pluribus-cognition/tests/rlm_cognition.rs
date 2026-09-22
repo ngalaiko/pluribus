@@ -2575,7 +2575,7 @@ impl pluribus_core::StreamService for CancellableExecutor {
             self.entered.notify_one();
             std::future::pending::<()>().await;
         }
-        Ok(pluribus_core::StreamPage {bytes:b"{\"status\":\"completed\",\"stdout\":\"ok\",\"stderr\":\"\",\"exit_code\":0,\"truncated\":false}\n".to_vec(),closed:false})
+        Ok(pluribus_core::StreamPage {bytes:b"{\"type\":\"result\",\"response\":{\"status\":\"completed\",\"stdout\":\"ok\",\"stderr\":\"\",\"exit_code\":0,\"truncated\":false}}\n".to_vec(),closed:false})
     }
     fn shutdown_write(&self, _: &str) {}
     fn close(&self, _: &str) {}
