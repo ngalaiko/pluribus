@@ -57,6 +57,10 @@ receipts rebuild state after loss. Timers replay `timer.set`, `timer.cancel`, an
 requires the original request actor. WASI clock waits suspend the source loop;
 wall-clock rechecks are bounded to one second.
 
+The source loop projects timer history independently of capability delivery.
+Timer events are not delivery subscriptions, so historical timers cannot queue
+ahead of schedule requests.
+
 ## Installation
 
 ```json

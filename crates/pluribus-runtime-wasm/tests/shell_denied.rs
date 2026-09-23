@@ -223,7 +223,7 @@ async fn export_delivery(mode: &str) {
                 )
                 .unwrap()
                 .into_iter()
-                .chain([b'\n'])
+                .chain(*b"\n")
                 .collect()
             })
             .collect();
@@ -264,7 +264,7 @@ async fn export_delivery(mode: &str) {
             }))
             .unwrap()
             .into_iter()
-            .chain([b'\n'])
+            .chain(*b"\n")
             .collect(),
         );
         format!("pluribus-shell-cli attachment {}", blob.digest)

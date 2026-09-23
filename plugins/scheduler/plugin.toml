@@ -12,7 +12,7 @@ component = "plugin.wasm"
 digest = "sha256:dev"
 config_schema = "config.schema.json"
 imports = ["pluribus:plugin/runtime@3.0.0", "pluribus:plugin/events@3.0.0", "pluribus:plugin/state@3.0.0", "wasi:clocks/monotonic-clock@0.3.0", "wasi:clocks/system-clock@0.3.0"]
-subscribes = ["timer.set", "timer.cancel"]
+subscribes = []
 emits = ["timer.fired", "schedule.updated", "observation.received", "capability.completed", "capability.failed"]
 
 [[component.provides]]

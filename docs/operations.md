@@ -73,6 +73,10 @@ them.
 
 ## Diagnose
 
+`pluribus check --offline` validates installed packages, configuration, grants,
+model selection, and timer wiring without starting plugins or opening agent
+state. It does not verify enrolled credentials or remote service availability.
+
 [Logs](logging.md) describe process transitions; the event store records agent
 activity. Check component failures, capability outcomes, and unresolved attempts
 before retrying effects. Reasoning completion alone does not prove reply delivery.

@@ -1,3 +1,4 @@
+mod check;
 #[cfg(test)]
 mod fixtures;
 mod installation;
@@ -147,6 +148,12 @@ fn shell_path(path: &Path) -> String {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate configuration and packages without starting plugins.
+    Check {
+        /// Resolve packages only from installed files and cache.
+        #[arg(long)]
+        offline: bool,
+    },
     /// Show stored events for the configured agent as JSON lines.
     Logs {
         /// Keep printing new events until interrupted.
@@ -206,6 +213,16 @@ async fn run_command() -> Result<(), Box<dyn Error>> {
     let paths = Paths::resolve(&cli);
     let data = &paths;
     match cli.command {
+        Command::Check { offline } => {
+            let (config, packages) =
+                package_source::prepare_registry(data, &load_config(data)?, offline, true).await?;
+            check::validate(&config, &packages)?;
+            println!(
+                "Configuration valid: {} plugin instances",
+                config.plugin_instances.len()
+            );
+            Ok(())
+        }
         Command::Logs { follow, limit } => logs::show(data, limit as usize, follow).await,
         Command::Init { example } => {
             initialize(data, example).await?;
@@ -1090,6 +1107,7 @@ const IDLE_MAX: Duration = Duration::from_secs(5);
 async fn run_agent(data: &Paths) -> Result<(), Box<dyn Error>> {
     let (config, packages) =
         package_source::prepare_registry(data, &load_config(data)?, false, true).await?;
+    check::validate(&config, &packages)?;
     info!(
         state = %data.state.display(),
         config_dir = %data.config.display(),

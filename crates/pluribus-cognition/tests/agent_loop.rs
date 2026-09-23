@@ -619,6 +619,55 @@ async fn scheduler_plugin_emits_one_time_observations_and_manages_cron() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_plugin_serves_requests_without_redelivering_timer_history() {
+    let (mut agent, store) = build(&["schedule.list"]).await;
+    for _ in 0..256 {
+        let timer = schedule_event(&store, "timer.set", "owner", json!({"dueAtMs":1}), None).await;
+        schedule_event(
+            &store,
+            "timer.fired",
+            "old-host",
+            json!({"requestEventId":timer.event_id.as_str(),"dueAtMs":1}),
+            Some(timer.event_id.clone()),
+        )
+        .await;
+    }
+    install_scheduler(&mut agent).await;
+    let origin = schedule_event(
+        &store,
+        "observation.received",
+        "cli",
+        json!({"provider":"cli","externalSenderId":"u","conversationId":"c","message":{"text":"list schedules"}}),
+        None,
+    )
+    .await;
+    let request = schedule_event(
+        &store,
+        "capability.requested",
+        "rlm-1",
+        json!({"capability":"schedule.list","arguments":{}}),
+        Some(origin.event_id),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for _ in 0..16 {
+            agent.tick_wait(1_700_000_000_000).await.unwrap();
+            if let Some(result) = agent.result_for(&request.event_id).await.unwrap() {
+                assert_eq!(result.request.event_type, "capability.completed");
+                assert_eq!(payload(&result)["output"]["schedules"], json!([]));
+                return;
+            }
+            agent
+                .wait_for_progress(std::time::Duration::from_millis(10))
+                .await;
+        }
+        panic!("timer history blocked schedule.list");
+    })
+    .await
+    .expect("scheduler stalled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scheduler_plugin_recovers_timers_and_respects_cancellation_ownership() {
     let (mut agent, store) = build(&[]).await;
     let fired = schedule_event(&store, "timer.set", "owner", json!({"dueAtMs":1}), None).await;
