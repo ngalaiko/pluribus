@@ -152,7 +152,12 @@ provider = "chat"
 reply_component = "send"
 ```
 
-`provider` must match the observation payload. `reply_component` names a component
+`provider` must match direct observation payloads. Connectors declaring
+`inherits_origin = true` instead emit observations with `originEventId` and
+causation linking to an existing observation. The host preserves that origin's
+identity, trust, grants, and reply destination; it rejects altered identity.
+
+`reply_component` names a component
 in the same package; `""` names the unnamed single component. Omit it for an
 input-only connector. The reply component's capabilities receive origin-scoped
 grants; their constraint bindings must confine effects to that origin.

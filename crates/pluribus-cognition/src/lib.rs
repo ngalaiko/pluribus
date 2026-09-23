@@ -9,10 +9,7 @@ pub mod dispatch;
 mod tests;
 
 pub use agent::{Agent, AgentError, AuthorityResolver, ComponentInstall, Progress};
-pub use dispatch::{
-    PendingTimer, Registration, Routed, Router, RouterError, Subscriptions, fire_timer,
-    payload_field, pending_timers,
-};
+pub use dispatch::{Registration, Routed, Router, RouterError, Subscriptions, payload_field};
 
 mod authority;
 pub use authority::{Connector, OriginAuthority, OriginConstraints};

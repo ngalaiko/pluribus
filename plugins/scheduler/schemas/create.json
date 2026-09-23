@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "timing": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "at"
+          ],
+          "properties": {
+            "kind": {
+              "const": "at"
+            },
+            "at": {
+              "type": "string",
+              "description": "Future RFC 3339 timestamp including UTC offset, e.g. 2026-09-24T09:00:00+02:00"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "milliseconds"
+          ],
+          "properties": {
+            "kind": {
+              "const": "after"
+            },
+            "milliseconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "One-time delay from receipt, in milliseconds"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "expression",
+            "timezone"
+          ],
+          "properties": {
+            "kind": {
+              "const": "cron"
+            },
+            "expression": {
+              "type": "string",
+              "description": "Five-field cron: minute hour day month weekday"
+            },
+            "timezone": {
+              "type": "string",
+              "description": "IANA timezone, e.g. Europe/Stockholm or UTC"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "prompt",
+    "timing"
+  ]
+}

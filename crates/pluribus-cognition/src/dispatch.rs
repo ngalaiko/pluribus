@@ -991,14 +991,6 @@ impl<P: ConstraintPolicy> Router<P> {
             .await
             .map_err(|e| RouterError::Storage(e.to_string()))
     }
-
-    pub(crate) async fn timers(&self, page_size: usize) -> Result<Vec<PendingTimer>, RouterError> {
-        let mut projection = self.projection.lock().await;
-        projection
-            .refresh(self.events.as_ref(), &self.stream_id, page_size)
-            .await?;
-        Ok(projection.timers())
-    }
 }
 
 fn deferred_input(source: &CommittedEvent) -> Value {
@@ -1064,37 +1056,10 @@ fn deferred_input(source: &CommittedEvent) -> Value {
     envelope
 }
 
-/// Timer requests a plugin proposed and the core has yet to answer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingTimer {
-    pub request: EventId,
-    pub due_at_ms: i64,
-    pub instance_id: String,
-}
-
-/// Reads timer requests without a subsequent firing or cancellation.
-///
-/// `page_size` bounds each log read, not the number of pending timers.
-/// Zero uses one event per page. Results retain request sequence order.
-///
-/// # Errors
-///
-/// Returns an error when the stream cannot be read.
-pub async fn pending_timers(
-    events: &dyn EventStore,
-    stream_id: &StreamId,
-    page_size: usize,
-) -> Result<Vec<PendingTimer>, RouterError> {
-    let mut projection = DispatchProjection::default();
-    projection.refresh(events, stream_id, page_size).await?;
-    Ok(projection.timers())
-}
-
 #[derive(Default)]
 struct DispatchProjection {
     through: u64,
     results: BTreeMap<String, EventId>,
-    pending: BTreeMap<String, (u64, PendingTimer)>,
     jobs: BTreeMap<(String, String), (i64, String)>,
     observations: BTreeMap<String, BTreeSet<String>>,
 }
@@ -1116,9 +1081,6 @@ impl DispatchProjection {
                             "cognition.checkpoint",
                             "cognition.job-updated",
                             "cognition.observation-associated",
-                            "timer.set",
-                            "timer.fired",
-                            "timer.cancel",
                             "code.completed",
                             "code.failed",
                             "code.yielded",
@@ -1148,31 +1110,6 @@ impl DispatchProjection {
                     "cognition.checkpoint"
                     | "cognition.job-updated"
                     | "cognition.observation-associated" => self.update_cognition(&event)?,
-                    "timer.set" => {
-                        if let Some(due_at_ms) = json_number(&event, "dueAtMs") {
-                            self.pending.insert(
-                                event.event_id.as_str().into(),
-                                (
-                                    event.sequence,
-                                    PendingTimer {
-                                        request: event.event_id.clone(),
-                                        due_at_ms,
-                                        instance_id: event.request.actor.id.as_str().into(),
-                                    },
-                                ),
-                            );
-                        }
-                    }
-                    "timer.fired" | "timer.cancel" => {
-                        if let Some(request) = payload_field(&event, "requestEventId")
-                            && (event.request.event_type == "timer.fired"
-                                || self.pending.get(&request).is_some_and(|(_, timer)| {
-                                    timer.instance_id == event.request.actor.id.as_str()
-                                }))
-                        {
-                            self.pending.remove(&request);
-                        }
-                    }
                     _ => {
                         if let Some(request) = &event.request.causation_id {
                             self.results
@@ -1232,15 +1169,6 @@ impl DispatchProjection {
             pending.remove(id);
         }
     }
-
-    fn timers(&self) -> Vec<PendingTimer> {
-        let mut pending = self.pending.values().collect::<Vec<_>>();
-        pending.sort_unstable_by_key(|(sequence, _)| *sequence);
-        pending
-            .into_iter()
-            .map(|(_, timer)| timer.clone())
-            .collect()
-    }
 }
 
 fn json_number(event: &CommittedEvent, field: &str) -> Option<i64> {
@@ -1249,43 +1177,6 @@ fn json_number(event: &CommittedEvent, field: &str) -> Option<i64> {
     };
     let value: Value = serde_json::from_slice(bytes).ok()?;
     value.get(field)?.as_i64()
-}
-
-/// Appends `timer.fired` for a due timer.
-///
-/// # Errors
-///
-/// Returns an error when the append fails.
-pub async fn fire_timer(
-    events: &dyn EventStore,
-    stream_id: &StreamId,
-    agent: &PrincipalRef,
-    timer: &PendingTimer,
-) -> Result<CommittedEvent, RouterError> {
-    let payload = json!({
-        "requestEventId": timer.request.as_str(),
-        "dueAtMs": timer.due_at_ms,
-    });
-    events
-        .append(AppendRequest {
-            stream_id: stream_id.clone(),
-            stream_kind: StreamKind::Agent,
-            observed_at_ms: None,
-            event_type: "timer.fired".into(),
-            payload_schema: "pluribus.timer-fired/1".into(),
-            payload: EventPayload::CanonicalJson(
-                serde_json::to_vec(&payload)
-                    .map_err(|error| RouterError::Storage(error.to_string()))?,
-            ),
-            actor: PrincipalRef::new(PrincipalKind::Node, agent.id.as_str().to_owned()),
-            authority_id: None,
-            activity_id: None,
-            correlation_id: None,
-            causation_id: Some(timer.request.clone()),
-            deduplication_key: Some(format!("timer:{}", timer.request.as_str())),
-        })
-        .await
-        .map_err(|error| RouterError::Storage(error.to_string()))
 }
 
 fn denial_reason(reason: &DenialReason) -> String {

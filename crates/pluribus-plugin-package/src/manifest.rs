@@ -67,6 +67,8 @@ pub struct CatalogInjection {
 #[serde(deny_unknown_fields)]
 pub struct ConnectorDeclaration {
     pub provider: String,
+    #[serde(default)]
+    pub inherits_origin: bool,
     pub reply_component: Option<String>,
 }
 

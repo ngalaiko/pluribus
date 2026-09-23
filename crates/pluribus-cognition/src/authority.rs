@@ -13,6 +13,8 @@ use std::{collections::BTreeMap, sync::Arc};
 pub struct Connector {
     /// The plugin name the ingress component stamps on its observations.
     pub provider: String,
+    /// Derived observations retain their causal origin instead of issuing fresh authority.
+    pub inherits_origin: bool,
     /// Component principal of the ingress half, such as `telegram-1/receive`.
     pub ingress: String,
     /// Component principal of the reply half, such as `telegram-1/send`.
@@ -34,12 +36,41 @@ pub struct OriginAuthority {
 impl AuthorityResolver for OriginAuthority {
     async fn resolve(&self, event: &CommittedEvent) -> Result<Authority, String> {
         let mut origin = event.clone();
+        let mut inherited: Option<(String, Value)> = None;
         for _ in 0..4096 {
             if origin.request.stream_id != StreamId::new(self.agent.id.as_str()) {
                 return Err("origin belongs to another agent".into());
             }
             if origin.request.event_type == "observation.received" {
-                return self.issue(&origin);
+                let connector = self
+                    .connectors
+                    .iter()
+                    .find(|connector| {
+                        origin.request.actor
+                            == PrincipalRef::new(PrincipalKind::Component, &connector.ingress)
+                    })
+                    .ok_or("unrecognized observation connector")?;
+                let EventPayload::CanonicalJson(bytes) = &origin.request.payload else {
+                    return Err("invalid observation".into());
+                };
+                let value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+                if let Some((expected_id, expected)) = inherited.take()
+                    && (origin.event_id.as_str() != expected_id
+                        || ["provider", "externalSenderId", "conversationId"]
+                            .iter()
+                            .any(|field| value[field] != expected[field])
+                        || value.get("trusted").is_none_or(|v| v == true)
+                            != expected.get("trusted").is_none_or(|v| v == true))
+                {
+                    return Err("derived observation changes its origin".into());
+                }
+                if !connector.inherits_origin {
+                    return self.issue(&origin);
+                }
+                let id = value["originEventId"]
+                    .as_str()
+                    .ok_or("derived observation requires originEventId")?;
+                inherited = Some((id.into(), value));
             }
             let cause = origin
                 .request

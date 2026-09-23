@@ -778,6 +778,25 @@ async fn drive(agent: &mut Agent<AllowAll, TestAuthority>, now: i64) {
     panic!("agent did not become idle");
 }
 
+// Scheduler receipts keep this cognition fixture's clock deterministic.
+async fn deliver_scheduled_wake(store: &Arc<SqliteEventStore<Metadata>>) {
+    let timer = store
+        .read(&StreamId::new("personal"), 0, 10000)
+        .await
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|event| event.request.event_type == "timer.set")
+        .unwrap();
+    let mut event = event_request(
+        "timer.fired",
+        &json!({"requestEventId":timer.event_id.as_str(),"dueAtMs":payload(&timer)["dueAtMs"]}),
+    );
+    event.actor = PrincipalRef::new(PrincipalKind::Component, "scheduler");
+    event.causation_id = Some(timer.event_id);
+    store.append(event).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packaged_jobs_rebuild_corrections_and_wakes() {
     let clock = Arc::new(AtomicI64::new(1_700_000_000_000));
@@ -852,6 +871,7 @@ async fn packaged_jobs_rebuild_corrections_and_wakes() {
     assert_eq!(projection(&store).await["jobs"], state["jobs"]);
     assert_eq!(model_requests(&store).await.len(), count);
     clock.fetch_add(60_000, Ordering::Relaxed);
+    deliver_scheduled_wake(&store).await;
     drive(&mut agent, clock.load(Ordering::Relaxed)).await;
     assert_eq!(model_requests(&store).await.len(), count + 1);
     let background = model_requests(&store).await.pop().unwrap();
@@ -863,6 +883,7 @@ async fn packaged_jobs_rebuild_corrections_and_wakes() {
     .await;
     drive(&mut agent, clock.load(Ordering::Relaxed)).await;
     clock.fetch_add(120_000, Ordering::Relaxed);
+    deliver_scheduled_wake(&store).await;
     drive(&mut agent, clock.load(Ordering::Relaxed)).await;
     assert_eq!(
         projection(&store).await["jobs"][origin.event_id.as_str()]["status"],
@@ -2749,6 +2770,7 @@ async fn packaged_reasoning_preserves_large_state_across_budget_pause() {
         "paused-budget"
     );
     clock.fetch_add(60_000, Ordering::Relaxed);
+    deliver_scheduled_wake(&store).await;
     drive(&mut agent, clock.load(Ordering::Relaxed)).await;
     scripted(
         &store,

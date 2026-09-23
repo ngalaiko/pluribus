@@ -308,137 +308,6 @@ async fn a_request_without_a_result_resumes_nothing() {
 }
 
 #[tokio::test]
-async fn an_unanswered_timer_is_pending_and_fires_once() {
-    let store = store().await;
-    let stream = StreamId::new("personal");
-    let request = append(&store, "timer.set", &json!({"dueAtMs": 500})).await;
-
-    let pending = pending_timers(store.as_ref(), &stream, 100).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].due_at_ms, 500);
-    assert_eq!(pending[0].request, request.event_id);
-
-    fire_timer(store.as_ref(), &stream, &agent(), &pending[0])
-        .await
-        .unwrap();
-
-    assert!(
-        pending_timers(store.as_ref(), &stream, 100)
-            .await
-            .unwrap()
-            .is_empty(),
-        "a fired timer stops being pending, so a restart does not re-fire it"
-    );
-}
-
-#[tokio::test]
-async fn a_cancelled_timer_never_becomes_pending() {
-    let store = store().await;
-    let stream = StreamId::new("personal");
-    let request = append(&store, "timer.set", &json!({"dueAtMs": 500})).await;
-    append(
-        &store,
-        "timer.cancel",
-        &json!({"requestEventId": request.event_id.as_str()}),
-    )
-    .await;
-
-    assert!(
-        pending_timers(store.as_ref(), &stream, 100)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn timer_lookup_reaches_requests_beyond_settled_pages() {
-    let store = store().await;
-    let stream = StreamId::new("personal");
-    for n in 0..105 {
-        let timer = append(&store, "timer.set", &json!({"dueAtMs": n})).await;
-        append(
-            &store,
-            if n % 2 == 0 {
-                "timer.fired"
-            } else {
-                "timer.cancel"
-            },
-            &json!({"requestEventId": timer.event_id.as_str()}),
-        )
-        .await;
-    }
-    let timer = append(&store, "timer.set", &json!({"dueAtMs": 500})).await;
-    let pending = pending_timers(store.as_ref(), &stream, 100).await.unwrap();
-    assert_eq!(
-        pending.iter().map(|t| &t.request).collect::<Vec<_>>(),
-        vec![&timer.event_id]
-    );
-    fire_timer(store.as_ref(), &stream, &agent(), &pending[0])
-        .await
-        .unwrap();
-    assert!(
-        pending_timers(store.as_ref(), &stream, 100)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn timer_lookup_reads_terminal_events_beyond_the_first_page() {
-    let store = store().await;
-    let stream = StreamId::new("personal");
-    let cancelled = append(&store, "timer.set", &json!({"dueAtMs": 100})).await;
-    let fired = append(&store, "timer.set", &json!({"dueAtMs": 200})).await;
-    for n in 0..105 {
-        append(
-            &store,
-            "timer.fired",
-            &json!({"requestEventId": format!("other-{n}")}),
-        )
-        .await;
-    }
-    append(
-        &store,
-        "timer.cancel",
-        &json!({"requestEventId": cancelled.event_id.as_str()}),
-    )
-    .await;
-    append(
-        &store,
-        "timer.fired",
-        &json!({"requestEventId": fired.event_id.as_str()}),
-    )
-    .await;
-    assert!(
-        pending_timers(store.as_ref(), &stream, 100)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn timer_lookup_preserves_request_order_across_pages() {
-    let store = store().await;
-    let stream = StreamId::new("personal");
-    let mut expected = Vec::new();
-    for n in 0..12 {
-        expected.push(
-            append(&store, "timer.set", &json!({"dueAtMs": 12-n}))
-                .await
-                .event_id,
-        );
-    }
-    let pending = pending_timers(store.as_ref(), &stream, 3).await.unwrap();
-    assert_eq!(
-        pending.into_iter().map(|t| t.request).collect::<Vec<_>>(),
-        expected
-    );
-}
-
-#[tokio::test]
 async fn registering_the_same_instance_twice_replaces_it() {
     let store = store().await;
     let mut router = router(&store);
@@ -536,6 +405,7 @@ async fn origin_grants_follow_causation_and_confine_replies() {
         events: Arc::clone(&store) as _,
         connectors: vec![Connector {
             provider: "telegram".into(),
+            inherits_origin: false,
             ingress: "telegram-1/receive".into(),
             reply: "telegram-1/send".into(),
             reply_capabilities: vec![CapabilityName::new("telegram.send-message")],
@@ -642,46 +512,20 @@ async fn timer_delivery_uses_the_request_actor_not_payload_target() {
             },
         });
     }
-    append(
+    let request = append(
         &store,
         "timer.set",
         &json!({"dueAtMs":0,"target":"telegram-1"}),
     )
     .await;
-    let timer = pending_timers(store.as_ref(), &StreamId::new("personal"), 100)
-        .await
-        .unwrap()
-        .remove(0);
-    let fired = fire_timer(store.as_ref(), &StreamId::new("personal"), &agent(), &timer)
-        .await
-        .unwrap();
+    let fired = append(
+        &store,
+        "timer.fired",
+        &json!({"requestEventId":request.event_id.as_str(),"dueAtMs":0}),
+    )
+    .await;
     assert_eq!(router.recipients(&fired).await, vec!["rlm-1"]);
     assert!(router.poll("telegram-1", 0, 100).await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn another_plugin_cannot_cancel_an_owned_timer() {
-    let store = store().await;
-    let timer = append(&store, "timer.set", &json!({"dueAtMs":1})).await;
-    let mut cancel = append(
-        &store,
-        "timer.cancel",
-        &json!({"requestEventId":"unrelated"}),
-    )
-    .await
-    .request;
-    cancel.actor = PrincipalRef::new(PrincipalKind::Component, "telegram-1");
-    cancel.payload = EventPayload::CanonicalJson(
-        serde_json::to_vec(&json!({"requestEventId":timer.event_id.as_str()})).unwrap(),
-    );
-    store.append(cancel).await.unwrap();
-    assert_eq!(
-        pending_timers(store.as_ref(), &StreamId::new("personal"), 100)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
 }
 
 #[tokio::test]
@@ -969,35 +813,6 @@ async fn admission_checks_job_updates_without_whole_engine_checkpoints() {
 }
 
 #[tokio::test]
-async fn timer_projection_only_reads_new_events() {
-    let inner = store().await;
-    let counted = Arc::new(CountedStore {
-        inner: inner.clone(),
-        returned: AtomicU64::new(0),
-    });
-    let router = Router::new(
-        StreamId::new("personal"),
-        agent(),
-        counted.clone() as _,
-        Arc::new(EventTypeRegistry::core()),
-        AllowAll,
-    );
-    let request = append(&inner, "timer.set", &json!({"dueAtMs":5})).await;
-    assert_eq!(router.timers(1).await.unwrap().len(), 1);
-    counted.returned.store(0, Ordering::Relaxed);
-    assert_eq!(router.timers(1).await.unwrap().len(), 1);
-    assert_eq!(counted.returned.load(Ordering::Relaxed), 0);
-    append(
-        &inner,
-        "timer.cancel",
-        &json!({"requestEventId":request.event_id.as_str()}),
-    )
-    .await;
-    assert!(router.timers(1).await.unwrap().is_empty());
-    assert_eq!(counted.returned.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
 async fn resource_exhaustion_is_a_host_owned_durable_event() {
     let store = store().await;
     let router = router(&store);
@@ -1056,6 +871,7 @@ async fn untrusted_observations_do_not_inherit_standing_or_reply_grants() {
         events: Arc::clone(&store) as _,
         connectors: vec![Connector {
             provider: "github".into(),
+            inherits_origin: false,
             ingress: "github/receive".into(),
             reply: "github/send".into(),
             reply_capabilities: vec![CapabilityName::new("github.reply")],
@@ -1254,4 +1070,81 @@ async fn routing_projects_constraints_from_the_selected_provider_contract() {
             .unwrap(),
         Routed::Denied { .. }
     ));
+}
+
+#[tokio::test]
+async fn derived_observations_preserve_origin_authority_and_reject_identity_changes() {
+    use crate::{AuthorityResolver, Connector, OriginAuthority};
+    let store = store().await;
+    let resolver = OriginAuthority {
+        agent: agent(),
+        events: store.clone(),
+        max_depth: 4,
+        connectors: vec![
+            Connector {
+                provider: "cli".into(),
+                inherits_origin: false,
+                ingress: "cli".into(),
+                reply: "cli".into(),
+                reply_capabilities: vec![CapabilityName::new("cli.reply")],
+            },
+            Connector {
+                provider: "scheduler".into(),
+                inherits_origin: true,
+                ingress: "scheduler".into(),
+                reply: String::new(),
+                reply_capabilities: vec![],
+            },
+        ],
+        grants: authority(&["shell.execute"]).grants,
+    };
+    for trusted in [true, false] {
+        let identity =
+            json!({"provider":"cli","externalSenderId":"u","conversationId":"c","trusted":trusted});
+        let mut original = append(&store, "observation.received", &identity)
+            .await
+            .request;
+        original.actor = PrincipalRef::new(PrincipalKind::Component, "cli");
+        let original = store.append(original).await.unwrap();
+        let mut request = append(
+            &store,
+            "capability.requested",
+            &json!({"capability":"schedule.create"}),
+        )
+        .await
+        .request;
+        request.causation_id = Some(original.event_id.clone());
+        let request = store.append(request).await.unwrap();
+        for changed in [
+            None,
+            Some("conversationId"),
+            Some("externalSenderId"),
+            Some("provider"),
+            Some("originEventId"),
+            Some("trusted"),
+        ] {
+            let mut value = identity.clone();
+            value["originEventId"] = json!(original.event_id.as_str());
+            if let Some(field) = changed {
+                value[field] = json!("forged");
+            }
+            let mut wake = append(&store, "observation.received", &value).await.request;
+            wake.actor = PrincipalRef::new(PrincipalKind::Component, "scheduler");
+            wake.causation_id = Some(request.event_id.clone());
+            let wake = store.append(wake).await.unwrap();
+            let resolved = resolver.resolve(&wake).await;
+            // Non-true trust values are untrusted, so changing false to a string cannot expand authority.
+            if changed.is_some() && !(changed == Some("trusted") && !trusted) {
+                assert!(resolved.is_err(), "accepted changed {changed:?}");
+            } else {
+                let resolved = resolved.unwrap();
+                assert_eq!(resolved.origin.source_event_id, original.event_id);
+                assert_eq!(
+                    resolved.permits(&CapabilityName::new("shell.execute")),
+                    trusted
+                );
+                assert_eq!(resolved.origin.conversation_id.as_deref(), Some("c"));
+            }
+        }
+    }
 }

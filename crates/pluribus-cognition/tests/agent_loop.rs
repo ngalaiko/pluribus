@@ -271,7 +271,7 @@ async fn the_loop_is_idle_with_nothing_to_do() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_due_timer_fires_once() {
+async fn the_host_does_not_execute_timers() {
     let (mut agent, store) = build(&["system.echo"]).await;
     store
         .append(AppendRequest {
@@ -293,16 +293,16 @@ async fn a_due_timer_fires_once() {
         .await
         .unwrap();
 
-    let early = agent.tick_wait(100).await.unwrap();
-    let due = agent.tick_wait(500).await.unwrap();
-    let after = agent.tick_wait(900).await.unwrap();
-
-    assert_eq!(
-        early.timers_fired, 0,
-        "a timer must not fire before it is due"
+    agent.tick_wait(900).await.unwrap();
+    let events = store
+        .read(&StreamId::new("personal"), 0, 100)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.request.event_type == "timer.fired")
     );
-    assert_eq!(due.timers_fired, 1);
-    assert_eq!(after.timers_fired, 0, "a fired timer must not re-fire");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -454,4 +454,267 @@ async fn a_reinstalled_provider_serves_requests_after_a_restart() {
         !types(&store).await.contains(&"component.failed".to_owned()),
         "a restart must not report the previous source loop as a failure"
     );
+}
+
+async fn install_scheduler(agent: &mut TestAgent) {
+    let package = PluginPackage::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/plugins/scheduler"),
+    )
+    .unwrap();
+    let mut delivery = delivery();
+    delivery.instance_id = "scheduler".into();
+    agent
+        .install_package(
+            &package,
+            &json!({}),
+            delivery,
+            BTreeMap::from([(
+                String::new(),
+                pluribus_cognition::ComponentInstall::default(),
+            )]),
+        )
+        .await
+        .unwrap();
+}
+
+async fn schedule_event(
+    store: &Arc<SqliteEventStore<Metadata>>,
+    kind: &str,
+    actor: &str,
+    value: Value,
+    cause: Option<EventId>,
+) -> CommittedEvent {
+    store
+        .append(AppendRequest {
+            stream_id: StreamId::new("personal"),
+            stream_kind: StreamKind::Agent,
+            observed_at_ms: None,
+            event_type: kind.into(),
+            payload_schema: format!("test.{kind}/1"),
+            payload: EventPayload::CanonicalJson(serde_json::to_vec(&value).unwrap()),
+            actor: PrincipalRef::new(PrincipalKind::Component, actor),
+            authority_id: None,
+            activity_id: None,
+            correlation_id: None,
+            causation_id: cause,
+            deduplication_key: None,
+        })
+        .await
+        .unwrap()
+}
+
+async fn schedule_result(agent: &mut TestAgent, request: &CommittedEvent) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            agent.tick_wait(1_700_000_000_000).await.unwrap();
+            if let Some(result) = agent.result_for(&request.event_id).await.unwrap() {
+                assert_eq!(
+                    result.request.event_type,
+                    "capability.completed",
+                    "{}",
+                    payload(&result)
+                );
+                return payload(&result)["output"].clone();
+            }
+            agent
+                .wait_for_progress(std::time::Duration::from_millis(10))
+                .await;
+        }
+    })
+    .await
+    .expect("schedule request did not settle")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_plugin_emits_one_time_observations_and_manages_cron() {
+    let grants = [
+        "schedule.create",
+        "schedule.list",
+        "schedule.get",
+        "schedule.pause",
+        "schedule.resume",
+        "schedule.update",
+        "schedule.delete",
+    ];
+    let (mut agent, store) = build(&grants).await;
+    install_scheduler(&mut agent).await;
+    let origin = schedule_event(&store,"observation.received","cli",json!({"provider":"cli","externalSenderId":"u","conversationId":"c","message":{"text":"remind me"}}),None).await;
+    let create = schedule_event(&store,"capability.requested","rlm-1",json!({"capability":"schedule.create","arguments":{"name":"reminder","prompt":"check status","timing":{"kind":"after","milliseconds":100}}}),Some(origin.event_id.clone())).await;
+    let created = schedule_result(&mut agent, &create).await;
+    assert!(created["nextAtMs"].is_i64());
+    let wake = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            agent.tick_wait(1_700_000_000_000).await.unwrap();
+            let events = store
+                .read(&StreamId::new("personal"), 0, 1000)
+                .await
+                .unwrap();
+            if let Some(event) = events.into_iter().find(|e| {
+                e.request.event_type == "observation.received"
+                    && e.request.actor.id.as_str() == "scheduler"
+            }) {
+                break event;
+            }
+            agent
+                .wait_for_progress(std::time::Duration::from_millis(10))
+                .await;
+        }
+    })
+    .await
+    .expect("schedule did not fire");
+    assert_eq!(payload(&wake)["message"]["text"], "check status");
+    assert_eq!(payload(&wake)["originEventId"], origin.event_id.as_str());
+    assert_eq!(wake.request.causation_id, Some(create.event_id));
+    drop(agent);
+    clear_scheduler_projection(&store).await;
+    let mut agent = build_on(&store, &grants).await;
+    install_scheduler(&mut agent).await;
+    let list = schedule_event(
+        &store,
+        "capability.requested",
+        "rlm-1",
+        json!({"capability":"schedule.list","arguments":{}}),
+        Some(origin.event_id.clone()),
+    )
+    .await;
+    let listed = schedule_result(&mut agent, &list).await;
+    assert_eq!(listed["schedules"].as_array().unwrap().len(), 1);
+    assert!(listed["schedules"][0]["nextAtMs"].is_null());
+    let id = created["id"].clone();
+    for (capability, args) in [
+        (
+            "schedule.update",
+            json!({"id":id,"timing":{"kind":"cron","expression":"0 9 * * MON-FRI","timezone":"Europe/Stockholm"}}),
+        ),
+        ("schedule.pause", json!({"id":id})),
+        ("schedule.get", json!({"id":id})),
+        ("schedule.resume", json!({"id":id})),
+        ("schedule.delete", json!({"id":id})),
+    ] {
+        let request = schedule_event(
+            &store,
+            "capability.requested",
+            "rlm-1",
+            json!({"capability":capability,"arguments":args}),
+            Some(origin.event_id.clone()),
+        )
+        .await;
+        let result = schedule_result(&mut agent, &request).await;
+        if capability == "schedule.get" {
+            assert_eq!(result["paused"], true);
+        }
+    }
+    let events = store
+        .read(&StreamId::new("personal"), 0, 1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.request.event_type == "observation.received"
+                && e.request.actor.id.as_str() == "scheduler")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_plugin_recovers_timers_and_respects_cancellation_ownership() {
+    let (mut agent, store) = build(&[]).await;
+    let fired = schedule_event(&store, "timer.set", "owner", json!({"dueAtMs":1}), None).await;
+    schedule_event(
+        &store,
+        "timer.fired",
+        "old-host",
+        json!({"requestEventId":fired.event_id.as_str(),"dueAtMs":1}),
+        Some(fired.event_id.clone()),
+    )
+    .await;
+    let cancelled = schedule_event(&store, "timer.set", "owner", json!({"dueAtMs":1}), None).await;
+    schedule_event(
+        &store,
+        "timer.cancel",
+        "owner",
+        json!({"requestEventId":cancelled.event_id.as_str()}),
+        None,
+    )
+    .await;
+    for _ in 0..70 {
+        let timer = schedule_event(&store, "timer.set", "owner", json!({"dueAtMs":1}), None).await;
+        schedule_event(
+            &store,
+            "timer.cancel",
+            "owner",
+            json!({"requestEventId":timer.event_id.as_str()}),
+            None,
+        )
+        .await;
+    }
+    let pending = schedule_event(&store, "timer.set", "owner", json!({"dueAtMs":1}), None).await;
+    schedule_event(
+        &store,
+        "timer.cancel",
+        "stranger",
+        json!({"requestEventId":pending.event_id.as_str()}),
+        None,
+    )
+    .await;
+    install_scheduler(&mut agent).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            agent.tick_wait(1_700_000_000_000).await.unwrap();
+            let events = store
+                .read(&StreamId::new("personal"), 0, 1000)
+                .await
+                .unwrap();
+            if events.iter().any(|e| {
+                e.request.event_type == "timer.fired"
+                    && payload(e)["requestEventId"] == pending.event_id.as_str()
+            }) {
+                break;
+            }
+            agent
+                .wait_for_progress(std::time::Duration::from_millis(10))
+                .await;
+        }
+    })
+    .await
+    .expect("timer did not fire");
+    drop(agent);
+    let mut agent = build_on(&store, &[]).await;
+    install_scheduler(&mut agent).await;
+    agent.tick_wait(1_700_000_000_000).await.unwrap();
+    let events = store
+        .read(&StreamId::new("personal"), 0, 1000)
+        .await
+        .unwrap();
+    let fired: Vec<_> = events
+        .iter()
+        .filter(|e| e.request.event_type == "timer.fired")
+        .collect();
+    assert_eq!(fired.len(), 2);
+    assert!(
+        !fired
+            .iter()
+            .any(|e| payload(e)["requestEventId"] == cancelled.event_id.as_str())
+    );
+}
+
+async fn clear_scheduler_projection(store: &Arc<SqliteEventStore<Metadata>>) {
+    let namespace = pluribus_core::StateNamespace::new("scheduler");
+    let state = store.scan(&namespace, "", None, 1000).await.unwrap();
+    store
+        .apply(
+            &namespace,
+            state.revision,
+            &state
+                .entries
+                .iter()
+                .map(|entry| pluribus_core::StateMutation::Delete {
+                    key: entry.key.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
 }

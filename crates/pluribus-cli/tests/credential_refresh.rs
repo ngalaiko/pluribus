@@ -292,11 +292,11 @@ async fn device_enrollment(reenroll_during_exchange: bool) {
         }
         unrelated.deduplication_key = None;
         let unrelated = store.append(unrelated).await.unwrap();
-        let unrelated_fired = pluribus_cognition::fire_timer(
+        let unrelated_fired = fire_timer(
             store.as_ref(),
             &StreamId::new("personal"),
             &PrincipalRef::new(PrincipalKind::Node, "scheduler"),
-            &pluribus_cognition::PendingTimer {
+            &PendingTimer {
                 request: unrelated.event_id,
                 due_at_ms: device_due,
                 instance_id: "codex-1/main".into(),
@@ -335,11 +335,11 @@ async fn device_enrollment(reenroll_during_exchange: bool) {
         "restart must preserve the pending timer"
     );
     clock.store(device_due, Ordering::SeqCst);
-    let fired = pluribus_cognition::fire_timer(
+    let fired = fire_timer(
         store.as_ref(),
         &StreamId::new("personal"),
         &PrincipalRef::new(PrincipalKind::Node, "scheduler"),
-        &pluribus_cognition::PendingTimer {
+        &PendingTimer {
             request: timer.event_id,
             due_at_ms: device_due,
             instance_id: "codex-1/main".into(),
@@ -385,11 +385,11 @@ async fn device_enrollment(reenroll_during_exchange: bool) {
         .unwrap()
         .clone();
     clock.store(device_due, Ordering::SeqCst);
-    let fired = pluribus_cognition::fire_timer(
+    let fired = fire_timer(
         store.as_ref(),
         &StreamId::new("personal"),
         &PrincipalRef::new(PrincipalKind::Node, "scheduler"),
-        &pluribus_cognition::PendingTimer {
+        &PendingTimer {
             request: timer.event_id,
             due_at_ms: device_due,
             instance_id: "codex-1/main".into(),
@@ -738,4 +738,26 @@ async fn packaged_codex_refreshes_its_own_credential_after_401() {
     assert_eq!(record["refresh_token"], "new-refresh");
     assert_eq!(record["enrollment"]["id"], "pending");
     server.join().unwrap();
+}
+
+struct PendingTimer {
+    request: pluribus_core::EventId,
+    due_at_ms: i64,
+    instance_id: String,
+}
+async fn fire_timer(
+    events: &dyn pluribus_core::EventStore,
+    stream: &pluribus_core::StreamId,
+    _agent: &pluribus_core::PrincipalRef,
+    timer: &PendingTimer,
+) -> Result<pluribus_core::CommittedEvent, Box<dyn std::error::Error>> {
+    let _ = &timer.instance_id;
+    events.append(pluribus_core::AppendRequest {
+        stream_id: stream.clone(), stream_kind: pluribus_core::StreamKind::Agent,
+        observed_at_ms: None, event_type: "timer.fired".into(), payload_schema: "pluribus.timer-fired/1".into(),
+        payload: pluribus_core::EventPayload::CanonicalJson(serde_json::to_vec(&serde_json::json!({"requestEventId":timer.request.as_str(),"dueAtMs":timer.due_at_ms})).unwrap()),
+        actor: pluribus_core::PrincipalRef::new(pluribus_core::PrincipalKind::Component, "scheduler"),
+        authority_id: None, activity_id: None, correlation_id: None, causation_id: Some(timer.request.clone()),
+        deduplication_key: Some(format!("timer:{}", timer.request.as_str())),
+    }).await.map_err(Into::into)
 }

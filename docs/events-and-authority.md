@@ -432,23 +432,19 @@ before transport without producing it.
 
 ### Timers
 
-A timer is a request and a result, not a scheduler table. A plugin appends
-`timer.set`; the core appends `timer.fired` when due. Outstanding timers are
-recovered by reading `timer.set` events with no matching `timer.fired` or
-`timer.cancel`, so a restart neither loses a timer nor fires one twice.
+The [scheduler plugin](../plugins/scheduler/README.md) executes timers. Plugins
+request `timer.set` with `dueAtMs` or `timer.cancel` with `requestEventId`;
+the scheduler emits `timer.fired`. Core only routes a firing to its request
+actor. Timer requests and terminal receipts recover pending work after restart.
 
-Plugin-emitted:
+The same plugin exposes one-time and cron schedule capabilities. Occurrences
+emit observations; `schedule.updated` records schedule state. All four timer
+and schedule event types are plugin-emittable.
 
-```text
-timer.set
-timer.cancel
-```
-
-Core-owned:
-
-```text
-timer.fired
-```
+A connector declaring `inherits_origin = true` must emit derived observations
+with `originEventId`. Core follows causation to that observation and validates
+provider, sender, conversation, and trust before inheriting its current grants
+and reply destination. A derived observation cannot create fresh authority.
 
 ### Policy
 

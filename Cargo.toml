@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "plugins/http",
+    "plugins/scheduler",
     "plugins/github",
     "crates/pluribus-core",
     "crates/pluribus-log",

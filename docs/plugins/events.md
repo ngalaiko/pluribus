@@ -67,7 +67,7 @@ plugin-emittable types its manifest lists in `emits`.
 ### Core-owned
 
 Only the core appends these. They record component health, operator control,
-gates, dispatch outcomes, and timers:
+gates and dispatch outcomes:
 
 ```text
 component.failed        component.backoff       component.recovered
@@ -77,7 +77,6 @@ policy.decision
 credential.enrollment.requested
 activity.attempted      activity.unknown
 capability.denied       capability.timed-out    capability.cancelled
-timer.fired
 stream.closed
 agent.failed
 ```
@@ -101,7 +100,8 @@ memory.remembered       memory.superseded       memory.forgotten
 code.evaluate-requested code.yielded            code.resumed
 code.completed          code.failed
 code.close-requested    code.closed
-timer.set               timer.cancel
+timer.set               timer.cancel             timer.fired
+schedule.updated
 http.request.received    http.response.requested
 ```
 
@@ -167,7 +167,7 @@ charged for reading the whole stream.
 An observation is an event. There is no separate observation record and no
 poll/push source role.
 
-The plugin proposes `timer.set`; the core answers `timer.fired`; the plugin
+The plugin proposes `timer.set`; the scheduler plugin answers `timer.fired`; the plugin
 fetches and proposes `observation.received`.
 
 The provider's own delivery identifier is the deduplication key. It MUST be

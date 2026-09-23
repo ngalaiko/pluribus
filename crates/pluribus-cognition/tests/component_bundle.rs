@@ -150,6 +150,7 @@ async fn setup() -> (FixtureAgent, Arc<SqliteEventStore<Metadata>>, Arc<Telegram
         events: store.clone(),
         connectors: vec![pluribus_cognition::Connector {
             provider: "telegram".into(),
+            inherits_origin: false,
             ingress: "telegram-1/receive".into(),
             reply: "telegram-1/send".into(),
             reply_capabilities: vec![CapabilityName::new("telegram.send-message")],

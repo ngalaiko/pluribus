@@ -381,6 +381,11 @@
               "$ref": "#/$defs/component_name"
             }
           ]
+        },
+        "inherits_origin": {
+          "type": "boolean",
+          "default": false,
+          "description": "Observations must inherit identity and authority from an observation in their causation chain."
         }
       }
     },

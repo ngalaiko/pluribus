@@ -258,7 +258,7 @@ async fn example_configuration(data: &Paths) -> Result<(), Box<dyn Error>> {
     const DEMO_KEY: &str =
         "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";
 
-    for name in ["cli", "shell", "openrouter", "rlm"] {
+    for name in ["cli", "shell", "openrouter", "rlm", "scheduler"] {
         installation::install_named(data, name).await?;
     }
 
@@ -266,7 +266,23 @@ async fn example_configuration(data: &Paths) -> Result<(), Box<dyn Error>> {
     config.identity = IDENTITY.into();
     config.model = MODEL.into();
     config.model_instance = Some("openrouter/main".into());
-    config.capability_instances = vec!["shell/main".into()];
+    config.capability_instances = vec!["shell/main".into(), "scheduler".into()];
+    let schedule_capabilities: Vec<String> = [
+        "create", "list", "get", "update", "pause", "resume", "delete",
+    ]
+    .into_iter()
+    .map(|method| format!("schedule.{method}"))
+    .collect();
+    config.trusted_constraints.insert(
+        "scheduler".into(),
+        schedule_capabilities
+            .iter()
+            .map(|capability| (capability.clone(), json!({})))
+            .collect(),
+    );
+    config
+        .trusted_capabilities
+        .insert("scheduler".into(), schedule_capabilities);
     config
         .trusted_capabilities
         .insert("shell/main".into(), vec!["shell.execute".into()]);
@@ -286,6 +302,7 @@ async fn example_configuration(data: &Paths) -> Result<(), Box<dyn Error>> {
         json!({"credentials": {"api-key": "openrouter:personal"}, "models": [MODEL]}),
     )?;
     set(&mut config, "rlm", json!({}))?;
+    set(&mut config, "scheduler", json!({}))?;
     save_config(data, &config)?;
     enroll(data, "openrouter", "api-key", json!({"api_key": DEMO_KEY})).await?;
 
@@ -297,7 +314,7 @@ async fn example_configuration(data: &Paths) -> Result<(), Box<dyn Error>> {
     } else {
         format!(" --data-dir {}", data.state.display())
     };
-    println!("\nConfigured cli, shell, openrouter and rlm, on a shared key with no");
+    println!("\nConfigured cli, shell, openrouter, rlm and scheduler, on a shared key with no");
     println!("budget. Replace it with `pluribus{where_} auth openrouter`.");
     println!("\nStart each of these, in its own terminal:");
     println!("  pluribus-cli-bridge{where_}");
@@ -968,6 +985,7 @@ fn connectors(
                     };
                 connectors.push(pluribus_cognition::Connector {
                     provider: declaration.provider.clone(),
+                    inherits_origin: declaration.inherits_origin,
                     ingress: selector,
                     reply,
                     reply_capabilities,
@@ -1642,6 +1660,7 @@ mod tests {
             ),
             connectors: vec![pluribus_cognition::Connector {
                 provider: "telegram".into(),
+                inherits_origin: false,
                 ingress: "telegram-1/receive".into(),
                 reply: "telegram-1/send".into(),
                 reply_capabilities: vec![pluribus_core::CapabilityName::new("telegram.reply")],

@@ -42,7 +42,7 @@ rustPlatform.buildRustPackage {
       install -D "$wasm/pluribus_plugin_''${crate//-/_}.wasm" "components/$path"
     }
 
-    for plugin in cli echo memory openai-codex openrouter shell; do
+    for plugin in cli echo memory openai-codex openrouter scheduler shell; do
       component "$plugin" "$plugin/main.wasm"
     done
 

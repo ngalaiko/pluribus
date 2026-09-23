@@ -153,7 +153,10 @@ impl Guest for Codex {
                 continue;
             }
             if event.event_type == "timer.fired" {
-                if event.actor.kind != types::PrincipalKind::Node {
+                if !matches!(
+                    event.actor.kind,
+                    types::PrincipalKind::Component | types::PrincipalKind::Node
+                ) {
                     continue;
                 }
                 let mut timer = event_value(event)?;

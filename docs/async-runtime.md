@@ -17,7 +17,7 @@ A pending HTTP cancellation test also failed before cancellation handling. It pa
 - Cancelling an agent wait retains ownership of its provider. Dropping a lifecycle future invalidates that instance; reinstantiation reads the durable checkpoint.
 - Each instance still owns one mutable store and receives one lifecycle call at a time. Package components stage and validate first, then initialize and rebuild independently in parallel; each component keeps init before rebuild. Cognition remains serialized. Independent providers share the executor instead of spawning delivery threads.
 - HTTP uses bounded async channels. Dropping a stream aborts its reader; abandoned response uploads are cleaned up. Socket readiness replaces polling sleeps and registry-wide locking. Writes remain serialized per socket.
-- Committed events and completed deliveries notify the agent. Idle waits remain bounded to discover external database writes and due timers.
+- Committed events and completed deliveries notify the agent. Idle waits remain bounded to discover external database writes.
 - Storage imports, projection replay, blob transfers, credential resolution, and delivery commits await asynchronous storage APIs. Compilation uses blocking workers. A database transaction already executing finishes atomically if its awaiting task is dropped.
 
 ## Boundaries

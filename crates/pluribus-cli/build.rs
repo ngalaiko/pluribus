@@ -23,6 +23,7 @@ fn main() {
             "openai-codex",
             "openrouter",
             "rlm",
+            "scheduler",
             "shell",
             "telegram",
         ] {

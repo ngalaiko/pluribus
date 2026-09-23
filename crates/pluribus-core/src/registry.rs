@@ -27,8 +27,6 @@ pub const RESERVED_EVENT_TYPES: &[&str] = &[
     "capability.denied",
     "capability.timed-out",
     "capability.cancelled",
-    // Timers, owned by the core scheduler
-    "timer.fired",
     // Transport audit
     "stream.closed",
     // Inter-agent calls
@@ -72,9 +70,11 @@ pub const PLUGIN_EVENT_TYPES: &[&str] = &[
     "code.resumed",
     "code.completed",
     "code.failed",
-    // Timers, requested by a plugin and answered by the core
+    // Scheduling plugin protocol
     "timer.set",
     "timer.cancel",
+    "timer.fired",
+    "schedule.updated",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

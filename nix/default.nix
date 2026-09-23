@@ -46,6 +46,10 @@ rec {
   inherit buildPluginPackage workspace;
 
   plugins = {
+    scheduler = package {
+      name = "scheduler";
+      components = [ "" ];
+    };
     http = package {
       name = "http";
       components = [ "listen" ];
@@ -144,7 +148,7 @@ rec {
         # A selection carrying the example packages proves they load and that
         # `bundled:` names reach them: the example installs each one.
         example=1
-        for name in cli shell openrouter rlm; do
+        for name in cli shell openrouter rlm scheduler; do
           [ -d "$out/share/pluribus/plugins/$name" ] || example=
         done
         if [ -n "$example" ]; then

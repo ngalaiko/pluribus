@@ -1,12 +1,10 @@
 //! The agent loop.
 //!
-//! One pass fires due timers, gates new requests against authority, then
+//! One pass gates new requests against authority, then
 //! delivers pending events to each instance. Every step reads its position
 //! from the log, so a restart resumes rather than replaying or skipping.
 
-use crate::dispatch::{
-    PendingTimer, Registration, Routed, Router, RouterError, Subscriptions, fire_timer,
-};
+use crate::dispatch::{Registration, Routed, Router, RouterError, Subscriptions};
 use pluribus_core::{
     Authority, CommittedEvent, ConstraintPolicy, EventId, EventStore, PrincipalRef, StreamId,
 };
@@ -39,7 +37,6 @@ pub trait AuthorityResolver: Send + Sync {
 /// What one pass accomplished. All zero means the agent is idle.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Progress {
-    pub timers_fired: usize,
     pub requests_gated: usize,
     pub requests_denied: usize,
     pub deliveries: usize,
@@ -49,10 +46,7 @@ pub struct Progress {
 impl Progress {
     #[must_use]
     pub const fn is_idle(&self) -> bool {
-        self.timers_fired == 0
-            && self.requests_gated == 0
-            && self.deliveries == 0
-            && self.events_committed == 0
+        self.requests_gated == 0 && self.deliveries == 0 && self.events_committed == 0
     }
 }
 
@@ -409,13 +403,13 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             return Err(AgentError::Storage("one cognition writer per agent".into()));
         }
         for name in &subscriptions.capabilities {
-            if name.starts_with("memory.")
+            if (name.starts_with("memory.") || name.starts_with("schedule."))
                 && registrations
                     .iter()
                     .any(|r| r.subscriptions.capabilities.contains(name))
             {
                 return Err(AgentError::Storage(format!(
-                    "duplicate memory provider: {name}"
+                    "duplicate exclusive provider: {name}"
                 )));
             }
         }
@@ -532,18 +526,6 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             return Ok(progress);
         }
 
-        for timer in self.due_timers(now_ms).await? {
-            fire_timer(
-                self.events.as_ref(),
-                &self.stream_id,
-                &self.principal,
-                &timer,
-            )
-            .await
-            .map_err(AgentError::Router)?;
-            progress.timers_fired += 1;
-        }
-
         let cognition: Vec<_> = self
             .router
             .registrations()
@@ -588,7 +570,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         Ok(progress)
     }
 
-    /// Waits for local progress, bounded to poll external writers and timers.
+    /// Waits for local progress, bounded to poll external writers.
     pub async fn wait_for_progress(&self, maximum: std::time::Duration) {
         let progress = self.runtime.progress_notification();
         let _ = tokio::time::timeout(maximum, progress.notified()).await;
@@ -992,17 +974,6 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
             }
         }
         Ok(true)
-    }
-
-    async fn due_timers(&mut self, now_ms: i64) -> Result<Vec<PendingTimer>, AgentError> {
-        Ok(self
-            .router
-            .timers(self.batch)
-            .await
-            .map_err(AgentError::Router)?
-            .into_iter()
-            .filter(|timer| timer.due_at_ms <= now_ms)
-            .collect())
     }
 
     /// Runs the authority gate over requests committed since the last pass.

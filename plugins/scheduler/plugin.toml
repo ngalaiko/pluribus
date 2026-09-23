@@ -1,0 +1,72 @@
+abi = "pluribus:plugin@3.0.0"
+manifest_version = 1
+id = "dev.pluribus.scheduler"
+name = "Scheduler"
+config_schema = "config.schema.json"
+license = "MIT OR Apache-2.0"
+
+[component]
+connector = { provider = "scheduler", inherits_origin = true }
+world = "pluribus:plugin/plugin@3.0.0"
+component = "plugin.wasm"
+digest = "sha256:dev"
+config_schema = "config.schema.json"
+imports = ["pluribus:plugin/runtime@3.0.0", "pluribus:plugin/events@3.0.0", "pluribus:plugin/state@3.0.0", "wasi:clocks/monotonic-clock@0.3.0", "wasi:clocks/system-clock@0.3.0"]
+subscribes = ["timer.set", "timer.cancel"]
+emits = ["timer.fired", "schedule.updated", "observation.received", "capability.completed", "capability.failed"]
+
+[[component.provides]]
+capability = "schedule.create"
+description = "Schedule a prompt once at a timestamp, once after a delay, or repeatedly with cron. Occurrences become new observations in this conversation."
+arguments_schema = "schemas/create.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "keyed"
+
+[[component.provides]]
+capability = "schedule.list"
+description = "List schedules owned by the current sender in this conversation."
+arguments_schema = "schemas/list.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "inherent"
+
+[[component.provides]]
+capability = "schedule.get"
+description = "Read a schedule and its next and last occurrence."
+arguments_schema = "schemas/get.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "inherent"
+
+[[component.provides]]
+capability = "schedule.update"
+description = "Update a schedule. A timing change computes a new deadline; paused schedules remain paused."
+arguments_schema = "schemas/update.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "keyed"
+
+[[component.provides]]
+capability = "schedule.pause"
+description = "Pause a schedule without deleting it."
+arguments_schema = "schemas/pause.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "keyed"
+
+[[component.provides]]
+capability = "schedule.resume"
+description = "Resume a paused schedule. Missed occurrences coalesce into one execution."
+arguments_schema = "schemas/resume.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "keyed"
+
+[[component.provides]]
+capability = "schedule.delete"
+description = "Delete a schedule and prevent future occurrences. Already emitted work is unaffected."
+arguments_schema = "schemas/delete.json"
+result_schema = "schemas/result.json"
+constraints_schema = "schemas/constraints.json"
+idempotency = "keyed"

@@ -1,0 +1,18 @@
+[package]
+name = "pluribus-plugin-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pluribus-plugin-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+croner = { version = "4", default-features = false, features = ["chrono"] }

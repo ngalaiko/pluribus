@@ -1,7 +1,7 @@
 # Persistent work and observation coordination
 
 RLM owns durable jobs and one coordinator per agent. Core records observations,
-executes authorized activities, delivers results, schedules wakes, and enforces
+executes authorized activities, delivers results and enforces
 limits. Jobs retain responsibility for unfinished objectives across messages,
 waiting periods, bounded reasoning cycles, and process restarts.
 
@@ -13,7 +13,7 @@ waiting periods, bounded reasoning cycles, and process restarts.
 | Associate observations with jobs | Preserve origin, identity, authority, and destinations |
 | Continue, wait, cancel, finish, or ask the user | Dispatch, cancellation, deadlines, and concurrency ceilings |
 | Select memory and history for the next decision | Enforce visibility and grants |
-| Choose wake deadlines and retry intent | Persist and route timers; deduplicate execution |
+| Choose wake deadlines and retry intent | Route timer receipts; deduplicate execution |
 | Select recoverable context checkpoints | Track attempt outcomes and prevent unsafe replay |
 
 One coordinator serializes decisions; several jobs and activities may exist.
@@ -126,7 +126,7 @@ explicit resume action.
 
 ## Waiting and wakes
 
-`timer.fired` routes through its original request actor. Payload targets confer
+The scheduler plugin executes timers. `timer.fired` routes through its original request actor. Payload targets confer
 neither ownership nor authority. Job revisions invalidate obsolete wakes. Waiting
 for input produces no periodic inference. Timed waits require a future external
 deadline. Code results automatically request the next reasoning step. There is
