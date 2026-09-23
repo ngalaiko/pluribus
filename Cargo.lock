@@ -2567,6 +2567,8 @@ name = "pluribus-plugin-sdk"
 version = "1.0.0"
 dependencies = [
  "futures-util",
+ "serde",
+ "serde_json",
  "url",
  "wit-bindgen 0.62.0",
 ]

@@ -215,8 +215,7 @@ fn trigger_input(task: &Task) -> &'static str {
     }
 }
 
-/// Ready image attachments of one observation, as model content parts. The
-/// payload spells the blob in camelCase; the model request uses snake_case.
+/// Ready image attachments of one observation, as model content parts.
 fn image_parts(observation: &Value) -> Vec<Value> {
     observation["media"]
         .as_array()
@@ -224,17 +223,12 @@ fn image_parts(observation: &Value) -> Vec<Value> {
         .flatten()
         .filter(|item| item["status"] == "ready")
         .filter_map(|item| {
-            let blob = item.get("blob")?;
-            let media_type = blob["mediaType"].as_str()?;
-            let size = blob["size"].as_u64()?;
-            (media_type.starts_with("image/") && size <= MAX_IMAGE_BYTES).then(|| {
-                json!({"kind":"image","blob":{
-                    "algorithm": blob["algorithm"],
-                    "digest": blob["digest"],
-                    "size": size,
-                    "media_type": media_type,
-                }})
-            })
+            let blob = serde_json::from_value::<pluribus_plugin_sdk::blob::BlobRef>(
+                item.get("blob")?.clone(),
+            )
+            .ok()?;
+            (blob.media_type.starts_with("image/") && blob.size <= MAX_IMAGE_BYTES)
+                .then(|| json!({"kind":"image","blob":blob.to_json(pluribus_plugin_sdk::blob::MediaTypeSpelling::Snake)}))
         })
         .take(MAX_TURN_IMAGES)
         .collect()
@@ -247,27 +241,18 @@ fn attachment_refs(observation: &Value) -> Vec<Value> {
         .flatten()
         .filter(|item| item["status"] == "ready")
         .filter_map(|item| {
-            let blob = item.get("blob")?;
-            let algorithm = blob["algorithm"].as_str()?;
-            let digest = blob["digest"].as_str()?;
-            let size = blob["size"].as_u64()?;
-            let media_type = blob["mediaType"]
-                .as_str()
-                .or_else(|| blob["media_type"].as_str())?;
-            (algorithm == "sha256"
-                && digest.len() == 64
-                && digest
+            let blob = serde_json::from_value::<pluribus_plugin_sdk::blob::BlobRef>(
+                item.get("blob")?.clone(),
+            )
+            .ok()?;
+            (blob.algorithm == "sha256"
+                && blob.digest.len() == 64
+                && blob
+                    .digest
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                && !media_type.is_empty())
-            .then(|| {
-                json!({
-                    "algorithm": algorithm,
-                    "digest": digest,
-                    "size": size,
-                    "media-type": media_type,
-                })
-            })
+                && !blob.media_type.is_empty())
+            .then(|| blob.to_json(pluribus_plugin_sdk::blob::MediaTypeSpelling::Kebab))
         })
         .take(32)
         .collect()

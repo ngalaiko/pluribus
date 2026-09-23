@@ -10,6 +10,7 @@ wit_bindgen::generate!({
     generate_unused_types: true,
 });
 
+pub mod blob;
 pub mod http;
 mod run;
 pub mod socket;

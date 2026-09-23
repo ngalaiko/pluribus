@@ -10,3 +10,5 @@ description = "Guest bindings and runtime helpers for Pluribus plugins"
 futures-util.workspace = true
 url.workspace = true
 wit-bindgen.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

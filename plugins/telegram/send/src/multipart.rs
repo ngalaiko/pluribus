@@ -1,31 +1,9 @@
 //! Uploading media to Telegram as multipart form data.
 
-use serde::Deserialize;
 use telegram::api::{CHUNK_BYTES, ORIGIN, TelegramResponse, decode_response, internal, write};
 use telegram::http::{self, Header, Request};
 use telegram::pluribus::plugin::blobs;
 use telegram::pluribus::plugin::types::{BlobRef, Error};
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BlobArgument {
-    pub algorithm: String,
-    pub digest: String,
-    pub size: u64,
-    #[serde(rename = "media_type", alias = "mediaType", alias = "media-type")]
-    pub media_type: String,
-}
-
-impl From<BlobArgument> for BlobRef {
-    fn from(value: BlobArgument) -> Self {
-        Self {
-            algorithm: value.algorithm,
-            digest: value.digest,
-            size: value.size,
-            media_type: value.media_type,
-        }
-    }
-}
 
 pub fn call(
     method: &str,
@@ -106,7 +84,7 @@ fn safe_file_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::BlobArgument;
+    use pluribus_plugin_sdk::blob::BlobRef;
 
     #[test]
     fn accepts_blob_reference_media_type_spellings() {
@@ -117,7 +95,7 @@ mod tests {
                 "size": 4,
                 key: "image/png"
             });
-            let blob: BlobArgument = serde_json::from_value(value).unwrap();
+            let blob: BlobRef = serde_json::from_value(value).unwrap();
             assert_eq!(blob.media_type, "image/png");
         }
     }

@@ -20,6 +20,7 @@ Plugins use these types and `export!`; they do not generate a second copy.
 - `exports::pluribus::plugin::lifecycle`: `Guest`, `Context`, and `Outcome`.
 - `serve`: dispatch, commit, reject, and checkpoint handling for handler-only plugins.
 - `http`: streaming HTTP responses and bounded inline exchanges.
+- `blob`: typed JSON references and explicit media-type field conversions.
 - `socket::Socket`: asynchronous reads and writes to granted endpoints.
 
 A handler-only plugin:

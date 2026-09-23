@@ -2,7 +2,7 @@
 
 mod multipart;
 
-use multipart::BlobArgument;
+use pluribus_plugin_sdk::blob::BlobRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use telegram::exports::pluribus::plugin::lifecycle::{Context, Guest, Outcome};
@@ -206,7 +206,7 @@ fn send_location(arguments: &Value, config: &Config) -> Result<Value, Error> {
 fn send_media(arguments: &Value, config: &Config) -> Result<Value, Error> {
     let kind = required_string(arguments, "kind")?;
     let (method, field) = media_method(kind)?;
-    let blob: BlobArgument = serde_json::from_value(required(arguments, "blob")?.clone())
+    let blob = BlobRef::from_value_strict(required(arguments, "blob")?.clone())
         .map_err(|error| telegram::api::invalid(format!("invalid blob: {error}")))?;
     let file_name = arguments
         .get("file_name")
@@ -246,7 +246,7 @@ fn send_media_group(arguments: &Value, config: &Config) -> Result<Value, Error> 
         if !matches!(kind, "photo" | "video" | "audio" | "document") {
             return Err(telegram::api::invalid("unsupported media-group kind"));
         }
-        let blob: BlobArgument = serde_json::from_value(required(item, "blob")?.clone())
+        let blob = BlobRef::from_value_strict(required(item, "blob")?.clone())
             .map_err(|error| telegram::api::invalid(format!("invalid blob: {error}")))?;
         let attachment = format!("file{index}");
         let mut entry = json!({"type": kind, "media": format!("attach://{attachment}")});

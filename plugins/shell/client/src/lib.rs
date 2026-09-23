@@ -278,12 +278,10 @@ fn core_operation(request: protocol::CoreRequest) -> CoreReply {
             } => blobs::write(&handle, offset, &bytes).map(|next| next.to_string().into_bytes()),
             CoreOperation::AttachmentFinish { handle } => {
                 let blob = blobs::finish(&handle)?;
-                serde_json::to_vec(&json!({
-                    "algorithm": blob.algorithm,
-                    "digest": blob.digest,
-                    "size": blob.size,
-                    "media_type": blob.media_type,
-                }))
+                let blob = pluribus_plugin_sdk::blob::BlobRef::from(blob);
+                serde_json::to_vec(
+                    &blob.to_json(pluribus_plugin_sdk::blob::MediaTypeSpelling::Snake),
+                )
                 .map_err(|_| failure(ErrorCode::Internal, "cannot encode uploaded attachment"))
             }
         }
