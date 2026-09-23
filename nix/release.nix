@@ -148,7 +148,8 @@ rustPlatform.buildRustPackage {
 
     config=$smoke/agent/config.json
     pluribus() {
-      env -u PLURIBUS_PLUGIN_DIR PATH="" "$binary" --data-dir "$smoke/agent" "$@"
+      env -u PLURIBUS_PLUGIN_DIR PATH="" "$binary" --data-dir "$smoke/agent" \
+        --config-dir "$smoke/agent" --cache-dir "$smoke/agent" --runtime-dir "$smoke/agent" "$@"
     }
 
     binary=$smoke/bin/pluribus
@@ -161,13 +162,13 @@ rustPlatform.buildRustPackage {
     # Install packages the way a release installation does: by URL and digest.
     digest() { cut -d' ' -f1 < "$out/pluribus-plugin-$1-${version}.tar.gz.sha256"; }
     for name in memory rlm; do
-      pluribus install "file://$out/pluribus-plugin-$name-${version}.tar.gz" \
+      pluribus plugins install "file://$out/pluribus-plugin-$name-${version}.tar.gz" \
         --sha256 "$(digest "$name")"
     done
     jq -e '.plugin_instances | has("memory") and has("rlm")' "$config" > /dev/null
 
     # A digest already resolved must be served from the cache, not the network.
-    pluribus install https://example.invalid/unavailable \
+    pluribus plugins install https://example.invalid/unavailable \
       --sha256 "$(digest memory)" --id cached
 
     runHook postInstallCheck

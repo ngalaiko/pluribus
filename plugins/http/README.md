@@ -9,7 +9,7 @@ Native listener flags:
 ```sh
 pluribus-http-listener \
   --listen 127.0.0.1:8090 \
-  --socket /home/nikita/.local/share/pluribus/http.sock \
+  --socket /var/lib/pluribus/http.sock \
   --runtime-uid 1000 \
   --route 'github:GET,POST:/*:github/receive'
 ```

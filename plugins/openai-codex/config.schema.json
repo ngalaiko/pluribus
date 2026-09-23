@@ -14,6 +14,11 @@
         "minLength": 1
       }
     },
+    "reasoning_effort": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Default reasoning effort, such as medium. Request provider_options.reasoning_effort overrides this value."
+    },
     "timeout_ms": {
       "type": "integer",
       "minimum": 1000,

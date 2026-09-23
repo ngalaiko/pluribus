@@ -3,6 +3,7 @@
 The Wasm plugin handles App enrollment, JWT signing, token refresh, and webhook
 verification. It uses core-owned credential storage and the HTTP plugin.
 There is no GitHub daemon or separate credential database.
+See [architecture](architecture.md) for enrollment and credential flow.
 
 ## Configuration
 
@@ -13,13 +14,13 @@ There is no GitHub daemon or separate credential database.
     "credentials": {"app": "github:personal"},
     "http_instance": "http/listen",
     "route_id": "github",
-    "owner": "ngalaiko"
+    "owner": "your-owner"
   }
 }
 ```
 
 Create a GitHub App. Set its webhook URL to
-`https://computer.tail4fad0.ts.net/nikita/pluribus/github/events` and choose a
+`https://agent.example.org/github/events` and choose a
 webhook secret. Configure the repository permissions and event subscriptions
 listed in `app.flow.json`. Download the App's private key and note its App ID.
 No OAuth callback or setup URL is required.
@@ -27,7 +28,7 @@ No OAuth callback or setup URL is required.
 With `pluribus run` active, run:
 
 ```sh
-pluribus auth github
+pluribus plugins auth github
 ```
 
 Enter the App ID, the path to the downloaded PEM file, and the webhook secret.
@@ -153,8 +154,7 @@ Unsigned requests return 401; wrong owners or installations return 403.
 A committed delivery ID is acknowledged without another observation; reuse
 with different bytes returns 409.
 
-Deduplication scans committed GitHub observations. Large histories will need a
-durable indexed lookup. Token refresh checks installation access every minute;
+Deduplication scans committed GitHub observations. Lookup cost grows with history. Token refresh checks installation access every minute;
 failed checks clear both published exports. Already issued tokens retain their
 GitHub-side lifetime.
 

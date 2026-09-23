@@ -85,7 +85,15 @@ fn configured_file_archive_allows_concurrent_runners_without_its_source() {
         let errors = temp.path().join(format!("run-{attempt}.err"));
         let mut runner = Runner(
             Command::new(env!("CARGO_BIN_EXE_pluribus"))
-                .args(["-d", data.to_str().unwrap(), "run", "--offline", "--resume"])
+                .arg("--data-dir")
+                .arg(&data)
+                .arg("--config-dir")
+                .arg(&data)
+                .arg("--cache-dir")
+                .arg(&data)
+                .arg("--runtime-dir")
+                .arg(&data)
+                .args(["run", "--resume"])
                 .stdout(File::create(&output).unwrap())
                 .stderr(File::create(&errors).unwrap())
                 .spawn()

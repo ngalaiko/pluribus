@@ -11,8 +11,8 @@ into a poll nobody configured.
 ## Install
 
 ```sh
-pluribus install email
-pluribus auth email
+pluribus plugins install email
+pluribus plugins auth email
 ```
 
 `auth` prompts for the username and an app-specific password, and seals them
@@ -212,7 +212,7 @@ header of its own, and an address is refused unless it is a bare addr-spec.
 | Endpoint reply | Code | Meaning |
 | --- | --- | --- |
 | `4xx` | `unavailable` | The endpoint asked to be tried later. Retrying is reasonable. |
-| `530`, `534`, `535`, `538` | `permission-denied` | The credential was rejected. Re-run `pluribus auth`; retrying will not help. |
+| `530`, `534`, `535`, `538` | `permission-denied` | The credential was rejected. Re-run `pluribus plugins auth`; retrying will not help. |
 | `523`, `552` | `resource-exhausted` | The message is too large for the endpoint. |
 | other `5xx` | `invalid-argument` | The endpoint refused the message itself — an unknown recipient, usually. It will refuse it identically on every attempt. |
 

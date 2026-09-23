@@ -1,8 +1,26 @@
 # REPL component
 
-Boa packaged as Wasm, without host imports, WASI, filesystem, network, or
-credentials. The separate [cognition plugin](../README.md) owns
+Boa packaged as Wasm, with lifecycle coordination imports but no WASI,
+filesystem, network, or credential access. The separate [cognition plugin](../README.md) owns
 reasoning and dispatch.
+
+## JavaScript API
+
+These helpers yield work to cognition; they do not give the interpreter direct
+storage or network access:
+
+- `history.read({after, limit, eventTypes})`: authorized history, bounded to
+  100 events / 64 KiB. Oversized payloads return `payloadOmitted`; cursors advance.
+- `history.search({...})`: bounded lexical [history search](../history.md).
+- `rlm.query({question, context})`: a read-only child with at most 64 KiB of context.
+- `capabilities.invoke(name, arguments)`: a root capability call; its receipt
+  contains the provider result in `output`.
+- `checkpoint({named: values})`: preserve up to 32 KiB of JSON working values.
+
+`context.turn` carries the [model turn context](../turn-context.md). Child history
+cannot exceed delegated access. Filter history to relevant event types.
+
+## Sessions
 
 Requests identify a `sessionId`. `code.evaluate-requested` starts a cell in that
 session, creating its realm if necessary. Subsequent cells preserve `state`.
@@ -39,3 +57,8 @@ The `repl` component of the rlm package, not a plugin of its own: it ships insid
 that package beside `cognition`, and an rlm instance configures both.
 
 Context, checkpoints, and host responses enter Boa as JSON values, not source.
+
+## Development
+
+From the repository root, run `cargo test --locked -p pluribus-plugin-rlm-repl`.
+See [workspace setup](../../../docs/development.md) for packaged checks.

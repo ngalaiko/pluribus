@@ -1,16 +1,16 @@
 # Plugin author specification
 
-Status: draft for ABI `pluribus:plugin@3.0.0`
+ABI `pluribus:plugin@3.0.0`
 
-This is the public contract between Pluribus and plugin authors. A plugin is a
-WebAssembly Component plus a manifest and configuration schema. The runtime
-calls it only through WIT.
+This is the public contract between Pluribus and plugin authors. A plugin
+package contains one or more WebAssembly components, a manifest, and
+configuration schemas. The runtime calls components through WIT.
 
 The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
 
 ## The shape of a plugin
 
-A plugin exports three functions and nothing else:
+Each component exports three lifecycle functions:
 
 ```wit
 run:    async func(context: context, config: json) -> result<_, error>;
@@ -97,7 +97,7 @@ The ABI does not provide:
 - background threads that survive an exported call;
 - exactly-once external effects;
 - confidentiality enforced by an LLM;
-- package signing or a public registry in the MVP;
+- package signing or a public registry;
 - MCP compatibility.
 
 ## Background
@@ -107,3 +107,6 @@ Worlds collect the imports a component requires and exports it provides. See
 the [Component Model WIT reference](https://component-model.bytecodealliance.org/design/wit.html),
 [worlds](https://component-model.bytecodealliance.org/design/worlds.html), and
 [component composition](https://component-model.bytecodealliance.org/composing-and-distributing/composing.html).
+
+For installed packages, see the [plugin catalog](../../plugins/README.md).
+For implementation ownership, see [architecture](../architecture.md).

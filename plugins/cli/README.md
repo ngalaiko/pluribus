@@ -28,9 +28,9 @@ fully escaped JSON response fits the 256 KiB frame limit; remaining lines are
 sent by later polls.
 Protocol v2 requires upgrading the bridge and component together.
 
-Its endpoint is `cli-main.sock` in the agent's data directory,
-`$XDG_DATA_HOME/pluribus` unless `--data-dir` says otherwise; `--socket` names
-another path. `--runtime-uid` is the account the agent runs as, and defaults to
+Its endpoint is `cli-main.sock` in the platform runtime directory;
+`--data-dir` groups it with agent state and `--socket` names another path.
+See [paths](../../docs/operations.md#paths). `--runtime-uid` is the account the agent runs as, and defaults to
 this one.
 
 ## Configure

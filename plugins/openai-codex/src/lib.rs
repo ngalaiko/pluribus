@@ -75,6 +75,8 @@ struct Config {
     credentials: Credentials,
     #[serde(default = "default_models")]
     models: Vec<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     #[serde(default = "default_timeout")]
     timeout_ms: u32,
 }
@@ -230,7 +232,7 @@ impl Guest for Codex {
 /// Runs one completion against the Codex Responses endpoint.
 fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error> {
     reject_unsupported_features(&request.required_features)?;
-    let (body, tool_names) = build_request(request)?;
+    let (body, tool_names) = build_request(request, config.reasoning_effort.as_deref())?;
     let body = put_blob("application/json", &body)?;
     let handle = &config.credentials.subscription;
     let (record, tokens) = read_tokens(handle)?;
@@ -856,7 +858,10 @@ fn config() -> Result<Config, Error> {
     })
 }
 
-fn build_request(request: &ModelRequest) -> Result<(Vec<u8>, ToolNames), Error> {
+fn build_request(
+    request: &ModelRequest,
+    reasoning_effort: Option<&str>,
+) -> Result<(Vec<u8>, ToolNames), Error> {
     let options = request
         .provider_options
         .clone()
@@ -906,7 +911,7 @@ fn build_request(request: &ModelRequest) -> Result<(Vec<u8>, ToolNames), Error> 
     if let Some(key) = option_string(&options, "prompt_cache_key") {
         body.insert("prompt_cache_key".into(), Value::String(key.to_owned()));
     }
-    if let Some(effort) = option_string(&options, "reasoning_effort") {
+    if let Some(effort) = option_string(&options, "reasoning_effort").or(reasoning_effort) {
         body.insert(
             "reasoning".into(),
             json!({
@@ -1513,7 +1518,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let (bytes, names) = build_request(&request).unwrap();
+        let (bytes, names) = build_request(&request, None).unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["tools"][1]["parameters"], schema);
         let arguments = json!({"action":"complete"});
@@ -1537,9 +1542,48 @@ mod tests {
             "max_output_tokens":4096
         }))
         .unwrap();
-        let (bytes, _) = build_request(&request).unwrap();
+        let (bytes, _) = build_request(&request, None).unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn configured_reasoning_effort_is_a_request_default() {
+        for (configured, options, expected) in [
+            (None, json!({}), None),
+            (Some("medium"), json!({}), Some("medium")),
+            (None, json!({"reasoning_effort":"high"}), Some("high")),
+            (
+                Some("medium"),
+                json!({"reasoning_effort":"high", "reasoning_summary":"detailed"}),
+                Some("high"),
+            ),
+        ] {
+            let mut config = json!({"credentials":{"subscription":"test"}});
+            if let Some(effort) = configured {
+                config["reasoning_effort"] = json!(effort);
+            }
+            let config: Config = serde_json::from_value(config).unwrap();
+            let request: ModelRequest = serde_json::from_value(json!({
+                "call_id":"test", "model":"gpt-5.6-luna", "messages":[],
+                "provider_options":options
+            }))
+            .unwrap();
+            let (bytes, _) = build_request(&request, config.reasoning_effort.as_deref()).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if let Some(effort) = expected {
+                assert_eq!(body["reasoning"]["effort"], effort);
+                assert_eq!(
+                    body["reasoning"]["summary"],
+                    options
+                        .get("reasoning_summary")
+                        .cloned()
+                        .unwrap_or(json!("auto"))
+                );
+            } else {
+                assert!(body.get("reasoning").is_none());
+            }
+        }
     }
 
     #[test]

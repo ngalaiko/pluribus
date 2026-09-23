@@ -1,12 +1,11 @@
 # Searchable history
 
-`history.search` is an additive REPL capability for finding older events in the
-root agent stream. It keeps the existing `history.read` cursor and payload
-behavior unchanged.
+`history.search` finds older events in the root agent stream.
+`history.read` retrieves their source payloads.
 
 Both JS helpers use WIT `events.query`. Its filter combines metadata predicates,
 optional text search, and sort direction. There is no WIT `history` interface.
-The expanded filter belongs to ABI 3; ABI 2 plugins require rebuilding.
+The query filter belongs to ABI 3.
 
 ```js
 const page = await history.search({
@@ -44,7 +43,7 @@ Empty queries are rejected; punctuation-only queries return an empty page.
 Queries are limited to 4,096 UTF-8 bytes. A conversation filter narrows results;
 it does not confer authority. Existing stream and delegated-range grants apply.
 
-# Working-summary provenance
+## Working-summary provenance
 
 Working-summary source IDs are provenance claims. Acceptance requires each ID
 to resolve through the host event API in the current visibility context, to

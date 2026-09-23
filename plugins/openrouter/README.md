@@ -4,15 +4,7 @@ Serves `model.requested` through the OpenRouter chat-completions API using an en
 
 Responses stream as server-sent events. The plugin owns record framing and appends one `model.stream` event per read, so a long completion is observable without a durable event per token.
 
-Build and package:
-
-```sh
-cargo build --manifest-path plugins/openrouter/Cargo.toml --target wasm32-unknown-unknown --release
-cargo run -p pluribus-plugin-package --bin pluribus-package -- \
-  plugins/openrouter \
-  target/plugins/openrouter \
-  main=plugins/openrouter/target/wasm32-unknown-unknown/release/pluribus_plugin_openrouter.wasm
-```
+See [development](../../docs/development.md) to build packages.
 
 Configuration:
 
@@ -33,7 +25,7 @@ Register the instance in `config.json` under `--data-dir`, then enroll the key. 
 {
   "plugin_instances": {
     "openrouter": {
-      "package": "file:///path/to/pluribus-v2/target/plugins/openrouter",
+      "package": "file:///path/to/pluribus/target/plugins/openrouter",
       "config": {
         "credentials": {"api-key": "openrouter:personal"},
         "models": [
@@ -62,7 +54,7 @@ Register the instance in `config.json` under `--data-dir`, then enroll the key. 
 ```
 
 ```sh
-pluribus --data-dir ./data auth openrouter
+pluribus --data-dir ./data --config-dir ./data plugins auth openrouter
 ```
 
 `credentials.api-key` is an opaque handle. The host seals the enrolled key under it; the component reads it back with `credentials.get` and sets `authorization` itself.

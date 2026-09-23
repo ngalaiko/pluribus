@@ -57,7 +57,7 @@ WantedBy=multi-user.target
 ```
 
 Every flag above has a default for trying things out: the endpoint is
-`shell-main.sock` in the agent's data directory (`$XDG_DATA_HOME/pluribus`),
+`shell-main.sock` in the [platform runtime directory](../../docs/operations.md#paths),
 commands run in the current directory, and the runtime is this account. That last default means
 commands run with this account's authority, which the executor says at startup;
 a deployment names another account with `--runtime-uid`, as above.

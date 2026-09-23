@@ -1,7 +1,5 @@
 # Events and authority
 
-Status: draft
-
 This document defines the canonical facts stored by the core and the authority carried by every activity.
 
 ## Invariants
@@ -330,7 +328,7 @@ checkpoint status. Its deduplication key is scoped to the cognition instance
 and failing input.
 ```
 
-See [persistent work](persistent-work.md).
+See [persistent work](../plugins/rlm/persistent-work.md).
 
 ### Models
 

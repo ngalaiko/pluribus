@@ -20,14 +20,17 @@ Configuration:
 {
   "credentials": {"subscription": "openai-codex:personal"},
   "models": ["gpt-5.6-luna"],
+  "reasoning_effort": "medium",
   "timeout_ms": 300000
 }
 ```
 
+`reasoning_effort` sets the default effort. Request `provider_options.reasoning_effort` overrides it. Omit both to use the provider default.
+
 Start device login:
 
 ```sh
-pluribus --data-dir ./data auth openai-codex
+pluribus --data-dir ./data --config-dir ./data plugins auth openai-codex
 ```
 
 Open the displayed URL and enter the displayed code. Enable device-code login

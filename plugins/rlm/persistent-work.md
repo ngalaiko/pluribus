@@ -1,24 +1,23 @@
 # Persistent work and observation coordination
 
-RLM owns durable jobs and one coordinator per agent. Core records observations,
+RLM owns durable jobs and one coordinator per agent. Host records observations,
 executes authorized activities, delivers results and enforces
 limits. Jobs retain responsibility for unfinished objectives across messages,
 waiting periods, bounded reasoning cycles, and process restarts.
 
 ## Ownership
 
-| RLM | Core |
+| RLM | Host |
 | --- | --- |
 | Objectives, plans, constraints, progress, job selection | Ordered durable intake and result delivery |
 | Associate observations with jobs | Preserve origin, identity, authority, and destinations |
 | Continue, wait, cancel, finish, or ask the user | Dispatch, cancellation, deadlines, and concurrency ceilings |
-| Select memory and history for the next decision | Enforce visibility and grants |
+| Select context and history for the next decision | Enforce visibility and grants |
 | Choose wake deadlines and retry intent | Route timer receipts; deduplicate execution |
 | Select recoverable context checkpoints | Track attempt outcomes and prevent unsafe replay |
 
 One coordinator serializes decisions; several jobs and activities may exist.
 Workers never mutate a job's plan; they append results for the coordinator.
-Memory stores knowledge. A `goal` memory record is not a job or a queue.
 
 ## Durable state
 
@@ -47,7 +46,7 @@ bounds repeated result copies in job updates, task context, and checkpoints.
 
 ## Intake and observation association
 
-Core runs each provider in an async task, with one lifecycle call per instance.
+Host runs each provider in an async task, with one lifecycle call per instance.
 Cognition is the sole serialized writer. `Agent::tick().await` admits work
 without joining providers; `tick_wait().await` gives deterministic test drivers a
 completion boundary. Providers commit their events, state, and cursor together.
@@ -109,7 +108,7 @@ commit together.
 
 ## Execution and cancellation
 
-Before an effect starts, core checks that cognition has consumed pending
+Before an effect starts, the host checks that cognition has consumed pending
 observations, verifies the current job revision, reauthorizes capabilities, and
 claims a durable attempt. Atomic claim receipts prevent duplicate admission.
 Terminal results remain reusable after restart. Unsettled admitted attempts
@@ -119,6 +118,8 @@ command or message occurs.
 
 Reported provider failures use persistent exponential backoff from one to sixty
 seconds; other providers keep running. Traps persist as quarantine records.
+Pinned sessions can restart with lost calls reported as unknown; resource failures
+have bounded recovery. See [runtime recovery](../../docs/runtime.md#resource-recovery).
 
 Emergency stop runs on an independent monitor: it prevents new admission, signals
 cancellation to active workers, and persists across restart. Resuming requires an
@@ -126,7 +127,7 @@ explicit resume action.
 
 ## Waiting and wakes
 
-The scheduler plugin executes timers. `timer.fired` routes through its original request actor. Payload targets confer
+The configured timer provider executes timers. `timer.fired` routes through its original request actor. Payload targets confer
 neither ownership nor authority. Job revisions invalidate obsolete wakes. Waiting
 for input produces no periodic inference. Timed waits require a future external
 deadline. Code results automatically request the next reasoning step. There is
@@ -147,22 +148,42 @@ survive checkpoints.
 
 ## Checkpoints and persistence
 
-Use `checkpoint({name: jsonValue})` in JS to preserve selected working values, up
-to 32 KiB. Restored values become `state`, and `context.recovered` is true. Store
-references for larger data. Checkpoints do not preserve promises, functions, or
-suspended stacks; a lost suspended cell fails explicitly.
+The [REPL](repl/README.md#sessions) checkpoints JSON working state automatically
+after successful cells, or an explicit subset selected with `checkpoint`.
+Checkpoints do not preserve promises, functions, or suspended stacks; a lost
+suspended cell fails explicitly.
 
-The versioned vocabulary includes `cognition.job-updated`,
-`cognition.observation-associated`, `cognition.checkpoint`,
-`cognition.cancel-requested`, `activity.attempted`, and `activity.unknown`.
-Version 3 checkpoints commit changed records with requests and the delivery
-cursor. Live cognition deliveries contain at most 16 events; rebuild reads at
-most 32 checkpoint events per delivery. State records use 128 KiB fragments;
-results and retired observation receipts load by identity. Versions 1 and 2
-remain readable. Rebuild applies record fragments across deliveries and commits
-each sequence marker last, without emitting historical requests. Active state
-retires older terminal jobs toward a 64-job target; audit records remain in the
-event log. Deduplication receipts remain durable.
+Persistence stores independent records in 128 KiB fragments under
+`engine/record/<field>/<key-hash>/<fragment>`. Version 1 `cognition.checkpoint`
+events carry `sequence` and up to four `mutations`, each containing a state `key`
+and base64 `value` (null deletes). Replay also accepts legacy byte arrays. Fragments encode `{field,key,value}` JSON;
+the sequence record commits last. Replay applies deltas across delivery boundaries.
+Any other checkpoint version is rejected.
+
+Retention targets 64 inactive terminal jobs, 64 settled activities per job, and
+64 source contexts. Each delivery retires bounded groups to stay within
+transaction limits. Earlier records remain in the audit log. Result receipts
+and observation tombstones use individual records, fetched only for matching
+incoming events. Retired records are deleted.
+
+## Bounded state and recovery
+
+- Cognition loads selected records, compact routing metadata, and at most four
+  queued sessions. Records are capped at 256 KiB; the selected view at 2 MiB.
+  Incremental legacy migration keeps a durable cursor. Large observation fields
+  become references to their authoritative events. Mutation diffs cover only
+  loaded records; indexes and sequence are included in checkpoint replay.
+- Oversized stored jobs/tasks recover from compact metadata. The triggering input
+  remains in the delivery. Recovery retains conversation identity, revisions,
+  child history scope, and parent continuation IDs. Unavailable checkpoints are
+  reported as missing.
+- Model recovery exposes resource details, lost-session/effect status, and its
+  remaining allowance. History reads/searches are capped at 16 rows after the
+  first failure and 8 after the second. Identical failed cells are rejected.
+  The third failure ends the affected task.
+
+Compact-index scans grow with historical record count; loaded payload memory
+does not.
 
 ## Operator controls
 
@@ -171,10 +192,19 @@ and pending observations. Repeated passes read only new matching events.
 Operator events require the host principal and cannot be proposed by plugins. Resumed and queued model requests
 retain their initiating observation as the authority ancestor.
 
+Operator commands require node actor `operator:<agent-id>`:
+
+- `operator.job-control`: `{version:1,jobId,action:"cancel"|"resume",revision,reason}`.
+  Revision must match. Cancel invalidates requests and closes sessions. Resume
+  requires a paused live task and no unresolved outcomes; original authority stays.
+- `operator.attempt-reconciled`: `{version:1,requestEventId,outcome:"completed"|"failed",output?,reason}`.
+  Records a verified result and clears its reconciliation blocker. Execution
+  requires a separate resume command.
+
 ## Operational limits
 
-- Cancellation cannot undo an effect past admission. Blocking HTTP transport
-  may finish before observing cancellation; lifecycle deadlines cap its timeout.
+- Cancellation cannot undo an effect past admission. An external service may
+  finish a request before observing cancellation.
 - Restart preserves provider quarantine and backoff. Provider recovery does not
   reconcile unknown effects. No generic status probe or automatic keyed retry
   integration is provided.
@@ -183,17 +213,11 @@ retain their initiating observation as the authority ancestor.
 - RLM partitions state below the 1 MiB value ceiling. Retained receipts and the
   append-only event log still grow; backups require sufficient disk space.
 - Cross-conversation completion has no implicit grant.
-- Remote nodes, inter-agent work, and automatic memory extraction do not exist.
+- Remote nodes and inter-agent work do not exist.
 
 ## Tests
 
-Rust 1.95.0 is pinned. Rebuild packages and run workspace and plugin checks:
-
-```sh
-nix-shell
-pluribus-sync-plugins
-cargo test --locked --workspace
-```
+See [development](../../docs/development.md) for package builds and checks.
 
 Deterministic providers, controllable clocks, and synchronization barriers cover
 blocked-provider intake, association and revision handling, corrections during
@@ -204,9 +228,9 @@ explicit resume, admission races and unknown attempts, checkpoint restoration an
 interrupted cells, projection rebuild, and a reference scenario that survives a
 correction during blocked tests and a restart while retaining reply provenance.
 
-Boundary tests live in `crates/pluribus-cognition/tests/rlm_cognition.rs`. RLM
-transition tests live in `plugins/rlm/cognition/src/persistent_tests.rs`. The
-reference scenario uses packaged echo as its deterministic test provider: it runs
+Boundary tests live in [rlm_cognition.rs](../../crates/pluribus-cognition/tests/rlm_cognition.rs).
+RLM transition tests live in [persistent_tests.rs](cognition/src/persistent_tests.rs). The
+reference scenario uses a packaged deterministic test provider: it runs
 no shell command, opens no real PR, and sends no message. Runtime regressions
 cover restricted destructive grants, provider backoff across restarts, uncertain
 effects, incremental dispatch projections, and reserved operator events. Live

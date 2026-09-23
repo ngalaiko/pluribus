@@ -90,7 +90,7 @@ const fn default_batch() -> usize {
     20
 }
 
-/// The enrolled credential, as `pluribus auth` stored it. One account
+/// The enrolled credential, as `pluribus plugins auth` stored it. One account
 /// authenticates both endpoints.
 #[derive(Deserialize)]
 struct Account {
@@ -295,7 +295,7 @@ fn load_credential(config: &Config) -> Result<Account, Error> {
     let bytes = credentials::get(&config.credentials.account)?.ok_or_else(|| {
         failure(
             ErrorCode::PermissionDenied,
-            "no credential is enrolled; run pluribus auth",
+            "no credential is enrolled; run pluribus plugins auth",
         )
     })?;
     serde_json::from_slice(&bytes)

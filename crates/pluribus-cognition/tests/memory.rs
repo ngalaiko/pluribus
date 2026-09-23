@@ -1,5 +1,10 @@
 //! Memory dispatch, reconstruction, and scope enforcement.
 
+#[path = "support/memory_eval_provider.rs"]
+mod memory_eval_provider;
+#[path = "support/memory_learning.rs"]
+mod memory_learning;
+
 use pluribus_cognition::{Agent, AuthorityResolver, Router};
 use pluribus_core::{
     AppendRequest, Audience, Authority, AuthorityId, BlobStore, CapabilityName, CommittedEvent,
@@ -550,6 +555,24 @@ async fn memory_turn(
     text: &str,
     code: Option<&str>,
 ) -> Vec<CommittedEvent> {
+    let mut code = code;
+    memory_turn_with(agent, store, "chat:7", text, |event| {
+        let content = if let Some(source) = code.take() {
+            json!([{"kind":"tool-call","call_id":"cell","name":"js","arguments":{"code":source}}])
+        } else {
+            json!([{"kind":"tool-call","call_id":"done","name":"yield","arguments":{"action":"complete","reply":null}}])
+        };
+        json!({"call_id":payload(event)["call_id"],"message":{"role":"assistant","content":content}})
+    }).await
+}
+
+async fn memory_turn_with(
+    agent: &mut TestAgent,
+    store: &Arc<SqliteEventStore<Metadata>>,
+    conversation: &str,
+    text: &str,
+    mut respond: impl FnMut(&CommittedEvent) -> Value,
+) -> Vec<CommittedEvent> {
     let origin = store
         .append(AppendRequest {
             stream_id: StreamId::new("personal"),
@@ -559,7 +582,7 @@ async fn memory_turn(
             payload_schema: "pluribus.observation/1".into(),
             payload: EventPayload::CanonicalJson(
                 serde_json::to_vec(&json!({
-                    "provider":"telegram", "externalSenderId":"7", "conversationId":"chat:7",
+                    "provider":"telegram", "externalSenderId":"7", "conversationId":conversation,
                     "message":{"chat":{"id":7},"text":text}
                 }))
                 .unwrap(),
@@ -574,7 +597,6 @@ async fn memory_turn(
         .await
         .unwrap();
     let mut answered = std::collections::HashSet::new();
-    let mut code = code;
     for _ in 0..200 {
         agent.tick_wait(1_700_000_000_000).await.unwrap();
         let events = store
@@ -592,7 +614,7 @@ async fn memory_turn(
             e.request.event_type == "cognition.completed"
                 && payload(e)["root"] == origin.event_id.as_str()
         }) {
-            return events;
+            return std::iter::once(origin).chain(events).collect();
         }
         for event in events
             .iter()
@@ -601,18 +623,13 @@ async fn memory_turn(
             if !answered.insert(event.event_id.clone()) {
                 continue;
             }
-            let content = if let Some(source) = code.take() {
-                json!([{"kind":"tool-call","call_id":"cell","name":"js","arguments":{"code":source}}])
-            } else {
-                json!([{"kind":"tool-call","call_id":"done","name":"yield","arguments":{"action":"complete","reply":null}}])
-            };
+            assert!(answered.len() <= 48, "memory turn exceeded 48 model calls");
+            let completion = respond(event);
             let mut result = event.request.clone();
             result.event_type = "model.completed".into();
             result.causation_id = Some(event.event_id.clone());
             result.deduplication_key = None;
-            result.payload = EventPayload::CanonicalJson(serde_json::to_vec(&json!({
-                "call_id":payload(event)["call_id"],"message":{"role":"assistant","content":content}
-            })).unwrap());
+            result.payload = EventPayload::CanonicalJson(serde_json::to_vec(&completion).unwrap());
             store.append(result).await.unwrap();
         }
     }

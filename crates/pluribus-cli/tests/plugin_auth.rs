@@ -9,6 +9,12 @@ fn cli(data: &Path, args: &[&str], input: Option<&str>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pluribus"))
         .arg("--data-dir")
         .arg(data)
+        .arg("--config-dir")
+        .arg(data)
+        .arg("--cache-dir")
+        .arg(data)
+        .arg("--runtime-dir")
+        .arg(data)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -159,10 +165,10 @@ fn external_package_auth_uses_configured_instances_and_aliases() {
     // An alias names the instance it belongs to.
     success(cli(
         data.path(),
-        &["auth", "office"],
+        &["plugins", "auth", "office"],
         Some("123456:fake-test-token-00000000\n"),
     ));
-    let unknown = cli(data.path(), &["auth", "telegram"], None);
+    let unknown = cli(data.path(), &["plugins", "auth", "telegram"], None);
     assert!(!unknown.status.success());
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown plugin instance"));
 }
@@ -177,7 +183,7 @@ fn a_grant_wider_than_the_manifest_is_refused() {
     fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     let result = cli(
         data.path(),
-        &["auth", "work"],
+        &["plugins", "auth", "work"],
         Some("123456:fake-test-token-00000000\n"),
     );
     assert!(!result.status.success());
@@ -203,7 +209,7 @@ fn interactive_auth_uses_the_selected_credential() {
     let script = format!(
         r#"
 set timeout 2
-spawn {bin} --data-dir {data} auth work
+spawn {bin} --data-dir {data} --config-dir {data} --cache-dir {data} --runtime-dir {data} plugins auth work
 expect "1. Telegram bot token"
 send "2\r"
 expect "Bot token"
@@ -241,7 +247,13 @@ fn plugin_auth_rejects_an_inaccessible_credential_before_waiting() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pluribus"))
         .arg("--data-dir")
         .arg(data.path())
-        .args(["auth", "work"])
+        .arg("--config-dir")
+        .arg(data.path())
+        .arg("--cache-dir")
+        .arg(data.path())
+        .arg("--runtime-dir")
+        .arg(data.path())
+        .args(["plugins", "auth", "work"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -153,7 +153,7 @@ rec {
         done
         if [ -n "$example" ]; then
           check=$(mktemp -d)
-          $out/bin/pluribus --data-dir "$check" init --example > /dev/null
+          $out/bin/pluribus --data-dir "$check" --config-dir "$check" --cache-dir "$check" --runtime-dir "$check" init --example > /dev/null
           rm -rf "$check"
         fi
       '';

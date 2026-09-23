@@ -1,6 +1,6 @@
 # Package and component instances
 
-`config.json` under `--data-dir` assembles an agent from package instances and operator overrides. Each package declares named components; each component runs independently with the stable ID `package-instance/component-name`.
+`config.json` in the [configuration directory](operations.md#paths) assembles an agent from package instances and operator overrides. Each package declares named components; each component runs independently with the stable ID `package-instance/component-name`.
 
 Telegram contains `receive` and `send`. RLM contains `cognition` and `repl`. Each component has separate linear memory, state namespace, delivery cursor, cancellation handle, worker, imports, and grants. A blocked Telegram poll cannot occupy the sender's worker.
 
@@ -26,7 +26,7 @@ This fragment needs a model package and `model_instance` to run. Packages use ab
 
 | Field | Meaning |
 | --- | --- |
-| `package` | `file://` directory URL or archive object with `url` and `sha256`. |
+| `package` | `bundled:<name>`, `file://` directory URL, or archive object with `url` and `sha256`. |
 | `config` | Package configuration; credentials are opaque handles, never secrets. |
 | `aliases` | Enrollment command aliases for the package instance. |
 | `components.<name>.http` | Component HTTP origins, methods, request/response limits, and timeout. |
@@ -59,12 +59,11 @@ Each component handles deliveries serially. Different components run on separate
 ## Discovery and enrollment
 
 ```sh
-pluribus install ./packages/telegram
-pluribus auth telegram
+pluribus plugins install ./packages/telegram
+pluribus plugins auth telegram
 ```
 
 Discovery and enrollment read package descriptors without executing guest code. `install` reads a package's manifest and writes an instance with the access it requests. See [credentials](plugins/credentials.md).
-
 
 ## Defaults and overrides
 
@@ -72,7 +71,7 @@ Installing a plugin accepts its declared HTTP and stream requirements. Startup
 derives host access from `requested_capabilities`, then applies `components`
 overrides. An explicit empty HTTP origins list disables network access. Credentials
 use declared consumers and generated handle references; secret values come from
-`pluribus auth`. Credential enrollment origins belong in the manifest and can be
+`pluribus plugins auth`. Credential enrollment origins belong in the manifest and can be
 overridden in config, including with an empty list.
 
 Package `[defaults]` values merge recursively with instance `config`. Arrays and

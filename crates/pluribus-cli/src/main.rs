@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod fixtures;
 mod installation;
+mod logs;
 mod package_source;
 mod registry;
 mod stop;
@@ -70,14 +71,17 @@ async fn main() {
 )]
 struct Cli {
     /// Agent state: the event store, blobs, and the emergency stop.
-    #[arg(long, short = 'd', global = true, value_name = "PATH")]
-    data_dir: Option<PathBuf>,
+    #[arg(long, short = 'd', global = true, value_name = "PATH", default_value_os_t = pluribus_paths::state())]
+    data_dir: PathBuf,
     /// Directory holding `config.json`.
-    #[arg(long, global = true, value_name = "PATH")]
-    config_dir: Option<PathBuf>,
+    #[arg(long, global = true, value_name = "PATH", default_value_os_t = pluribus_paths::config())]
+    config_dir: PathBuf,
     /// Directory holding packages fetched by digest.
-    #[arg(long, global = true, value_name = "PATH")]
-    cache_dir: Option<PathBuf>,
+    #[arg(long, global = true, value_name = "PATH", default_value_os_t = pluribus_paths::cache())]
+    cache_dir: PathBuf,
+    /// Directory holding local plugin endpoints.
+    #[arg(long, global = true, value_name = "PATH", default_value_os_t = pluribus_paths::runtime())]
+    runtime_dir: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -93,24 +97,11 @@ pub struct Paths {
 
 impl Paths {
     fn resolve(cli: &Cli) -> Self {
-        // Naming a directory says where this agent lives, all of it. The
-        // platform decides only what nothing else names.
-        let Some(state) = cli.data_dir.clone() else {
-            return Self {
-                state: pluribus_paths::state(),
-                config: cli
-                    .config_dir
-                    .clone()
-                    .unwrap_or_else(pluribus_paths::config),
-                cache: cli.cache_dir.clone().unwrap_or_else(pluribus_paths::cache),
-                runtime: pluribus_paths::runtime(),
-            };
-        };
         Self {
-            config: cli.config_dir.clone().unwrap_or_else(|| state.clone()),
-            cache: cli.cache_dir.clone().unwrap_or_else(|| state.clone()),
-            runtime: state.clone(),
-            state,
+            state: cli.data_dir.clone(),
+            config: cli.config_dir.clone(),
+            cache: cli.cache_dir.clone(),
+            runtime: cli.runtime_dir.clone(),
         }
     }
 
@@ -130,10 +121,41 @@ impl Paths {
     pub fn config_file(&self) -> PathBuf {
         self.config.join("config.json")
     }
+
+    fn cli_options(&self) -> String {
+        let mut options = String::new();
+        for (flag, path, default) in [
+            ("data-dir", &self.state, pluribus_paths::state()),
+            ("config-dir", &self.config, pluribus_paths::config()),
+            ("cache-dir", &self.cache, pluribus_paths::cache()),
+            ("runtime-dir", &self.runtime, pluribus_paths::runtime()),
+        ] {
+            if path != &default {
+                options.push_str(" --");
+                options.push_str(flag);
+                options.push(' ');
+                options.push_str(&shell_path(path));
+            }
+        }
+        options
+    }
+}
+
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Show stored events for the configured agent as JSON lines.
+    Logs {
+        /// Keep printing new events until interrupted.
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Number of recent events to print before following.
+        #[arg(long, short = 'n', default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+    },
     /// Create an agent data directory.
     Init {
         /// Configure the packages this build ships: a terminal to talk to, a
@@ -146,29 +168,37 @@ enum Command {
         /// Clear the emergency stop before starting.
         #[arg(long)]
         resume: bool,
-        /// Use cached packages or local file URLs without network downloads.
-        #[arg(long)]
-        offline: bool,
     },
-    /// Configure provider credentials.
+    /// List, authenticate, and install plugin instances.
+    Plugins {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+    /// Halt cognition and cancel active shell commands.
+    Stop,
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    /// List configured instances and their package sources.
+    List,
+    /// Enroll credentials for a configured instance.
     Auth {
         /// Configured instance ID or alias.
         #[arg(value_name = "INSTANCE")]
         plugin: String,
     },
-    /// Configure a plugin from a package directory or archive.
+    /// Add a plugin instance to config.json.
     Install {
-        /// Package directory, or an archive URL with `--sha256`.
+        /// Package directory or archive URL.
         package: String,
-        /// Digest of an archive package.
+        /// Expected archive digest; defaults to the downloaded archive's digest.
         #[arg(long)]
         sha256: Option<String>,
         /// Instance name. Defaults to the plugin name.
         #[arg(long)]
         id: Option<String>,
     },
-    /// Halt cognition and cancel active shell commands.
-    Stop,
 }
 
 async fn run_command() -> Result<(), Box<dyn Error>> {
@@ -176,6 +206,7 @@ async fn run_command() -> Result<(), Box<dyn Error>> {
     let paths = Paths::resolve(&cli);
     let data = &paths;
     match cli.command {
+        Command::Logs { follow, limit } => logs::show(data, limit as usize, follow).await,
         Command::Init { example } => {
             initialize(data, example).await?;
             if example {
@@ -183,16 +214,34 @@ async fn run_command() -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
-        Command::Run { resume, offline } => {
+        Command::Run { resume } => {
             stop::prepare(data, resume)?;
-            run_agent(data, offline).await
+            run_agent(data).await
         }
-        Command::Auth { plugin } => authenticate(data, &plugin).await,
-        Command::Install {
-            package,
-            sha256,
-            id,
-        } => installation::install(data, &package, sha256, id).await,
+        Command::Plugins { command } => match command {
+            PluginCommand::List => {
+                let config = load_config(data)?;
+                if config.plugin_instances.is_empty() {
+                    println!("No plugin instances are configured.");
+                } else {
+                    println!("INSTANCE\tPACKAGE");
+                    for (id, instance) in &config.plugin_instances {
+                        let source = match &instance.package {
+                            package_source::PackageSource::File(source) => source,
+                            package_source::PackageSource::Archive(source) => &source.url,
+                        };
+                        println!("{id}\t{source}");
+                    }
+                }
+                Ok(())
+            }
+            PluginCommand::Auth { plugin } => authenticate(data, &plugin).await,
+            PluginCommand::Install {
+                package,
+                sha256,
+                id,
+            } => installation::install(data, &package, sha256, id).await,
+        },
         Command::Stop => stop::request(data),
     }
 }
@@ -254,7 +303,7 @@ async fn example_configuration(data: &Paths) -> Result<(), Box<dyn Error>> {
     const MODEL: &str = "openrouter/free";
     const IDENTITY: &str = "You are a local assistant. Answer tersely.";
     // A shared key with no budget, so the example runs without an account.
-    // `pluribus auth openrouter` replaces it with one of your own.
+    // `pluribus plugins auth openrouter` replaces it with one of your own.
     const DEMO_KEY: &str =
         "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";
 
@@ -306,19 +355,18 @@ async fn example_configuration(data: &Paths) -> Result<(), Box<dyn Error>> {
     save_config(data, &config)?;
     enroll(data, "openrouter", "api-key", json!({"api_key": DEMO_KEY})).await?;
 
-    // The flag is noise when the data directory is the one every command uses
-    // without being told.
-    let where_ = if data.state == pluribus_paths::state() && data.config == pluribus_paths::config()
-    {
-        String::new()
-    } else {
-        format!(" --data-dir {}", data.state.display())
-    };
+    let where_ = data.cli_options();
     println!("\nConfigured cli, shell, openrouter, rlm and scheduler, on a shared key with no");
-    println!("budget. Replace it with `pluribus{where_} auth openrouter`.");
+    println!("budget. Replace it with `pluribus{where_} plugins auth openrouter`.");
     println!("\nStart each of these, in its own terminal:");
-    println!("  pluribus-cli-bridge{where_}");
-    println!("  pluribus-shell-executor{where_}");
+    println!(
+        "  pluribus-cli-bridge --socket {}",
+        shell_path(&data.runtime.join("cli-main.sock"))
+    );
+    println!(
+        "  pluribus-shell-executor --socket {}",
+        shell_path(&data.runtime.join("shell-main.sock"))
+    );
     println!("  pluribus{where_} run");
     Ok(())
 }
@@ -1032,9 +1080,9 @@ const IDLE_MIN: Duration = Duration::from_millis(50);
 const IDLE_MAX: Duration = Duration::from_secs(5);
 
 #[allow(clippy::too_many_lines)]
-async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
+async fn run_agent(data: &Paths) -> Result<(), Box<dyn Error>> {
     let (config, packages) =
-        package_source::prepare_registry(data, &load_config(data)?, offline, true).await?;
+        package_source::prepare_registry(data, &load_config(data)?, false, true).await?;
     info!(
         state = %data.state.display(),
         config_dir = %data.config.display(),
@@ -1808,14 +1856,55 @@ mod tests {
     }
 
     #[test]
-    fn data_directory_is_a_global_flag() {
-        let cli = Cli::try_parse_from(["pluribus", "auth", "telegram", "--data-dir", "/tmp/agent"])
-            .unwrap();
+    fn data_directory_does_not_override_other_directories() {
+        let defaults = Paths::resolve(&Cli::parse_from(["pluribus", "run"]));
+        let paths = Paths::resolve(&Cli::parse_from([
+            "pluribus",
+            "--data-dir",
+            "/tmp/isolated-state",
+            "run",
+        ]));
+        assert_eq!(paths.state, PathBuf::from("/tmp/isolated-state"));
+        assert_eq!(paths.config, defaults.config);
+        assert_eq!(paths.cache, defaults.cache);
+        assert_eq!(paths.runtime, defaults.runtime);
+    }
 
-        assert_eq!(cli.data_dir, Some(PathBuf::from("/tmp/agent")));
+    #[test]
+    fn help_displays_default_directories() {
+        let help = Cli::try_parse_from(["pluribus", "--help"])
+            .unwrap_err()
+            .to_string();
+        for path in [
+            pluribus_paths::state(),
+            pluribus_paths::config(),
+            pluribus_paths::cache(),
+            pluribus_paths::runtime(),
+        ] {
+            assert!(
+                help.contains(&format!("[default: {}]", path.display()))
+                    || help.contains(&format!("[default: \"{}\"]", path.display())),
+                "{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_directory_is_a_global_flag() {
+        let cli = Cli::try_parse_from([
+            "pluribus",
+            "plugins",
+            "auth",
+            "telegram",
+            "--data-dir",
+            "/tmp/agent",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.data_dir, PathBuf::from("/tmp/agent"));
         // Without the flag, an agent lives where the specification says.
         let default = Cli::try_parse_from(["pluribus", "run"]).unwrap();
-        assert_eq!(default.data_dir, None);
+        assert_eq!(default.data_dir, pluribus_paths::state());
         // Each kind of thing has its own directory, named for this program.
         let paths = Paths::resolve(&default);
         for directory in [&paths.config, &paths.state, &paths.cache, &paths.runtime] {
@@ -1824,17 +1913,18 @@ mod tests {
         }
         assert!(matches!(
             cli.command,
-            Command::Auth { plugin } if plugin == "telegram"
+            Command::Plugins { command: PluginCommand::Auth { plugin } } if plugin == "telegram"
         ));
     }
 
     #[test]
     fn auth_accepts_plugin_ids_without_core_subcommands() {
-        let cli = Cli::try_parse_from(["pluribus", "auth", "dev.example.provider"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["pluribus", "plugins", "auth", "dev.example.provider"]).unwrap();
 
         assert!(matches!(
             cli.command,
-            Command::Auth { plugin } if plugin == "dev.example.provider"
+            Command::Plugins { command: PluginCommand::Auth { plugin } } if plugin == "dev.example.provider"
         ));
     }
 

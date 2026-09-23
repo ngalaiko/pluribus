@@ -1,4 +1,39 @@
-# Remote plugin installation
+# Installation and packages
+
+## Distribution
+
+```sh
+nix profile install github:ngalaiko/pluribus
+```
+
+The default includes all plugin packages. Select a subset or an external package:
+
+```nix
+pluribus.withPlugins (ps: [
+  ps.memory
+  ps.telegram
+  inputs.my-plugin.packages.${system}.default
+])
+```
+
+Install a plugin alone with `nix profile install github:ngalaiko/pluribus#plugin-memory`.
+Nix packages contain `share/pluribus/plugins/<name>` and native helpers in `bin/`.
+External repositories can use the builder:
+
+```nix
+pluribus.lib.${system}.buildPluginPackage {
+  name = "battery";
+  src = ./.;
+  components.main = "${wasm}/battery.wasm";
+  binaries = [ ];
+}
+```
+
+Without Nix, unpack a release archive and add its `bin/` to PATH. Install versions
+in separate directories. Rust is needed only for source builds. Follow the
+[quickstart](../README.md#try-it) after installation.
+
+## Package references
 
 Packages support `file://` directory URLs and pinned `file://` or `https://` archive references:
 
@@ -21,6 +56,10 @@ spaces in URLs. File URLs must identify local regular files, not directories.
 Directory URLs use a string, such as `"file:///opt/plugins/telegram"`.
 Bare paths and `builtin:` references are unsupported.
 
+`bundled:<name>` resolves a package from the installation; see [releases](#releases).
+`PLURIBUS_PLUGIN_DIR` overrides the package root containing `<name>/plugin.toml`.
+For directory references, update absolute URLs when moving packages.
+
 The URL determines where to fetch bytes; the SHA-256 determines which bytes are
 accepted. No repository naming convention, GitHub API, or catalog is required.
 The archive hash lives in config. Component digests in `plugin.toml` remain
@@ -30,15 +69,18 @@ internal consistency checks.
 
 ```sh
 pluribus init
-pluribus install <package>
+pluribus plugins install <package>
 pluribus run
-pluribus run --offline
 ```
+
+`install` accepts a directory or archive URL. Without `--sha256`, an archive is
+pinned to the downloaded digest; later fetches must match. It writes the
+manifest-requested access; credentials and model selection remain operator settings.
 
 `run` fetches and validates every configured package before it starts any
 component; `install` resolves one without starting anything.
-`run --offline` fails on HTTPS cache misses; local file archives can still
-be imported. Config changes take effect on restart. No confirmation or update
+Cached packages are reused; missing archives are fetched from their configured
+URLs. Config changes take effect on restart. No confirmation or update
 command is required.
 
 Change the URL and hash to update or roll back. A new URL with the same hash
@@ -63,8 +105,8 @@ Wasmtime; the shell executor ships separately with the native runtime.
 The cache stores the original archive and extracted package under:
 
 ```text
-data/packages/sha256/<hash>/archive.tar.gz
-data/packages/sha256/<hash>/package/
+<cache-dir>/packages/sha256/<hash>/archive.tar.gz
+<cache-dir>/packages/sha256/<hash>/package/
 ```
 
 Each resolution checks the archive hash and compares extracted files against
@@ -100,21 +142,21 @@ macOS, each on x86-64 and ARM64.
 The release workflow builds/tests plugins, packages them, then builds native
 binaries with `PLURIBUS_RELEASE_CATALOG` pointing to `plugins.json`. `init`
 writes an agent with no plugin instances; every package a configuration uses is
-named explicitly, by directory URL or by archive URL and digest. RLM's tool
-catalog and sender trust are supplied by core from the assembled instance.
+named explicitly, by bundled reference, directory URL, or archive URL and digest.
+The host supplies RLM’s tool catalog; connectors control sender admission.
 
 A release installation needs only `bin/` and no Rust toolchain. Add it to
 `PATH`, then run `pluribus init --example`. It writes each package as
 `bundled:<name>`, a reference resolved at load time: from `PLURIBUS_PLUGIN_DIR`,
 else a `share/pluribus/plugins/` beside the binary, else the catalog its
 binaries embed, by URL and digest. An upgrade that replaces the installation
-directory therefore keeps the configuration loadable. `pluribus install`
+directory therefore keeps the configuration loadable. `pluribus plugins install`
 consults none of them; it requires an explicit package directory or archive URL.
 
 Run the **Release** workflow with an existing `vX.Y.Z` tag matching the
 workspace version. It creates a draft with all assets; it does not create tags
 or publish the draft. Enable immutable releases in repository settings and
-publish the completed draft manually. No release has been published by this work.
+publish the completed draft manually.
 
 Local packaging:
 
@@ -137,7 +179,7 @@ draft with `gh`.
 
 GitHub documents [immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
 and [draft publication](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository).
-Release attestations and private-host authentication remain follow-up work.
+Release attestations and private-host authentication are unsupported.
 
 ## Verification
 

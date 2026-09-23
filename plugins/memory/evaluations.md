@@ -58,3 +58,50 @@ a nonzero test exit after writing the report.
 
 This is a small regression benchmark, not a statistical estimate of reliability.
 Repeat live runs across models and compare reports before tuning retrieval.
+
+## Learning replay
+
+`memory_learning` replays anonymized patterns from live operation through packaged
+cognition, REPL, and memory components in an isolated store:
+
+- Reuse vault templates and linked product/type/store conventions.
+- Use a verified interpreter workaround instead of repeating a missing command.
+- Supersede a corrected template and field name.
+- Update an environment lesson when an interpreter becomes available.
+
+Each case learns from an observation, restarts the runtime, and asks for a concrete
+next-action decision in a different conversation. The earlier observation is
+absent from recent conversation context. Correction cases seed an older memory
+with scripted calls; learning and application use the selected provider.
+
+Passing requires exactly one durable learning write, a supersession for correction
+cases, a successful recall of the learned version citing the training observation,
+and the expected JSON decision. A correct answer without a write or recall fails.
+Reports include decisions, writes, corrections, recall calls, model calls, and
+latency. Tests reject duplicate writes, stale decisions, fabricated success, and
+missing retrieval.
+
+Run the scripted harness and scorer checks after rebuilding packages:
+
+```sh
+cargo test --locked -p pluribus-cognition --test memory memory_learning -- --nocapture
+```
+
+For model behavior, use the same canonical provider bridge as above:
+
+```sh
+PLURIBUS_MEMORY_EVAL_LIVE=1 \
+PLURIBUS_MEMORY_EVAL_MODEL='provider/model' \
+PLURIBUS_MEMORY_EVAL_PROVIDER_CMD='/path/to/provider-bridge' \
+PLURIBUS_MEMORY_EVAL_OUTPUT=/tmp/memory-learning.json \
+cargo test --locked -p pluribus-cognition --test memory \
+  memory_learning_live_replay -- --ignored --nocapture
+```
+
+The fixture specifies response fields; expected values remain in the scorer.
+Live responses are not replaced by scripted answers. The live flag is required
+even with `--include-ignored`. No production store, shell executor, vault, or
+connector is accessed. These are decision replays, not full shell-task executions;
+they measure whether the next action repeats discovery or a known failure, not
+actual shell latency or command counts. Scripted success validates the harness,
+not model learning quality.

@@ -276,8 +276,9 @@ async fn add(
     println!("Installed {id}.");
     for credential in &package.manifest().credentials {
         println!(
-            "  Authorize {} with `pluribus auth {id}`.",
-            credential.display_name
+            "  Authorize {} with `pluribus{} plugins auth {id}`.",
+            credential.display_name,
+            data.cli_options()
         );
     }
     Ok(())

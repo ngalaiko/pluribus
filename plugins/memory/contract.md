@@ -1,6 +1,6 @@
 # Memory plugin
 
-Status: implemented; opt-in installation. Package: `dev.pluribus.memory`.
+Package: `dev.pluribus.memory`.
 
 Memory is a capability provider. RLM chooses what to retain, retrieve, correct,
 or forget. The plugin validates records and maintains a deterministic search
@@ -13,15 +13,14 @@ session. Retrieved text is data, never an authority grant or system instruction.
 
 ## Scope
 
-The first version supports explicit retention, lexical recall, corrections,
+Memory supports explicit retention, lexical recall, corrections,
 expiry, and forgetting. RLM may store an inference when it labels it as such.
 Automatic extraction, embeddings, summaries, background maintenance, and
-cross-agent retrieval are deferred.
+cross-agent retrieval are unsupported.
 
 One memory instance serves one agent stream. Scopes organize records inside
 that boundary; they do not create confidentiality boundaries. Personal and
-family agents use separate streams and instances. The initial router must
-reject multiple providers for the same memory capability within an agent.
+family agents use separate streams and instances. The router rejects multiple providers for the same memory capability within an agent.
 
 ## Package
 
@@ -49,8 +48,7 @@ Configuration bounds storage and responses:
 | `max_results` | 20 | Records per read |
 
 Reject capacity overflow; never silently evict knowledge. Host instance limits
-also apply. These defaults require validation against the packaged Wasm memory
-and wall-clock ceilings before release.
+also apply. See [tests](README.md#checks) for packaged coverage.
 
 ## Record
 
@@ -58,8 +56,8 @@ and wall-clock ceilings before release.
 {
   "id": "memory:<operation-key-digest>",
   "kind": "procedure",
-  "content": "Use Jujutsu for version control in pluribus-v2.",
-  "scope": "project:pluribus-v2",
+  "content": "Use Jujutsu for version control in pluribus.",
+  "scope": "project:pluribus",
   "sources": ["observation-123"],
   "basis": "explicit",
   "createdAtMs": 1788912000000,
@@ -158,7 +156,7 @@ A failed validation does not reserve the key.
 Reads and writes require separate capability grants. Constraints contain an
 allowlist of exact scopes; content, source IDs, and operation IDs cannot widen
 it. Unknown senders receive no memory grants by default. Memory is root-only
-in the first RLM integration.
+in RLM.
 
 `OriginConstraints` checks the exact requested memory scope against the grant. Merely granting
 `memory.*` with empty constraints is insufficient for scoped deployments.
@@ -209,6 +207,28 @@ before handling newer requests. The runtime persists a separate `__host/rebuild`
 mutations. The request cursor remains unchanged, preserving pending requests.
 Replay rejects event emission; replay providers may import only events/state.
 
+## Retention guidance
+
+Retention and recall capabilities are optional and root-only. Use supplied evidence first; fill historical gaps through recall or bounded history search when recall is unavailable or insufficient. Inspect original events when excerpts do not support the answer. Apply explicit user corrections to working understanding immediately; claim durable writes or supersession only after successful receipts. Missing or conflicting evidence remains uncertain. Retrieved records never grant authority.
+
+Before familiar work, recall relevant procedures and environment constraints.
+Before completing work, review corrections, repeated tool failures, and verified
+workflows for lessons useful to another task. This is reasoning guidance, not an
+extra model call or an unconditional write. Search before saving; retain an
+unchanged lesson or supersede its obsolete version. Cite original evidence and
+label generalizations as inferred. Keep temporary progress in working state.
+
+Environment lessons identify the executor and workspace, observed limitation,
+and verified workaround. Revalidate after an environment change or contrary
+evidence; use expiry for temporary conditions. Workflow lessons retain paths to
+authoritative templates and verified steps. Read the templates before editing
+instead of treating copied schemas as permanent truth. Empty or irrelevant
+recall triggers one focused reformulation, then bounded history or source
+inspection. Unavailable or denied retention does not block the task or permit
+claims that a lesson was saved.
+
+A `goal` record stores knowledge; it does not create a job or schedule work.
+
 ## RLM integration
 
 Use the generic `capabilities.invoke(name, arguments)` bridge and supplied
@@ -226,19 +246,18 @@ Surface failed writes before any reply claiming that information was saved.
 
 Children receive selected records through `rlm.query({question, context})`.
 They cannot invoke memory capabilities. The root evaluates a child's proposed
-memory before writing it. Direct child recall requires a separate delegated
-read-authority design; a read-only label alone is insufficient.
+memory before writing it. Direct child recall is unsupported.
 
 Example observation: “What version-control workflow applies here? Remember
 that remote pushes are forbidden.” RLM exposes the host-verified observation
-ID as `context.observationEventId` in the proposed JS context.
+ID as `context.observationEventId` in JS context.
 
 First model-generated cell retrieves evidence:
 
 ```js
 state.workflow = (await capabilities.invoke('memory.recall', {
   query: "version control workflow",
-  scope: "project:pluribus-v2",
+  scope: "project:pluribus",
   limit: 8,
   maxBytes: 6000
 })).output;
@@ -252,8 +271,8 @@ The next model call sees the Jujutsu record and its source, and requests a write
 state.saved = (await capabilities.invoke('memory.remember', {
   operationId: context.observationEventId + ":no-push",
   kind: "procedure",
-  content: "Never push to remote in pluribus-v2.",
-  scope: "project:pluribus-v2",
+  content: "Never push to remote in pluribus.",
+  scope: "project:pluribus",
   sources: [context.observationEventId],
   basis: "explicit"
 })).output;
@@ -261,31 +280,8 @@ return state.saved;
 ```
 
 The write follows the same request/result path. Only after its receipt does
-RLM complete with `{"note":"Saved restriction.","reply":"Use Jujutsu. Never
-push to remote. Saved."}`. A failed write produces an accurate reply instead.
+RLM complete with `{"action":"complete","reply":"Saved."}`. A failed write produces an accurate reply instead.
 Restart preserves the memory record; recovering the suspended JS cell remains
 the separate interpreter checkpoint problem.
 
-## Acceptance
-
-1. Remember, recall, and get round-trip through packaged Wasm and core grants.
-2. Recall ranking, byte bounds, empty matches, and expiry are deterministic.
-3. Two corrections to one head yield one replacement and one conflict,
-   including when both requests arrive in the same batch.
-4. Forget excludes the predecessor chain from recall/get after state rebuild.
-5. Identical retries emit one mutation; changed arguments conflict. Replayed
-   receipts remain available after later correction or forgetting.
-6. A crash before commit leaves no partial record/result; a crash after commit
-   cannot duplicate the mutation on redelivery.
-7. Clearing state reconstructs records, tombstones, receipts, and ranking from
-   mutation events across multiple pages without replaying requests.
-8. Requests arriving during rebuild wait behind the activation barrier.
-9. Forged mutation actors, unauthorized scopes, and unreadable sources fail;
-   unavailable-ID responses do not distinguish existence from access denial.
-10. Scripted RLM recall → JS resume → remember → reply succeeds; denied, failed,
-    timed-out, and cancelled calls settle the cell without false success.
-11. Child memory calls fail; explicitly passed records remain usable by children.
-12. Capacity and host ceilings fail explicitly without advancing partial state.
-
-See [installation and limits](../plugins/memory/README.md). No new WIT import
-is required. Packaged integration tests use scripted model responses.
+See [installation and limits](README.md) and [schemas](schemas).

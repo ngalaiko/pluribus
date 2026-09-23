@@ -1,0 +1,36 @@
+[
+  {
+    "id": "vault-workflow",
+    "query": "vault products template",
+    "lesson": "Vault products in /workspace/vault use Templates/Product Template.md. Product frontmatter uses categories, types, store, and source. Types and stores link to separate notes. Read the authoritative template before editing; preserve existing conventions.",
+    "observation": "We checked the vault: it is at /workspace/vault. Products follow Templates/Product Template.md with categories, types, store, and source fields. Product types and stores are separate linked notes. Use those existing conventions, not a new schema. Acknowledge briefly.",
+    "question": "Add another product to my vault. Do not edit files yet. Give the next step as JSON with action (read-template or discover), templatePath, typeField, storeField, and revalidateTemplate (boolean).",
+    "expected": {"action":"read-template","templatePath":"/workspace/vault/Templates/Product Template.md","typeField":"types","storeField":"store","revalidateTemplate":true}
+  },
+  {
+    "id": "missing-interpreter",
+    "query": "executor sandbox-a python Nix",
+    "lesson": "Executor sandbox-a at /workspace/a returned python3: command not found on two attempts. Its verified workaround is nix shell nixpkgs#python3 -c python3. Use Nix to provide Python there; revalidate tool availability after an environment change. This observation does not describe other executors.",
+    "observation": "Two attempts in executor sandbox-a (/workspace/a) returned python3: command not found. We verified that nix shell nixpkgs#python3 -c python3 works. Use Nix for tools in this executor. Acknowledge briefly.",
+    "question": "Parse JSON with Python in executor sandbox-a. Do not execute anything yet. Reply as JSON with executor, command (the interpreter launch prefix), and revalidateAfterEnvironmentChange (boolean).",
+    "expected": {"executor":"sandbox-a","command":"nix shell nixpkgs#python3 -c python3","revalidateAfterEnvironmentChange":true}
+  },
+  {
+    "id": "corrected-template",
+    "query": "vault products template",
+    "initialLesson": "Vault products in /workspace/vault use Templates/Legacy Product.md and the category field for their product type.",
+    "lesson": "Vault products in /workspace/vault use Templates/Product Template.md and the types field for linked product types. Read the authoritative template before editing. Templates/Legacy Product.md and the category field are obsolete for this workflow.",
+    "observation": "Correction: vault products use /workspace/vault/Templates/Product Template.md and the types field, not Templates/Legacy Product.md and category. Read the existing template before editing. Acknowledge briefly.",
+    "question": "Prepare another product note for my vault. Do not edit files yet. Reply as JSON with action (read-template or discover), templatePath, typeField, and revalidateTemplate (boolean).",
+    "expected": {"action":"read-template","templatePath":"/workspace/vault/Templates/Product Template.md","typeField":"types","revalidateTemplate":true}
+  },
+  {
+    "id": "environment-change",
+    "query": "executor sandbox-a python",
+    "initialLesson": "Executor sandbox-a at /workspace/a lacks python3 on PATH. Use nix shell nixpkgs#python3 -c python3; revalidate after an environment change.",
+    "lesson": "Executor sandbox-a at /workspace/a was rebuilt. A verified python3 --version succeeded there, so python3 is available on PATH. Revalidate after another environment change; the earlier missing-interpreter observation is obsolete for this executor.",
+    "observation": "Executor sandbox-a was rebuilt. We verified python3 --version succeeds in /workspace/a. Python is available directly there; the old missing-command workaround is unnecessary. Acknowledge briefly.",
+    "question": "Parse JSON with Python in executor sandbox-a. Do not execute anything yet. Reply as JSON with executor, command (the interpreter launch prefix), and revalidateAfterEnvironmentChange (boolean).",
+    "expected": {"executor":"sandbox-a","command":"python3","revalidateAfterEnvironmentChange":true}
+  }
+]

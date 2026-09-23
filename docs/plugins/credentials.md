@@ -38,7 +38,7 @@ Descriptors are untrusted until validated. Credential IDs MUST be unique. Unknow
 
 Discovery reads `plugin.toml` and the schema and flow files it names. No guest code runs during discovery. `input_schema` and `flow` are package-relative paths to JSON files.
 
-Operators register packages, instance configurations, and grants in the [plugin-instance registry](../plugin-instances.md). `pluribus auth <instance>` accepts any instance whose manifest declares credentials, independent of its package ID or what else it does.
+Operators register packages, instance configurations, and grants in the [plugin-instance registry](../plugin-instances.md). `pluribus plugins auth <instance>` accepts any instance whose manifest declares credentials, independent of its package ID or what else it does.
 
 The host supports these flows:
 
@@ -67,7 +67,7 @@ cannot be overwritten. A lost swap adopts whatever the winner stored.
 
 Credential writes are atomic but independent of event commits, so a plugin
 must make enrollment and token exchanges replay-safe. Re-running
-`pluribus auth <instance>` replaces the whole record rather than merging into
+`pluribus plugins auth <instance>` replaces the whole record rather than merging into
 it.
 
 ## Network constraints

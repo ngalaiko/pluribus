@@ -106,16 +106,20 @@ A returned failure commits nothing, so the cursor does not advance and the same
 events are delivered again. Terminal results already appended through
 `events.append` deduplicate on their keys rather than duplicating.
 
-A trap records `component.failed`, carrying the instance, the reason, and the
-delivered sequence range. The host then advances the cursor past that batch and
-withdraws the instance from delivery, because redelivering a batch that killed
-a component only kills it again. Restoring an instance is an operator decision;
-`component.failed` is the durable record of why it left.
+A non-resource trap records `component.failed`, carrying the instance, reason,
+and delivered sequence range. The host advances past the failed batch and
+quarantines the instance. A pinned-session component can restart with fresh
+memory; its suspended calls receive unknown outcomes and admitted cells are not
+replayed. Other components remain quarantined.
 
-Automatic restart under bounded exponential backoff is not implemented. A
-restart keeps configuration and durable state but discards linear memory, open
-HTTP streams, blob uploads, and delivery-scoped handles, and loses any pinned
-session, which fails its activity.
+Resource exhaustion follows bounded recovery: persistent attempt counts,
+single-input deliveries, and an atomic deferred-work event before cursor
+advancement when retries are exhausted. Returned failures use persistent backoff.
+See [runtime recovery](../runtime.md#resource-recovery).
+
+Restart retains durable state and configuration but discards linear memory,
+open streams, uploads, and delivery-scoped handles. Durable checkpoints do not
+restore suspended stacks.
 
 The host does not automatically retry:
 

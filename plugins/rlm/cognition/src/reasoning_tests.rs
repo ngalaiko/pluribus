@@ -1,4 +1,25 @@
 #[test]
+fn reasoning_requests_teach_reusable_procedures_and_environment_revalidation() {
+    let mut e = Engine::default();
+    let c = config();
+    let request = observe(&mut e, &c, "learning", json!({
+        "message":{"text":"We have a product type template; follow existing products."}
+    })).remove(0);
+    let instruction = request.payload["messages"][0]["content"][0]["text"].as_str().unwrap();
+    for rule in [
+        "Before familiar work, recall relevant procedures",
+        "Before completing work, review user corrections, repeated tool failures, and verified workflows",
+        "Search for an existing lesson before writing",
+        "Scope environment observations to the executor",
+        "Revalidate after an environment change",
+        "Store paths to authoritative templates",
+        "Label generalizations as inferred",
+    ] {
+        assert!(instruction.contains(rule), "missing learning rule: {rule}");
+    }
+}
+
+#[test]
 fn reasoning_rejects_model_scheduled_continuations() {
     assert!(validate_control(&json!({"action":"continue"}), false).is_err());
     assert!(!model_tools(false).to_string().contains("continue"));

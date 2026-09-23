@@ -349,6 +349,23 @@ impl<M: Send + Sync + 'static> SqliteEventStore<M> {
         Self::initialize(connection, metadata).await
     }
 
+    /// Opens an existing store without migrations or write access.
+    ///
+    /// # Errors
+    /// Returns an error when the database cannot be opened for reading.
+    pub async fn open_read_only(path: impl AsRef<Path>, metadata: M) -> Result<Self, AppendError> {
+        let connection = async_sqlite::ClientBuilder::new()
+            .path(path)
+            .flags(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .open()
+            .await
+            .map_err(storage)?;
+        Ok(Self {
+            connection,
+            metadata: Arc::new(metadata),
+        })
+    }
+
     /// Opens an isolated in-memory store.
     ///
     /// # Errors

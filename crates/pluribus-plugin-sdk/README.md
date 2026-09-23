@@ -58,3 +58,6 @@ Source plugins own their wait loop and use `runtime` directly. The SDK does
 not grant authority; manifests and operator grants control every host call.
 Build with `--target wasm32-unknown-unknown` and package the resulting module
 with `pluribus-package`.
+
+See [Rust authoring](../../docs/plugins/rust.md) for package setup and
+[development](../../docs/development.md) for workspace builds and checks.

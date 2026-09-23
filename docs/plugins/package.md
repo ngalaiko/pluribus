@@ -4,7 +4,7 @@
 
 Packages load from a directory or a pinned `.tar.gz` archive. Remote and
 `file://` references use `{ "url": "...", "sha256": "..." }` in instance config;
-see [installation](../release-design.md). Archives contain this layout at their root:
+see [installation](../installation.md). Archives contain this layout at their root:
 
 ```text
 example-plugin/
@@ -297,7 +297,7 @@ Each component `digest` covers its binary, not the manifest or documentation.
 The package builder replaces template `sha256:dev` values with binary digests.
 Installed packages require concrete digests.
 
-Signing and registry trust are deferred. Operators trust the installed bytes and recorded digest. An update is a new installation decision, even when `id` and publisher are unchanged.
+Signing and registry trust are unsupported. Operators trust the installed bytes and recorded digest. An update is a new installation decision, even when `id` and publisher are unchanged.
 
 ## JSON
 
@@ -318,7 +318,7 @@ Payload schema versions are independent of plugin, manifest, and ABI versions.
 registering its capabilities. Replay commits state and a separate replay cursor;
 request delivery progress stays unchanged. Handlers must consume each replay
 batch without emitting events. Replay providers may import only `events` and
-`state`. See [memory](../memory-plugin.md).
+`state`. See [memory](../../plugins/memory/contract.md).
 
 Credential declarations set `access = true` when their Wasm component reads
 the sealed record. The host grants only that declaration's configured handle

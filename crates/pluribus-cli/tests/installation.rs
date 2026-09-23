@@ -31,6 +31,12 @@ fn explicit_file_sources_survive_binary_relocation() {
             .env_remove("PLURIBUS_PLUGIN_DIR")
             .arg("--data-dir")
             .arg(&data)
+            .arg("--config-dir")
+            .arg(&data)
+            .arg("--cache-dir")
+            .arg(&data)
+            .arg("--runtime-dir")
+            .arg(&data)
             .args(arguments)
             .output()
             .unwrap()
@@ -71,7 +77,8 @@ fn explicit_file_sources_survive_binary_relocation() {
     fs::rename(prefix.join("bin"), moved.join("bin")).unwrap();
     // Reaching the credential check means the package resolved from where the
     // configuration names it, not from beside the binary.
-    let error = String::from_utf8_lossy(&invoke(&moved, &["auth", "memory-1"]).stderr).into_owned();
+    let error = String::from_utf8_lossy(&invoke(&moved, &["plugins", "auth", "memory-1"]).stderr)
+        .into_owned();
     assert!(error.contains("declares no credentials"), "{error}");
     assert_eq!(fs::read(&config_path).unwrap(), bytes);
 }
@@ -84,6 +91,12 @@ fn missing_installed_packages_do_not_fall_back_to_the_build_checkout() {
     let output = Command::new(binary)
         .env_remove("PLURIBUS_PLUGIN_DIR")
         .arg("--data-dir")
+        .arg(temp.path().join("data"))
+        .arg("--config-dir")
+        .arg(temp.path().join("data"))
+        .arg("--cache-dir")
+        .arg(temp.path().join("data"))
+        .arg("--runtime-dir")
         .arg(temp.path().join("data"))
         .args(["init", "--example"])
         .output()
@@ -114,6 +127,12 @@ fn installing_a_package_directory_configures_it_without_rust() {
             .env_remove("PLURIBUS_PLUGIN_DIR")
             .arg("--data-dir")
             .arg(&data)
+            .arg("--config-dir")
+            .arg(&data)
+            .arg("--cache-dir")
+            .arg(&data)
+            .arg("--runtime-dir")
+            .arg(&data)
             .args(arguments)
             .output()
             .unwrap()
@@ -121,7 +140,7 @@ fn installing_a_package_directory_configures_it_without_rust() {
     assert!(invoke(&["init"]).status.success());
 
     let package = bundle.join("share/pluribus/plugins/memory");
-    let output = invoke(&["install", &package.to_string_lossy()]);
+    let output = invoke(&["plugins", "install", &package.to_string_lossy()]);
     assert!(
         output.status.success(),
         "{}",
@@ -144,7 +163,7 @@ fn installing_a_package_directory_configures_it_without_rust() {
 
     // The same package cannot be installed twice under one name.
     assert!(
-        !invoke(&["install", &package.to_string_lossy()])
+        !invoke(&["plugins", "install", &package.to_string_lossy()])
             .status
             .success()
     );
@@ -170,6 +189,12 @@ fn bundled_references_resolve_through_the_current_installation() {
             .env_remove("PLURIBUS_PLUGIN_DIR")
             .arg("--data-dir")
             .arg(&data)
+            .arg("--config-dir")
+            .arg(&data)
+            .arg("--cache-dir")
+            .arg(&data)
+            .arg("--runtime-dir")
+            .arg(&data)
             .args(arguments)
             .output()
             .unwrap()
@@ -187,8 +212,8 @@ fn bundled_references_resolve_through_the_current_installation() {
 
     // Reaching the credential check means the name resolved.
     let resolved = |prefix: &Path| {
-        let error =
-            String::from_utf8_lossy(&invoke(prefix, &["auth", "memory"]).stderr).into_owned();
+        let error = String::from_utf8_lossy(&invoke(prefix, &["plugins", "auth", "memory"]).stderr)
+            .into_owned();
         assert!(error.contains("declares no credentials"), "{error}");
     };
     resolved(&old);

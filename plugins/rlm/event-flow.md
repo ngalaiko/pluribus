@@ -55,4 +55,4 @@ stack belongs only to its JS component; cognition resumes it through events.
 Bundle installation preflights every component before lifecycle execution and
 activates registrations only after all components initialize and rebuild. A failed
 initialization can leave committed lifecycle events/state but no active package
-registrations. See [package instances](plugin-instances.md).
+registrations. See [package instances](../../docs/plugin-instances.md).
