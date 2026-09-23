@@ -2144,12 +2144,20 @@ fn authorize_blob_references(
         }
     }
     found.retain(|blob| validate_blob_ref(blob).is_ok());
-    if found.iter().any(|blob| !visible_blobs.contains(blob)) {
+    if found.iter().any(|blob| {
+        !visible_blobs
+            .iter()
+            .any(|visible| same_blob_content(blob, visible))
+    }) {
         return Err(RuntimeError::new(
             "proposal references a blob not visible to this delivery",
         ));
     }
     Ok(())
+}
+
+fn same_blob_content(left: &BlobRef, right: &BlobRef) -> bool {
+    left.algorithm == right.algorithm && left.digest == right.digest && left.size == right.size
 }
 
 fn core_payload(payload: &types::Payload) -> Result<EventPayload, types::Error> {

@@ -144,8 +144,9 @@ delivery context, separate from `arguments`, so capability schemas need not
 accept host-supplied fields. Providers must still resolve each digest through
 the host's current-delivery visibility check; a reference supplied in
 `arguments` is not authority. A plugin may propose a blob reference only when
-that exact reference was delivered to it or stored by it during the current
-delivery. Only ready image attachments are sent as model content, and only
+its algorithm, digest, and size match a blob visible in the current delivery,
+including authorized history reads and uploads. MIME metadata may be corrected.
+Only ready image attachments are sent as model content, and only
 when the selected model supports vision. Other ready files remain available
 to capabilities through this attachment context.
 

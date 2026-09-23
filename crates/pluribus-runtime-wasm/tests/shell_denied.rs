@@ -290,7 +290,7 @@ async fn export_delivery(mode: &str) {
         )
         .unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
-        let args = json!({"command": command.clone(), "attachments": attachments});
+        let args = json!({"command": command.clone()});
         assert!(
             validator.is_valid(&args),
             "public shell.execute schema rejected {args}"
@@ -357,7 +357,8 @@ async fn export_delivery(mode: &str) {
             payload: EventPayload::CanonicalJson(
                 serde_json::to_vec(&json!({
                     "capability": "shell.execute",
-                    "arguments": {"command": command, "attachments": attachments},
+                    "arguments": {"command": command},
+                    "attachments": attachments,
                 }))
                 .unwrap(),
             ),

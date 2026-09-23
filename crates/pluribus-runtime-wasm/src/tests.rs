@@ -63,10 +63,32 @@ fn proposals_can_only_forward_visible_blob_references() {
         .unwrap(),
     );
     assert!(authorize_blob_references(&visible_nested, &visible_blobs).is_ok());
+    let relabeled = pluribus_core::BlobRef {
+        media_type: "image/jpeg".into(),
+        ..visible.clone()
+    };
+    assert!(
+        authorize_blob_references(&EventPayload::Blob(relabeled.clone()), &visible_blobs).is_ok()
+    );
+    let relabeled_nested = EventPayload::CanonicalJson(
+        serde_json::to_vec(&serde_json::json!({"blob": {
+            "algorithm": relabeled.algorithm,
+            "digest": relabeled.digest,
+            "size": relabeled.size,
+            "media-type": relabeled.media_type,
+        }}))
+        .unwrap(),
+    );
+    assert!(authorize_blob_references(&relabeled_nested, &visible_blobs).is_ok());
     assert!(
         authorize_blob_references(&EventPayload::Blob(visible.clone()), &visible_blobs).is_ok()
     );
     assert!(authorize_blob_references(&EventPayload::Blob(forged), &visible_blobs).is_err());
+    let wrong_size = pluribus_core::BlobRef {
+        size: visible.size + 1,
+        ..visible
+    };
+    assert!(authorize_blob_references(&EventPayload::Blob(wrong_size), &visible_blobs).is_err());
 }
 
 pub(super) struct Metadata(AtomicU64);
