@@ -6,8 +6,9 @@ mod package_builder;
 mod path;
 
 pub use manifest::{
-    ComponentManifest, CredentialDeclaration, Idempotency, Manifest, ModelProvider,
-    ProvidedCapability, RequestedCapability, component_id, merge_config,
+    CatalogInjection, ComponentManifest, ConnectorDeclaration, ConstraintBinding, ConstraintPart,
+    CredentialDeclaration, Idempotency, Manifest, ModelProvider, ProvidedCapability,
+    RequestedCapability, component_id, merge_config,
 };
 pub use package_builder::build_component_package;
 

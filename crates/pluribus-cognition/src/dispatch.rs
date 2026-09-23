@@ -10,7 +10,7 @@ use pluribus_core::{
     DenialReason, EventId, EventPayload, EventQuery, EventStore, EventTypeRegistry, PrincipalKind,
     PrincipalRef, StreamId, StreamKind, matches_pattern,
 };
-use pluribus_plugin_package::ComponentManifest;
+use pluribus_plugin_package::{ComponentManifest, ConstraintBinding};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -33,6 +33,8 @@ pub struct Subscriptions {
     /// Model identifiers this instance serves, matched against the payload of
     /// a `model.requested`.
     pub models: Vec<String>,
+    /// Provider-declared projections from request arguments to grant selectors.
+    pub constraint_bindings: BTreeMap<String, BTreeMap<String, ConstraintBinding>>,
 }
 
 impl Subscriptions {
@@ -69,6 +71,16 @@ impl Subscriptions {
                 .map(|provided| provided.capability.clone())
                 .collect(),
             models: models.to_vec(),
+            constraint_bindings: manifest
+                .provides
+                .iter()
+                .map(|capability| {
+                    (
+                        capability.capability.clone(),
+                        capability.constraint_bindings.clone(),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -114,6 +126,57 @@ pub fn payload_field(event: &CommittedEvent, field: &str) -> Option<String> {
 pub struct Registration {
     pub instance_id: String,
     pub subscriptions: Subscriptions,
+}
+
+struct ProjectedConstraints<'a, P> {
+    policy: &'a P,
+    bindings: Option<&'a BTreeMap<String, ConstraintBinding>>,
+}
+
+impl<P: ConstraintPolicy> ConstraintPolicy for ProjectedConstraints<'_, P> {
+    fn allows(&self, grant: &pluribus_core::Grant, request: &[u8]) -> Result<bool, String> {
+        let constraints: Value = serde_json::from_slice(grant.constraints.as_bytes())
+            .map_err(|error| error.to_string())?;
+        let constraints = constraints
+            .as_object()
+            .ok_or("constraints must be an object")?;
+        let request_value: Value =
+            serde_json::from_slice(request).map_err(|error| error.to_string())?;
+        let mut selectors = serde_json::Map::new();
+        for (key, binding) in self.bindings.into_iter().flatten() {
+            if !constraints.contains_key(key) {
+                if binding.required {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let mut selector = String::new();
+            if binding.parts.is_empty() {
+                return Ok(false);
+            }
+            for part in &binding.parts {
+                let Some(value) = request_value.pointer(&part.pointer) else {
+                    if part.optional {
+                        continue;
+                    }
+                    return Ok(false);
+                };
+                let value = match value {
+                    Value::String(value) => value.clone(),
+                    Value::Number(value) => value.to_string(),
+                    _ => return Ok(false),
+                };
+                selector.push_str(&part.prefix);
+                selector.push_str(&value);
+            }
+            selectors.insert(key.clone(), Value::String(selector));
+        }
+        self.policy.allows_projected(
+            grant,
+            request,
+            &serde_json::to_vec(&selectors).map_err(|error| error.to_string())?,
+        )
+    }
 }
 
 /// The decision the router reached about one request event.
@@ -325,11 +388,19 @@ impl<P: ConstraintPolicy> Router<P> {
         let provider = PrincipalRef::new(PrincipalKind::Component, &instance_id);
         let name = CapabilityName::new(capability.clone());
 
+        let bindings = candidates[0]
+            .subscriptions
+            .constraint_bindings
+            .get(&capability);
+        let policy = ProjectedConstraints {
+            policy: &self.constraints,
+            bindings,
+        };
         let decision = authority.decide(
             &name,
             &provider,
             arguments.to_string().as_bytes(),
-            &self.constraints,
+            &policy,
             now_ms,
         );
         let routed = match decision {

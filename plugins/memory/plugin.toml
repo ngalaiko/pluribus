@@ -22,6 +22,7 @@ arguments_schema = "schemas/remember.arguments.json"
 result_schema = "schemas/remember.result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "keyed"
+constraint_bindings = { scopes = { parts = [{ pointer = "/scope" }], required = true } }
 
 [[components.main.provides]]
 capability = "memory.supersede"
@@ -30,6 +31,7 @@ arguments_schema = "schemas/supersede.arguments.json"
 result_schema = "schemas/supersede.result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "keyed"
+constraint_bindings = { scopes = { parts = [{ pointer = "/scope" }], required = true } }
 
 [[components.main.provides]]
 capability = "memory.forget"
@@ -38,6 +40,7 @@ arguments_schema = "schemas/forget.arguments.json"
 result_schema = "schemas/forget.result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "keyed"
+constraint_bindings = { scopes = { parts = [{ pointer = "/scope" }], required = true } }
 
 [[components.main.provides]]
 capability = "memory.get"
@@ -46,6 +49,7 @@ arguments_schema = "schemas/get.arguments.json"
 result_schema = "schemas/get.result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "inherent"
+constraint_bindings = { scopes = { parts = [{ pointer = "/scope" }], required = true } }
 
 [[components.main.provides]]
 capability = "memory.recall"
@@ -54,3 +58,4 @@ arguments_schema = "schemas/recall.arguments.json"
 result_schema = "schemas/recall.result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "inherent"
+constraint_bindings = { scopes = { parts = [{ pointer = "/scope" }], required = true } }

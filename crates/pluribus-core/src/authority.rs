@@ -208,6 +208,20 @@ pub trait ConstraintPolicy: Send + Sync {
     ///
     /// Returns an error when the constraint or request cannot be interpreted.
     fn allows(&self, grant: &Grant, request: &[u8]) -> Result<bool, String>;
+
+    /// Checks host-projected selectors from the selected provider's contract.
+    /// Policies without declarative bindings retain access to the original request.
+    ///
+    /// # Errors
+    /// Returns an error when the grant, request, or selectors cannot be interpreted.
+    fn allows_projected(
+        &self,
+        grant: &Grant,
+        request: &[u8],
+        _selectors: &[u8],
+    ) -> Result<bool, String> {
+        self.allows(grant, request)
+    }
 }
 
 #[cfg(test)]

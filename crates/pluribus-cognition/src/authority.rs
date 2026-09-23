@@ -143,44 +143,31 @@ impl OriginAuthority {
     }
 }
 
+/// Matches operator allowlists against host-projected request selectors.
 pub struct OriginConstraints;
 impl ConstraintPolicy for OriginConstraints {
-    fn allows(&self, grant: &Grant, request: &[u8]) -> Result<bool, String> {
+    fn allows(&self, grant: &Grant, selectors: &[u8]) -> Result<bool, String> {
         let constraints: Value =
             serde_json::from_slice(grant.constraints.as_bytes()).map_err(|e| e.to_string())?;
-        if grant.capability.as_str().starts_with("memory.") {
-            let request: Value = serde_json::from_slice(request).map_err(|e| e.to_string())?;
-            return Ok(request["scope"].as_str().is_some_and(|scope| {
-                constraints["scopes"].as_array().is_some_and(|scopes| {
-                    scopes.iter().any(|allowed| allowed.as_str() == Some(scope))
-                })
-            }));
-        }
-        if constraints == json!({}) {
-            return Ok(true);
-        }
-        let request: Value = serde_json::from_slice(request).map_err(|e| e.to_string())?;
-        // The reply contract names its conversation; a provider's own sends
-        // may name the chat instead.
-        let conversation = if let Some(conversation) = request["conversationId"].as_str() {
-            conversation.to_owned()
-        } else if grant.capability.as_str().starts_with("telegram.") {
-            let chat = match &request["chat_id"] {
-                Value::Number(n) => n.to_string(),
-                Value::String(s) => s.clone(),
-                _ => return Ok(false),
-            };
-            request["message_thread_id"].as_i64().map_or_else(
-                || format!("chat:{chat}"),
-                |thread| format!("chat:{chat}:thread:{thread}"),
-            )
-        } else {
-            // An unrecognised request shape cannot be checked against a
-            // constraint, so it is not allowed.
-            return Ok(false);
-        };
-        Ok(constraints["conversation_ids"]
-            .as_array()
-            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&conversation))))
+        let selectors: Value = serde_json::from_slice(selectors).map_err(|e| e.to_string())?;
+        let constraints = constraints
+            .as_object()
+            .ok_or("constraints must be an object")?;
+        Ok(constraints.iter().all(|(key, allowed)| {
+            allowed.as_array().is_some_and(|values| {
+                selectors
+                    .get(key)
+                    .is_some_and(|value| values.contains(value))
+            })
+        }))
+    }
+
+    fn allows_projected(
+        &self,
+        grant: &Grant,
+        _request: &[u8],
+        selectors: &[u8],
+    ) -> Result<bool, String> {
+        self.allows(grant, selectors)
     }
 }

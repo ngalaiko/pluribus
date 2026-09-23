@@ -63,8 +63,56 @@ struct TestPackage {
 
 #[test]
 fn rlm_manifest_uses_the_events_query_interface() {
-    let manifest: Value = toml::from_str(include_str!("../../../plugins/rlm/plugin.toml")).unwrap();
+    let mut manifest: Value =
+        toml::from_str(include_str!("../../../plugins/rlm/plugin.toml")).unwrap();
     validate_manifest_schema(&manifest).unwrap();
+    manifest["id"] = "org.example.reasoner".into();
+    let loaded: Manifest = toml::from_str(&toml::to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        loaded.components["cognition"]
+            .catalog_injection
+            .as_ref()
+            .unwrap()
+            .tools_pointer,
+        "/tools"
+    );
+}
+
+#[test]
+fn connector_and_constraint_bindings_are_declared_without_identity_conventions() {
+    let telegram: Value =
+        toml::from_str(include_str!("../../../plugins/telegram/plugin.toml")).unwrap();
+    validate_manifest_schema(&telegram).unwrap();
+    let manifest: Manifest = toml::from_str(&toml::to_string(&telegram).unwrap()).unwrap();
+    let receive = &manifest.components["receive"];
+    assert_eq!(receive.connector.as_ref().unwrap().provider, "telegram");
+    assert_eq!(
+        receive
+            .connector
+            .as_ref()
+            .unwrap()
+            .reply_component
+            .as_deref(),
+        Some("send")
+    );
+    let reply = manifest.components["send"]
+        .provides
+        .iter()
+        .find(|item| item.capability == "telegram.reply")
+        .unwrap();
+    assert_eq!(
+        reply.constraint_bindings["conversation_ids"].parts[0].pointer,
+        "/conversationId"
+    );
+    let send = manifest.components["send"]
+        .provides
+        .iter()
+        .find(|item| item.capability == "telegram.send-message")
+        .unwrap();
+    assert_eq!(
+        send.constraint_bindings["conversation_ids"].parts[0].pointer,
+        "/chat_id"
+    );
 }
 
 impl TestPackage {

@@ -568,17 +568,25 @@ async fn origin_grants_follow_causation_and_confine_replies() {
         );
         assert!(
             OriginConstraints
-                .allows(grant, br#"{"chat_id":9,"message_thread_id":3}"#)
+                .allows(grant, br#"{"conversation_ids":"chat:9:thread:3"}"#)
                 .unwrap()
         );
         assert!(
             !OriginConstraints
-                .allows(grant, br#"{"chat_id":10,"message_thread_id":3}"#)
+                .allows(grant, br#"{"conversation_ids":"chat:10:thread:3"}"#)
                 .unwrap()
         );
         assert!(
             !OriginConstraints
-                .allows(grant, br#"{"chat_id":9}"#)
+                .allows(grant, br#"{"conversation_ids":"chat:9"}"#)
+                .unwrap()
+        );
+        assert!(
+            !OriginConstraints
+                .allows(
+                    grant,
+                    br#"{"chat_id":10,"conversationId":"chat:9:thread:3"}"#
+                )
                 .unwrap()
         );
         let mut spoof = origin.request.clone();
@@ -1096,4 +1104,154 @@ async fn deferred_photo_preserves_caption_and_original_reference() {
         source.event_id.as_str()
     );
     assert_eq!(value["input"]["payload"]["source"]["payloadOmitted"], true);
+}
+
+#[test]
+fn origin_constraints_support_declared_selectors_without_plugin_names() {
+    let grant = Grant {
+        capability: CapabilityName::new("vendor.search"),
+        provider: None,
+        constraints: ConstraintSet::canonical_json(br#"{"tenants":["team:7"]}"#.to_vec()),
+    };
+    assert!(
+        crate::OriginConstraints
+            .allows(&grant, br#"{"tenants":"team:7"}"#)
+            .unwrap()
+    );
+    assert!(
+        !crate::OriginConstraints
+            .allows(&grant, br#"{"tenants":"team:8"}"#)
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn routing_projects_constraints_from_the_selected_provider_contract() {
+    use pluribus_plugin_package::{ConstraintBinding, ConstraintPart};
+    let store = store().await;
+    let mut router = Router::new(
+        StreamId::new("personal"),
+        agent(),
+        Arc::clone(&store) as Arc<dyn EventStore>,
+        Arc::new(EventTypeRegistry::core()),
+        crate::OriginConstraints,
+    );
+    let binding = ConstraintBinding {
+        parts: vec![
+            ConstraintPart {
+                pointer: "/destination".into(),
+                prefix: "room:".into(),
+                optional: false,
+            },
+            ConstraintPart {
+                pointer: "/thread".into(),
+                prefix: ":thread:".into(),
+                optional: true,
+            },
+        ],
+        required: true,
+    };
+    router.register(Registration {
+        instance_id: "external-provider".into(),
+        subscriptions: Subscriptions {
+            capabilities: vec!["vendor.send".into()],
+            constraint_bindings: BTreeMap::from([(
+                "vendor.send".into(),
+                BTreeMap::from([("destinations".into(), binding)]),
+            )]),
+            ..Default::default()
+        },
+    });
+    let mut auth = authority(&["vendor.send"]);
+    let set_constraints = |auth: &mut Authority, value| {
+        auth.grants
+            .get_mut(&CapabilityName::new("vendor.send"))
+            .unwrap()[0]
+            .constraints = ConstraintSet::canonical_json(serde_json::to_vec(&value).unwrap());
+    };
+    set_constraints(&mut auth, json!({"destinations":["room:7:thread:3"]}));
+    for (args, permitted) in [
+        (json!({"destination":7,"thread":3}), true),
+        (
+            json!({"destination":8,"thread":3,"conversationId":"room:7:thread:3"}),
+            false,
+        ),
+        (json!({"destination":7}), false),
+        (json!({"destination":7,"thread":null}), false),
+        (json!({"destinations":"room:7:thread:3"}), false),
+    ] {
+        let event = append(
+            &store,
+            "capability.requested",
+            &json!({"capability":"vendor.send","arguments":args}),
+        )
+        .await;
+        let result = router
+            .route_request(&event, &auth, &agent(), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            matches!(result, Routed::Deliver { .. }),
+            permitted,
+            "{result:?}"
+        );
+    }
+    set_constraints(&mut auth, json!({"destinations":["room:7"]}));
+    let event = append(
+        &store,
+        "capability.requested",
+        &json!({"capability":"vendor.send","arguments":{"destination":7}}),
+    )
+    .await;
+    assert!(matches!(
+        router
+            .route_request(&event, &auth, &agent(), 0)
+            .await
+            .unwrap(),
+        Routed::Deliver { .. }
+    ));
+    let malformed = append(
+        &store,
+        "capability.requested",
+        &json!({"capability":"vendor.send","arguments":{"destination":7,"thread":null}}),
+    )
+    .await;
+    assert!(matches!(
+        router
+            .route_request(&malformed, &auth, &agent(), 0)
+            .await
+            .unwrap(),
+        Routed::Denied { .. }
+    ));
+    for constraints in [
+        json!({}),
+        json!({"destinations":[]}),
+        json!({"destinations":["room:7"],"unknown":["x"]}),
+    ] {
+        set_constraints(&mut auth, constraints);
+        assert!(matches!(
+            router
+                .route_request(&event, &auth, &agent(), 0)
+                .await
+                .unwrap(),
+            Routed::Denied { .. }
+        ));
+    }
+    // Replacing a provider replaces its selector contract, including wildcard grants.
+    router.unregister("external-provider");
+    router.register(Registration {
+        instance_id: "replacement".into(),
+        subscriptions: Subscriptions {
+            capabilities: vec!["vendor.send".into()],
+            ..Default::default()
+        },
+    });
+    set_constraints(&mut auth, json!({"destinations":["room:7"]}));
+    assert!(matches!(
+        router
+            .route_request(&event, &auth, &agent(), 0)
+            .await
+            .unwrap(),
+        Routed::Denied { .. }
+    ));
 }

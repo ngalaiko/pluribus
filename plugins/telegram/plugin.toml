@@ -17,6 +17,7 @@ flow = "flows/bot-token.json"
 
 
 [components.receive]
+connector = { provider = "telegram", reply_component = "send" }
 world = "pluribus:plugin/plugin@3.0.0"
 component = "components/receive.wasm"
 digest = "sha256:dev"
@@ -53,6 +54,7 @@ arguments_schema = "schemas/reply.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/conversationId" }] } }
 
 [[components.send.provides]]
 capability = "telegram.send-message"
@@ -61,6 +63,7 @@ arguments_schema = "schemas/send-message.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/chat_id", prefix = "chat:" }, { pointer = "/message_thread_id", prefix = ":thread:", optional = true }] } }
 
 [[components.send.provides]]
 capability = "telegram.send-draft"
@@ -69,6 +72,7 @@ arguments_schema = "schemas/send-draft.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/chat_id", prefix = "chat:" }, { pointer = "/message_thread_id", prefix = ":thread:", optional = true }] } }
 
 [[components.send.provides]]
 capability = "telegram.send-media"
@@ -77,6 +81,7 @@ arguments_schema = "schemas/send-media.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/chat_id", prefix = "chat:" }, { pointer = "/message_thread_id", prefix = ":thread:", optional = true }] } }
 
 [[components.send.provides]]
 capability = "telegram.send-media-group"
@@ -85,6 +90,7 @@ arguments_schema = "schemas/send-media-group.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/chat_id", prefix = "chat:" }, { pointer = "/message_thread_id", prefix = ":thread:", optional = true }] } }
 
 [[components.send.provides]]
 capability = "telegram.send-location"
@@ -93,6 +99,7 @@ arguments_schema = "schemas/send-location.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/chat_id", prefix = "chat:" }, { pointer = "/message_thread_id", prefix = ":thread:", optional = true }] } }
 
 [[components.send.provides]]
 capability = "telegram.react"
@@ -101,6 +108,7 @@ arguments_schema = "schemas/react.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/chat_id", prefix = "chat:" }, { pointer = "/message_thread_id", prefix = ":thread:", optional = true }] } }
 
 [[components.send.provides]]
 capability = "telegram.edit-message"
@@ -109,6 +117,7 @@ arguments_schema = "schemas/edit-message.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/chat_id", prefix = "chat:" }, { pointer = "/message_thread_id", prefix = ":thread:", optional = true }] } }
 
 [[components.send.provides]]
 capability = "telegram.delete-message"
@@ -117,3 +126,4 @@ arguments_schema = "schemas/delete-message.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/chat_id", prefix = "chat:" }, { pointer = "/message_thread_id", prefix = ":thread:", optional = true }] } }

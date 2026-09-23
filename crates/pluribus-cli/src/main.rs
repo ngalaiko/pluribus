@@ -817,22 +817,25 @@ fn validate_instance_package(
     Ok(())
 }
 
-/// Supplies core capability and trust context to RLM instances.
+/// Supplies capability and trust context to declared catalog consumers.
 fn refresh_cognition_tools(
     config: &mut Config,
     packages: &package_source::ResolvedPackages,
 ) -> Result<(), Box<dyn Error>> {
-    let mut rlm_instances = Vec::new();
+    let mut catalog_consumers = Vec::new();
     let mut components = Vec::new();
     let mut tools = Vec::new();
     let grants = config.trusted_grants()?;
     for id in config.plugin_instances.keys() {
         let package = packages.get(id)?;
-        if package.manifest().id == "dev.pluribus.rlm" {
-            rlm_instances.push(id.clone());
-        }
         for (name, component) in package.components() {
+            if !config.plugin_instances[id].components.contains_key(name) {
+                continue;
+            }
             let manifest = component.manifest();
+            if manifest.catalog_injection.is_some() {
+                catalog_consumers.push((id.clone(), name.to_owned()));
+            }
             components.push(json!({
                 "instanceId":pluribus_plugin_package::component_id(id, name),
                 "plugin":package.manifest().id,
@@ -859,22 +862,58 @@ fn refresh_cognition_tools(
             }
         }
     }
-    for id in rlm_instances {
+    for (id, component_name) in catalog_consumers {
         let instance = config
             .plugin_instances
             .get_mut(&id)
-            .expect("resolved RLM instance");
-        instance.config["tools"] = json!(tools);
-        instance.config["components"] = json!(components);
+            .expect("resolved catalog consumer");
+        let injection = packages
+            .get(&id)?
+            .component(&component_name)
+            .unwrap()
+            .manifest()
+            .catalog_injection
+            .as_ref()
+            .unwrap();
+        if injection.tools_pointer == injection.components_pointer {
+            return Err(format!("catalog pointers collide for {id}/{component_name}").into());
+        }
+        set_config_pointer(&mut instance.config, &injection.tools_pointer, json!(tools))?;
+        set_config_pointer(
+            &mut instance.config,
+            &injection.components_pointer,
+            json!(components),
+        )?;
     }
+    Ok(())
+}
+
+fn set_config_pointer(
+    config: &mut Value,
+    pointer: &str,
+    value: Value,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(target) = config.pointer_mut(pointer) {
+        *target = value;
+        return Ok(());
+    }
+    let (parent, key) = pointer
+        .rsplit_once('/')
+        .ok_or("catalog pointer must name a field")?;
+    let key = key.replace("~1", "/").replace("~0", "~");
+    let parent = config
+        .pointer_mut(parent)
+        .ok_or("catalog pointer parent missing from config")?;
+    parent
+        .as_object_mut()
+        .ok_or("catalog pointer parent is not an object")?
+        .insert(key, value);
     Ok(())
 }
 
 /// Every way in and out the configuration installs.
 ///
-/// A component that emits observations is one provider's senses; the component
-/// answering for it is the one providing `<provider>.reply`. The provider is
-/// the plugin name: the last segment of its manifest ID.
+/// Connector authority comes from public manifest declarations.
 fn connectors(
     config: &Config,
     packages: &package_source::ResolvedPackages,
@@ -882,50 +921,58 @@ fn connectors(
     let mut connectors = Vec::new();
     for (id, instance) in &config.plugin_instances {
         let package = packages.get(id)?;
-        let manifest_id = &package.manifest().id;
-        let provider = manifest_id
-            .rsplit('.')
-            .next()
-            .unwrap_or(manifest_id)
-            .to_owned();
-        let reply = format!("{provider}.reply");
-        let mut ingress = None;
-        let mut reply_component = None;
-        let mut reply_capabilities = Vec::new();
         for (name, component) in package.components() {
             if !instance.components.contains_key(name) {
                 continue;
             }
             let selector = pluribus_plugin_package::component_id(id, name);
             let manifest = component.manifest();
-            if manifest
-                .emits
-                .iter()
-                .any(|event| event == "observation.received")
-            {
-                ingress = Some(selector.clone());
-            }
-            if manifest
-                .provides
-                .iter()
-                .any(|capability| capability.capability == reply)
-            {
-                let capabilities = manifest
-                    .provides
+            if let Some(declaration) = &manifest.connector {
+                if !manifest
+                    .emits
                     .iter()
-                    .map(|capability| pluribus_core::CapabilityName::new(&capability.capability))
-                    .collect();
-                reply_component = Some(selector);
-                reply_capabilities = capabilities;
+                    .any(|event| event == "observation.received")
+                {
+                    return Err(format!("connector {} does not emit observations", selector).into());
+                }
+                let (reply, reply_capabilities) =
+                    if let Some(reply_name) = &declaration.reply_component {
+                        if !instance.components.contains_key(reply_name) {
+                            return Err(format!(
+                                "connector {} has unconfigured reply component {}",
+                                selector, reply_name
+                            )
+                            .into());
+                        }
+                        let reply_manifest = package
+                            .component(reply_name)
+                            .ok_or_else(|| {
+                                format!(
+                                    "connector {} references missing reply component {}",
+                                    selector, reply_name
+                                )
+                            })?
+                            .manifest();
+                        (
+                            pluribus_plugin_package::component_id(id, reply_name),
+                            reply_manifest
+                                .provides
+                                .iter()
+                                .map(|capability| {
+                                    pluribus_core::CapabilityName::new(&capability.capability)
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        (String::new(), Vec::new())
+                    };
+                connectors.push(pluribus_cognition::Connector {
+                    provider: declaration.provider.clone(),
+                    ingress: selector,
+                    reply,
+                    reply_capabilities,
+                });
             }
-        }
-        if let Some(ingress) = ingress {
-            connectors.push(pluribus_cognition::Connector {
-                provider,
-                ingress,
-                reply: reply_component.unwrap_or_default(),
-                reply_capabilities,
-            });
         }
     }
     Ok(connectors)
@@ -1232,6 +1279,39 @@ fn system_now_ns() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn package_path(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/plugins")
+            .join(name)
+            .canonicalize()
+            .map(|source| {
+                let target = root.join(name);
+                copy_tree(&source, &target);
+                target
+            })
+            .unwrap()
+    }
+
+    fn set_package(config: &mut crate::registry::Config, instance: &str, path: &std::path::Path) {
+        config.plugin_instances.get_mut(instance).unwrap().package =
+            package_source::PackageSource::File(
+                url::Url::from_directory_path(path).unwrap().to_string(),
+            );
+    }
+
     #[tokio::test]
     async fn connectors_keep_same_plugin_instances_paired() {
         let mut config = crate::fixtures::config();
@@ -1274,6 +1354,119 @@ mod tests {
         }
         let resolved = super::connectors(&config, &packages).unwrap();
         assert!(!resolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renamed_manifest_ids_keep_explicit_connector_and_catalog_contracts() {
+        let temp = tempfile::tempdir().unwrap();
+        let telegram_path = package_path(temp.path(), "telegram");
+        let manifest_path = telegram_path.join("plugin.toml");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace("dev.pluribus.telegram", "org.example.chat");
+        std::fs::write(manifest_path, manifest).unwrap();
+        let mut config = crate::fixtures::config();
+        set_package(&mut config, "telegram-1", &telegram_path);
+        let (mut config, packages) = crate::package_source::prepare_registry(
+            &super::Paths::under(temp.path()),
+            &config,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        let connectors = super::connectors(&config, &packages).unwrap();
+        assert!(
+            connectors
+                .iter()
+                .any(|connector| connector.provider == "telegram"
+                    && connector.ingress == "telegram-1/receive"
+                    && connector.reply == "telegram-1/send")
+        );
+
+        let rlm_path = package_path(temp.path(), "rlm");
+        let manifest_path = rlm_path.join("plugin.toml");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace("dev.pluribus.rlm", "org.example.reasoner");
+        std::fs::write(manifest_path, manifest).unwrap();
+        set_package(&mut config, "rlm", &rlm_path);
+        let (mut config, packages) = crate::package_source::prepare_registry(
+            &super::Paths::under(temp.path()),
+            &config,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        super::refresh_cognition_tools(&mut config, &packages).unwrap();
+        assert!(config.plugin_instances["rlm"].config["tools"].is_array());
+        assert!(
+            config.plugin_instances["rlm"].config["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|component| component["plugin"] == "org.example.reasoner")
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_targets_and_catalog_pointers_are_validated() {
+        let temp = tempfile::tempdir().unwrap();
+        let telegram_path = package_path(temp.path(), "telegram");
+        let manifest_path = telegram_path.join("plugin.toml");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap().replace(
+            "reply_component = \"send\"",
+            "reply_component = \"missing\"",
+        );
+        std::fs::write(manifest_path, manifest).unwrap();
+        let mut config = crate::fixtures::config();
+        set_package(&mut config, "telegram-1", &telegram_path);
+        let (mut config, packages) = crate::package_source::prepare_registry(
+            &super::Paths::under(temp.path()),
+            &config,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(super::connectors(&config, &packages).is_err());
+
+        let mut disabled = crate::fixtures::config();
+        set_package(&mut disabled, "telegram-1", &telegram_path);
+        let (mut disabled, disabled_packages) = crate::package_source::prepare_registry(
+            &super::Paths::under(temp.path()),
+            &disabled,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        disabled
+            .plugin_instances
+            .get_mut("telegram-1")
+            .unwrap()
+            .components
+            .remove("send");
+        assert!(super::connectors(&disabled, &disabled_packages).is_err());
+
+        let rlm_path = package_path(temp.path(), "rlm");
+        let manifest_path = rlm_path.join("plugin.toml");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap().replace(
+            "components_pointer = \"/components\"",
+            "components_pointer = \"/tools\"",
+        );
+        std::fs::write(manifest_path, manifest).unwrap();
+        set_package(&mut config, "rlm", &rlm_path);
+        let (mut config, packages) = crate::package_source::prepare_registry(
+            &super::Paths::under(temp.path()),
+            &config,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(super::refresh_cognition_tools(&mut config, &packages).is_err());
     }
 
     #[test]

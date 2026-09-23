@@ -113,6 +113,12 @@
             "keyed",
             "non-idempotent"
           ]
+        },
+        "constraint_bindings": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/constraint_binding"
+          }
         }
       }
     },
@@ -253,14 +259,14 @@
           "items": {
             "enum": [
               "pluribus:plugin/events@3.0.0",
-                "pluribus:plugin/runtime@3.0.0",
+              "pluribus:plugin/runtime@3.0.0",
               "pluribus:plugin/state@3.0.0",
               "pluribus:plugin/blobs@3.0.0",
               "wasi:http/types@0.3.0",
-                "wasi:http/client@0.3.0",
-                "wasi:clocks/system-clock@0.3.0",
-                "wasi:clocks/monotonic-clock@0.3.0",
-                "wasi:random/random@0.3.0",
+              "wasi:http/client@0.3.0",
+              "wasi:clocks/system-clock@0.3.0",
+              "wasi:clocks/monotonic-clock@0.3.0",
+              "wasi:random/random@0.3.0",
               "pluribus:plugin/socket@3.0.0",
               "pluribus:plugin/credentials@3.0.0"
             ]
@@ -322,6 +328,12 @@
           "items": {
             "$ref": "#/$defs/component_name"
           }
+        },
+        "catalog_injection": {
+          "$ref": "#/$defs/catalog_injection"
+        },
+        "connector": {
+          "$ref": "#/$defs/connector"
         }
       }
     },
@@ -329,6 +341,91 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]*$",
       "maxLength": 80
+    },
+    "catalog_injection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tools_pointer",
+        "components_pointer"
+      ],
+      "properties": {
+        "tools_pointer": {
+          "type": "string",
+          "pattern": "^(/[^/~]*(~[01][^/~]*)*)+$",
+          "maxLength": 255
+        },
+        "components_pointer": {
+          "type": "string",
+          "pattern": "^(/[^/~]*(~[01][^/~]*)*)+$",
+          "maxLength": 255
+        }
+      }
+    },
+    "connector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/dotted_name"
+        },
+        "reply_component": {
+          "anyOf": [
+            {
+              "const": ""
+            },
+            {
+              "$ref": "#/$defs/component_name"
+            }
+          ]
+        }
+      }
+    },
+    "constraint_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parts"
+      ],
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "parts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/constraint_part"
+          }
+        }
+      }
+    },
+    "constraint_part": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pointer"
+      ],
+      "properties": {
+        "pointer": {
+          "type": "string",
+          "pattern": "^(/[^/~]*(~[01][^/~]*)*)+$",
+          "maxLength": 255
+        },
+        "prefix": {
+          "type": "string",
+          "maxLength": 255
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        }
+      }
     }
   },
   "oneOf": [

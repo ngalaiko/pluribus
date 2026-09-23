@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +52,22 @@ pub struct ComponentManifest {
     pub requires: Vec<String>,
     #[serde(default)]
     pub requested_capabilities: Vec<RequestedCapability>,
+    pub catalog_injection: Option<CatalogInjection>,
+    pub connector: Option<ConnectorDeclaration>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogInjection {
+    pub tools_pointer: String,
+    pub components_pointer: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorDeclaration {
+    pub provider: String,
+    pub reply_component: Option<String>,
 }
 
 impl ComponentManifest {
@@ -70,6 +87,26 @@ pub struct ProvidedCapability {
     pub result_schema: String,
     pub constraints_schema: Option<String>,
     pub idempotency: Idempotency,
+    #[serde(default)]
+    pub constraint_bindings: BTreeMap<String, ConstraintBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConstraintBinding {
+    pub parts: Vec<ConstraintPart>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConstraintPart {
+    pub pointer: String,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub optional: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]

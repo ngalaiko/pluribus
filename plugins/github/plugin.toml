@@ -6,6 +6,7 @@ config_schema = "config.schema.json"
 license = "MIT OR Apache-2.0"
 
 [components.receive]
+connector = { provider = "github" }
 world = "pluribus:plugin/plugin@3.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"

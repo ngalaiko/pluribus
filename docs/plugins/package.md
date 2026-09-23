@@ -137,10 +137,58 @@ One package ABI applies to every component; component overrides are rejected. Un
 | `config_schema` | Schema for the full instance configuration. |
 | `requires` | Names of required sibling components. |
 | `provides`, `model_provider` | Capability or model routing declarations. |
+| `catalog_injection` | Opts a component into host cognition catalog injection at the declared config pointers. |
+| `connector` | Declares an observation provider and the sibling component that replies for it. |
 | `subscribes`, `emits` | Delivered and permitted proposed event types. |
 | `rebuilds` | Mutation events used to restore this component's projection. |
 | `pinned_session` | Retain interpreter memory across activity deliveries. |
 | `requested_capabilities` | Requested authority; never an automatic grant. |
+
+An observation component declares its connector independently of the package ID:
+
+```toml
+[components.receive.connector]
+provider = "chat"
+reply_component = "send"
+```
+
+`provider` must match the observation payload. `reply_component` names a component
+in the same package; `""` names the unnamed single component. Omit it for an
+input-only connector. The reply component's capabilities receive origin-scoped
+grants; their constraint bindings must confine effects to that origin.
+
+A component can opt into catalog injection:
+
+```toml
+[components.cognition.catalog_injection]
+tools_pointer = "/tools"
+components_pointer = "/components"
+```
+
+These distinct JSON Pointers name fields in package configuration. Parent objects
+must exist. The host supplies installed capability descriptions and component
+metadata before configuration validation. Package identity does not select this
+behavior.
+
+Capability `constraint_bindings` project actual request arguments into selectors
+for operator allowlists. Declare them inside a `provides` entry:
+
+```toml
+constraint_bindings = { scopes = { parts = [{ pointer = "/scope" }], required = true } }
+```
+
+Each part concatenates its optional literal `prefix` and a string or number at
+its JSON Pointer. An `optional = true` part is omitted only when absent; null or
+non-scalar values fail. For example, a destination can combine `/chat_id` with
+prefix `chat:` and optional `/message_thread_id` with prefix `:thread:`.
+
+The default host policy requires every grant constraint key to be a nonempty
+allowlist containing its projected selector. Unknown keys and missing required
+bindings deny the request. `required = true` also denies grants that omit that
+constraint key, including `{}`. An empty grant permits an unconstrained request
+only when no binding is required. Bindings are selected from the routed provider's
+manifest, never from caller-supplied metadata, and cannot add allowed values.
+Plugins must act on the destination fields their bindings declare.
 
 RLM declares `components.cognition.requires = ["repl"]` and embeds the REPL binary.
 Installation validates every component and configuration before activating any

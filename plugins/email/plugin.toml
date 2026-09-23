@@ -15,6 +15,7 @@ flow_schema = "pluribus:credential/static-plugin@1"
 flow = "flows/account.json"
 
 [component]
+connector = { provider = "email", reply_component = "" }
 world = "pluribus:plugin/plugin@3.0.0"
 component = "plugin.wasm"
 digest = "sha256:dev"
@@ -42,6 +43,7 @@ arguments_schema = "schemas/reply.arguments.json"
 result_schema = "schemas/result.json"
 constraints_schema = "schemas/constraints.json"
 idempotency = "non-idempotent"
+constraint_bindings = { conversation_ids = { parts = [{ pointer = "/conversationId" }] } }
 
 [[component.provides]]
 capability = "email.send-message"

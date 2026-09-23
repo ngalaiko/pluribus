@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 repl = {}
 
 [components.cognition]
+catalog_injection = { tools_pointer = "/tools", components_pointer = "/components" }
 requires = ["repl"]
 world = "pluribus:plugin/plugin@3.0.0"
 component = "components/cognition.wasm"
