@@ -2,7 +2,7 @@ use pluribus_plugin_package::PluginPackage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt::Write as _,
     fs::{self, File},
@@ -14,6 +14,24 @@ use tracing::{error, info};
 use url::Url;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+#[derive(Default)]
+pub struct ResolvedPackages(BTreeMap<String, PluginPackage>);
+
+impl ResolvedPackages {
+    fn insert(&mut self, instance: String, package: PluginPackage) {
+        self.0.insert(instance, package);
+    }
+    pub fn get(&self, instance: &str) -> Result<&PluginPackage> {
+        self.0
+            .get(instance)
+            .ok_or_else(|| format!("package for instance {instance} was not resolved").into())
+    }
+
+    fn contains(&self, instance: &str) -> bool {
+        self.0.contains_key(instance)
+    }
+}
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 512 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
@@ -488,42 +506,50 @@ fn verify_cached(root: &Path, sha256: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn prepare(
     data: &crate::Paths,
     config: &crate::Config,
     offline: bool,
     cognition: bool,
 ) -> Result<crate::Config> {
+    Ok(prepare_registry(data, config, offline, cognition).await?.0)
+}
+
+pub async fn prepare_registry(
+    data: &crate::Paths,
+    config: &crate::Config,
+    offline: bool,
+    cognition: bool,
+) -> Result<(crate::Config, ResolvedPackages)> {
     let mut resolved = config.clone();
-    let mut prepared = BTreeSet::new();
-    resolve_instances(data, &mut resolved, &mut prepared, offline).await?;
+    let mut packages = ResolvedPackages::default();
+    resolve_instances(data, &mut resolved, &mut packages, offline).await?;
     if cognition {
-        crate::refresh_cognition_tools(data, &mut resolved).await?;
-        resolve_instances(data, &mut resolved, &mut prepared, offline).await?;
+        crate::refresh_cognition_tools(&mut resolved, &packages)?;
+        resolve_instances(data, &mut resolved, &mut packages, offline).await?;
     }
     resolved.validate_resolved()?;
-    for id in resolved.plugin_instances.keys() {
-        let target = crate::credential_target(data, &resolved, id).await?;
-        blocking(move || {
-            let package = PluginPackage::load(&target.package)?;
-            crate::validate_instance_package(&package, &target)
-        })
-        .await?;
+    for (id, instance) in &resolved.plugin_instances {
+        let package = packages.get(id)?;
+        let target =
+            crate::credential_target_from_instance(id, package.root().to_path_buf(), instance);
+        crate::validate_instance_package(package, &target)?;
     }
-    Ok(resolved)
+    Ok((resolved, packages))
 }
 
 async fn resolve_instances(
     data: &crate::Paths,
     config: &mut crate::Config,
-    prepared: &mut BTreeSet<String>,
+    packages: &mut ResolvedPackages,
     offline: bool,
 ) -> Result<()> {
     use futures_util::{StreamExt as _, TryStreamExt as _};
     let sources: Vec<_> = config
         .plugin_instances
         .iter()
-        .filter(|(id, _)| !prepared.contains(*id))
+        .filter(|(id, _)| !packages.contains(id))
         .map(|(id, instance)| (id.clone(), instance.package.clone()))
         .collect();
     let resolved: Vec<_> = futures_util::stream::iter(sources)
@@ -545,7 +571,7 @@ async fn resolve_instances(
             .ok_or("missing plugin instance")?;
         instance.package = path.into();
         crate::installation::resolve_instance(&package, &id, &data.runtime, instance)?;
-        prepared.insert(id);
+        packages.insert(id.clone(), package);
     }
     Ok(())
 }

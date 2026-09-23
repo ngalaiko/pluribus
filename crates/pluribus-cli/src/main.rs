@@ -483,12 +483,20 @@ async fn credential_target(
     let path = resolve_plugin(data, &instance.package).await?;
     let package = PluginPackage::load(&path)?;
     installation::resolve_instance(&package, id, &data.runtime, &mut instance)?;
-    Ok(CredentialTarget {
+    Ok(credential_target_from_instance(id, path, &instance))
+}
+
+fn credential_target_from_instance(
+    id: &str,
+    path: PathBuf,
+    instance: &crate::registry::PluginInstance,
+) -> CredentialTarget {
+    CredentialTarget {
         package: path,
         instance_id: id.into(),
         config: instance.config.clone(),
         components: instance.components.clone(),
-    })
+    }
 }
 
 /// Credential enrollment a plugin declares.
@@ -810,13 +818,16 @@ fn validate_instance_package(
 }
 
 /// Supplies core capability and trust context to RLM instances.
-async fn refresh_cognition_tools(data: &Paths, config: &mut Config) -> Result<(), Box<dyn Error>> {
+fn refresh_cognition_tools(
+    config: &mut Config,
+    packages: &package_source::ResolvedPackages,
+) -> Result<(), Box<dyn Error>> {
     let mut rlm_instances = Vec::new();
     let mut components = Vec::new();
     let mut tools = Vec::new();
     let grants = config.trusted_grants()?;
-    for (id, instance) in &config.plugin_instances {
-        let package = PluginPackage::load(resolve_plugin(data, &instance.package).await?)?;
+    for id in config.plugin_instances.keys() {
+        let package = packages.get(id)?;
         if package.manifest().id == "dev.pluribus.rlm" {
             rlm_instances.push(id.clone());
         }
@@ -864,13 +875,13 @@ async fn refresh_cognition_tools(data: &Paths, config: &mut Config) -> Result<()
 /// A component that emits observations is one provider's senses; the component
 /// answering for it is the one providing `<provider>.reply`. The provider is
 /// the plugin name: the last segment of its manifest ID.
-async fn connectors(
-    data: &Paths,
+fn connectors(
     config: &Config,
+    packages: &package_source::ResolvedPackages,
 ) -> Result<Vec<pluribus_cognition::Connector>, Box<dyn Error>> {
     let mut connectors = Vec::new();
     for (id, instance) in &config.plugin_instances {
-        let package = PluginPackage::load(resolve_plugin(data, &instance.package).await?)?;
+        let package = packages.get(id)?;
         let manifest_id = &package.manifest().id;
         let provider = manifest_id
             .rsplit('.')
@@ -957,7 +968,8 @@ const IDLE_MAX: Duration = Duration::from_secs(5);
 
 #[allow(clippy::too_many_lines)]
 async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
-    let config = package_source::prepare(data, &load_config(data)?, offline, true).await?;
+    let (config, packages) =
+        package_source::prepare_registry(data, &load_config(data)?, offline, true).await?;
     info!(
         state = %data.state.display(),
         config_dir = %data.config.display(),
@@ -972,10 +984,6 @@ async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
     let agent_principal = PrincipalRef::new(PrincipalKind::Agent, &config.agent_id);
     let stream_id = StreamId::new(config.agent_id.clone());
 
-    for id in config.plugin_instances.keys() {
-        let target = credential_target(data, &config, id).await?;
-        validate_instance_package(&PluginPackage::load(&target.package)?, &target)?;
-    }
     let http: Arc<dyn pluribus_core::HttpStreamService> = Arc::new(
         pluribus_host_http::PolicyHttpService::new(Arc::clone(&blobs)),
     );
@@ -986,7 +994,7 @@ async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
         Arc::clone(&blobs),
         Arc::clone(&database) as Arc<dyn DeliveryStore>,
     )?;
-    let connectors = connectors(data, &config).await?;
+    let connectors = connectors(&config, &packages)?;
     info!(
         connectors = %connectors
             .iter()
@@ -1021,7 +1029,7 @@ async fn run_agent(data: &Paths, offline: bool) -> Result<(), Box<dyn Error>> {
     let model_component = selected_model_component(&config)?;
     let mut cognition = false;
     for (id, instance) in &config.plugin_instances {
-        let package = PluginPackage::load(resolve_plugin(data, &instance.package).await?)?;
+        let package = packages.get(id)?;
         cognition |= package.components().iter().any(|(name, component)| {
             component.manifest().subscribes_to_stream() && instance.components.contains_key(name)
         });
@@ -1231,16 +1239,41 @@ mod tests {
         config
             .plugin_instances
             .insert("telegram-2".into(), telegram);
+        for instance in config.plugin_instances.values_mut() {
+            instance.aliases.clear();
+        }
         let temp = tempfile::tempdir().unwrap();
-        let resolved = super::connectors(&super::Paths::under(temp.path()), &config)
-            .await
-            .unwrap();
+        let (config, packages) = crate::package_source::prepare_registry(
+            &super::Paths::under(temp.path()),
+            &config,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        let resolved = super::connectors(&config, &packages).unwrap();
         assert_eq!(resolved.len(), 2);
         for id in ["telegram-1", "telegram-2"] {
             assert!(resolved.iter().any(|c| {
                 c.ingress == format!("{id}/receive") && c.reply == format!("{id}/send")
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn connector_discovery_reuses_loaded_packages() {
+        let mut config = crate::fixtures::config();
+        let temp = tempfile::tempdir().unwrap();
+        let data = super::Paths::under(temp.path());
+        let (_, packages) = crate::package_source::prepare_registry(&data, &config, true, false)
+            .await
+            .unwrap();
+        for instance in config.plugin_instances.values_mut() {
+            instance.package =
+                package_source::PackageSource::File("file:///package-removed-after-load".into());
+        }
+        let resolved = super::connectors(&config, &packages).unwrap();
+        assert!(!resolved.is_empty());
     }
 
     #[test]
@@ -1452,9 +1485,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_configuration_gains_no_instances() {
         let mut config = Config::default();
-        refresh_cognition_tools(&Paths::under(Path::new("/tmp")), &mut config)
-            .await
-            .unwrap();
+        refresh_cognition_tools(&mut config, &package_source::ResolvedPackages::default()).unwrap();
         assert!(config.plugin_instances.is_empty());
     }
 
@@ -1472,9 +1503,15 @@ mod tests {
             "telegram/send".into(),
             BTreeMap::from([("telegram.react".into(), json!({"conversationId":"chat:1"}))]),
         );
-        refresh_cognition_tools(&Paths::under(Path::new("/tmp")), &mut config)
-            .await
-            .unwrap();
+        let (resolved, _) = crate::package_source::prepare_registry(
+            &Paths::under(Path::new("/tmp")),
+            &config,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        config = resolved;
         assert!(
             serde_json::to_value(&config.plugin_instances["rlm"]).unwrap()["config"]
                 .get("tools")
