@@ -2394,7 +2394,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "pluribus-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "clap",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-cognition"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "sha2 0.11.0",
@@ -2455,7 +2455,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-host-http"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-host-stream"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "nix",
@@ -2484,14 +2484,14 @@ dependencies = [
 
 [[package]]
 name = "pluribus-log"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "pluribus-model"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2499,14 +2499,14 @@ dependencies = [
 
 [[package]]
 name = "pluribus-paths"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "directories",
 ]
 
 [[package]]
 name = "pluribus-plugin-bindings"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "wasmtime",
  "wasmtime-wasi-http",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "clap",
  "futures-util",
@@ -2532,14 +2532,14 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-cli-protocol"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "pluribus-plugin-echo"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "pluribus-plugin-sdk",
  "serde_json",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-email"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64",
  "futures-util",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-github"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64",
  "futures-util",
@@ -2581,7 +2581,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-http"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-memory"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "pluribus-plugin-sdk",
  "serde",
@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-openai-codex"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "pluribus-model",
  "pluribus-plugin-sdk",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-openrouter"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64",
  "pluribus-model",
@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-package"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "jsonschema",
  "serde",
@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-rlm-cognition"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64",
  "pluribus-plugin-sdk",
@@ -2662,7 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-rlm-repl"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "boa_engine",
  "getrandom 0.3.4",
@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-scheduler"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-sdk"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "futures-util",
  "serde",
@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-shell"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "clap",
  "futures-util",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-telegram-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "pluribus-plugin-sdk",
  "serde",
@@ -2722,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-telegram-receive"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "futures-util",
  "pluribus-plugin-sdk",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-plugin-telegram-send"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "futures-util",
  "jsonschema",
@@ -2746,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-runtime-wasm"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-store-fs"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "pluribus-core",
@@ -2788,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "pluribus-store-sqlite"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-sqlite",
  "async-trait",
