@@ -20,6 +20,13 @@ under the instance's credential handle. Configuration holds the handle; the
 secret is never written to it. One credential authenticates both endpoints:
 IMAP `LOGIN` and SMTP `AUTH` present the same username and password.
 
+Loading the account publishes `username` and `password` credential exports under
+`dev.pluribus.email`. They use the instance's account handle (`email:account` by
+default). Shell bindings can grant access through `pluribus-shell-cli secret`.
+Exports remain valid until re-enrollment replaces the credential record; the
+connector republishes them when it next loads the account. Restart after rotation
+to refresh an idle connection and its exports.
+
 iCloud requires an app-specific password, generated at
 [account.apple.com](https://account.apple.com) under Sign-In and Security. The
 account password will not authenticate an IMAP session.

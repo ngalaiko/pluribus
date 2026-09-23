@@ -331,6 +331,73 @@ fn reply_arguments() -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_exports_follow_credential_rotation() {
+    let harness = Harness::new().await;
+    let _peer = smtp_peer(&harness.endpoint("smtp"), accepting()).await;
+    let mut instance = harness.instance(&["smtp"]).await;
+    instance.init().await.unwrap();
+    let access = pluribus_runtime_wasm::CredentialAccess {
+        store: harness.store.clone(),
+        provider: "dev.pluribus.shell".into(),
+        handles: Default::default(),
+        exports: [
+            ("EMAIL_USERNAME", "username"),
+            ("EMAIL_PASSWORD", "password"),
+        ]
+        .into_iter()
+        .map(|(binding, export)| {
+            (
+                binding.into(),
+                pluribus_runtime_wasm::CredentialExport {
+                    credential: "email:account".into(),
+                    provider: "dev.pluribus.email".into(),
+                    export: export.into(),
+                },
+            )
+        })
+        .collect(),
+    };
+    for password in ["app-specific", "rotated-password"] {
+        if password == "rotated-password" {
+            let handle = SecretHandle::new("email:account");
+            let previous = harness
+                .store
+                .read_plugin_credential(&handle, "dev.pluribus.email")
+                .await
+                .unwrap();
+            assert!(
+                harness
+                    .store
+                    .replace_plugin_credential(
+                        &handle,
+                        "dev.pluribus.email",
+                        previous,
+                        serde_json::to_vec(
+                            &json!({"username": "ada@example.com", "password": password})
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(access.resolve_export("EMAIL_PASSWORD").await.is_err());
+        }
+        let request = harness.request("email.reply", reply_arguments()).await;
+        let outcome = instance.handle(&[request]).await.unwrap();
+        assert_eq!(terminal(&outcome).0, "capability.completed");
+        assert_eq!(
+            access.resolve_export("EMAIL_USERNAME").await.unwrap(),
+            "ada@example.com"
+        );
+        assert_eq!(
+            access.resolve_export("EMAIL_PASSWORD").await.unwrap(),
+            password
+        );
+        assert!(access.resolve_export("UNGRANTED").await.is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reply_is_submitted_as_a_threaded_message() {
     let harness = Harness::new().await;
     let peer = smtp_peer(&harness.endpoint("smtp"), accepting()).await;

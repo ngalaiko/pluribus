@@ -298,8 +298,28 @@ fn load_credential(config: &Config) -> Result<Account, Error> {
             "no credential is enrolled; run pluribus plugins auth",
         )
     })?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| failure(ErrorCode::InvalidArgument, "credential record is malformed"))
+    let account: Account = serde_json::from_slice(&bytes)
+        .map_err(|_| failure(ErrorCode::InvalidArgument, "credential record is malformed"))?;
+    let mut record: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| failure(ErrorCode::InvalidArgument, "credential record is malformed"))?;
+    let exports = serde_json::json!({
+        "username": {"value": account.username, "expires_at_ms": i64::MAX},
+        "password": {"value": account.password, "expires_at_ms": i64::MAX},
+    });
+    if record["exports"] != exports {
+        record["exports"] = exports;
+        if !credentials::compare_and_swap(
+            &config.credentials.account,
+            Some(&bytes),
+            &serde_json::to_vec(&record).unwrap(),
+        )? {
+            return Err(failure(
+                ErrorCode::Unavailable,
+                "credential changed during operation",
+            ));
+        }
+    }
+    Ok(account)
 }
 
 impl Email {
