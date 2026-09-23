@@ -25,6 +25,11 @@ wasmtime.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 pluribus-store-sqlite = { path = "../pluribus-store-sqlite" }
+pluribus-host-stream = { path = "../pluribus-host-stream" }
+rustix.workspace = true
+reqwest.workspace = true
+ring = "0.17"
+tempfile.workspace = true
 wit-component.workspace = true
 wit-parser.workspace = true
 jsonschema.workspace = true

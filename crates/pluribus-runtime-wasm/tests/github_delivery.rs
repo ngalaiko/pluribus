@@ -1,8 +1,4 @@
 use pluribus_core::*;
-#[path = "../../http/listener/src/listener.rs"]
-mod listener;
-#[path = "../../http/listener/src/native.rs"]
-mod native;
 use pluribus_plugin_package::PluginPackage;
 use pluribus_runtime_wasm::{
     Delivery, PluginServices, Principal, PrincipalKind as Kind, Runtime, RuntimeLimits,
@@ -11,11 +7,12 @@ use pluribus_store_sqlite::SqliteEventStore;
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 struct GithubHttp {
@@ -107,7 +104,13 @@ impl EventMetadataSource for Metadata {
         EventId::new(format!("event-{}", self.0.fetch_add(1, Ordering::Relaxed)))
     }
     fn now_ms(&self) -> i64 {
-        native::now() * 1000
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
     }
 }
 fn port() -> u16 {
@@ -159,6 +162,71 @@ fn services(dir: &Path, socket: PathBuf, _instance: &str) -> PluginServices {
     }
 }
 
+struct HttpListener(Child);
+
+impl HttpListener {
+    async fn start(root: &Path, port: u16, uid: u32) -> Self {
+        let socket = root.join("http.sock");
+        let binary = std::env::var_os("PLURIBUS_HTTP_LISTENER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("pluribus-http-listener")
+            });
+        let child = Command::new(&binary)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--runtime-uid")
+            .arg(uid.to_string())
+            .args([
+                "--route",
+                "github:POST:/events:github/receive",
+                "--max-body-bytes",
+                "1048576",
+                "--max-queue-bytes",
+                "1048576",
+                "--response-timeout-seconds",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("start {}: {error}", binary.display()));
+        let mut listener = Self(child);
+        for _ in 0..100 {
+            if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                return listener;
+            }
+            assert!(
+                listener.0.try_wait().unwrap().is_none(),
+                "HTTP listener exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("HTTP listener did not open {}", socket.display());
+    }
+
+    async fn restart(&mut self, root: &Path, port: u16, uid: u32) {
+        self.0.kill().unwrap();
+        self.0.wait().unwrap();
+        *self = Self::start(root, port, uid).await;
+    }
+}
+
+impl Drop for HttpListener {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
     let dir = tempfile::tempdir().unwrap();
@@ -184,28 +252,7 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
         .await
         .unwrap();
     let hp = port();
-    let listener_config = || listener::Config {
-        listen: format!("127.0.0.1:{hp}").parse().unwrap(),
-        socket: root.join("http.sock"),
-        runtime_uid: uid,
-        routes: vec![listener::Route {
-            path: "/events".into(),
-            id: "github".into(),
-            consumer: "github/receive".into(),
-            methods: vec!["POST".into()],
-        }],
-        max_body_bytes: 1024 * 1024,
-        max_queue_bytes: 1024 * 1024,
-        response_timeout_seconds: 30,
-    };
-    let mut http_task = tokio::spawn(listener::serve(listener_config()));
-    for _ in 0..100 {
-        if root.join("http.sock").exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(!http_task.is_finished());
+    let mut http_listener = HttpListener::start(root, hp, uid).await;
     let blobs = Arc::new(InMemoryBlobStore::default());
     let runtime = Runtime::new(
         RuntimeLimits::default(),
@@ -275,19 +322,7 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
     .enumerate()
     {
         if index == 1 {
-            http_task.abort();
-            let _ = http_task.await;
-            http_task = tokio::spawn(listener::serve(listener_config()));
-            for _ in 0..100 {
-                if tokio::net::UnixStream::connect(root.join("http.sock"))
-                    .await
-                    .is_ok()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert!(!http_task.is_finished());
+            http_listener.restart(root, hp, uid).await;
         }
         let repository_id = if id == "delivery-repository-unknown" {
             43
@@ -384,7 +419,6 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
         serde_json::from_slice::<Value>(bytes).unwrap()["trusted"],
         false
     );
-    http_task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -446,7 +480,7 @@ async fn refresh_backfills_webhook_secret_export_for_shell_access() {
             "dev.pluribus.github",
             None,
             serde_json::to_vec(&json!({
-                "app":{"id":7,"pem":include_str!("../tests/fixtures/test-app.pem"),"webhook_secret":"secret-fixture"},
+                "app":{"id":7,"pem":include_str!("../../../plugins/github/tests/fixtures/test-app.pem"),"webhook_secret":"secret-fixture"},
                 "installation_id":9,
                 "exports":{"installation-token":{"value":"ghs_fixture","expires_at_ms":9999999999999_i64}}
             }))
