@@ -908,6 +908,10 @@ async fn http_request_reads_are_confined_to_consumer_and_listener() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep scenario setup and assertions together."
+)]
 async fn historical_reads_reveal_only_returned_event_blobs() {
     async fn put(host: &HostState, bytes: &[u8]) -> BlobRef {
         let upload = host
@@ -1231,10 +1235,13 @@ async fn a_delivered_event_reveals_the_blobs_its_payload_names() {
 async fn credential_exports_are_scoped_without_raw_record_access() {
     use pluribus_core::{InMemoryCredentialStore, PluginCredentialStore};
     let store = Arc::new(InMemoryCredentialStore::default());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
     let doc = serde_json::json!({
         "private-key": "never-export",
         "exports": {
@@ -1256,7 +1263,7 @@ async fn credential_exports_are_scoped_without_raw_record_access() {
     host.credentials = Some(CredentialAccess {
         store,
         provider: "consumer".into(),
-        handles: Default::default(),
+        handles: std::collections::HashSet::default(),
         exports: [
             ("TOKEN", "provider", "test", "token"),
             ("EXPIRED", "provider", "test", "expired"),

@@ -468,48 +468,56 @@ async fn enroll(
                 deduplication_key: None,
             })
             .await?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut after = request.sequence;
-        loop {
-            let replies = database
-                .query(
-                    &StreamId::new(&config.agent_id),
-                    &pluribus_core::EventQuery {
-                        after_sequence: Some(after),
-                        event_types: vec!["credential.enrollment.started".into()],
-                        correlation_id: None,
-                        activity_id: None,
-                        recorded_from_ms: None,
-                        recorded_to_ms: None,
-                        ..pluribus_core::EventQuery::default()
-                    },
-                    100,
-                )
-                .await?;
-            for reply in replies {
-                after = reply.sequence;
-                if reply.request.actor != *component
-                    || reply.request.causation_id.as_ref() != Some(&request.event_id)
-                {
-                    continue;
-                }
-                let pluribus_core::EventPayload::CanonicalJson(bytes) = reply.request.payload
-                else {
-                    continue;
-                };
-                let value: Value = serde_json::from_slice(&bytes)?;
-                for line in enrollment_display_lines(&value)? {
-                    println!("{line}");
-                }
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err("enrollment timed out; ensure pluribus run is active".into());
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        return await_enrollment(database.as_ref(), &config.agent_id, component, &request).await;
     }
     Err(format!("unsupported credential flow: {}", descriptor.flow_schema).into())
+}
+
+async fn await_enrollment(
+    database: &SqliteEventStore<SystemMetadata>,
+    agent_id: &str,
+    component: &PrincipalRef,
+    request: &pluribus_core::CommittedEvent,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut after = request.sequence;
+    loop {
+        let replies = database
+            .query(
+                &StreamId::new(agent_id),
+                &pluribus_core::EventQuery {
+                    after_sequence: Some(after),
+                    event_types: vec!["credential.enrollment.started".into()],
+                    correlation_id: None,
+                    activity_id: None,
+                    recorded_from_ms: None,
+                    recorded_to_ms: None,
+                    ..pluribus_core::EventQuery::default()
+                },
+                100,
+            )
+            .await?;
+        for reply in replies {
+            after = reply.sequence;
+            if reply.request.actor != *component
+                || reply.request.causation_id.as_ref() != Some(&request.event_id)
+            {
+                continue;
+            }
+            let pluribus_core::EventPayload::CanonicalJson(bytes) = reply.request.payload else {
+                continue;
+            };
+            let value: Value = serde_json::from_slice(&bytes)?;
+            for line in enrollment_display_lines(&value)? {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("enrollment timed out; ensure pluribus run is active".into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 fn enrollment_display_lines(value: &Value) -> Result<Vec<String>, Box<dyn Error>> {
@@ -998,39 +1006,38 @@ fn connectors(
                     .iter()
                     .any(|event| event == "observation.received")
                 {
-                    return Err(format!("connector {} does not emit observations", selector).into());
+                    return Err(format!("connector {selector} does not emit observations").into());
                 }
-                let (reply, reply_capabilities) =
-                    if let Some(reply_name) = &declaration.reply_component {
-                        if !instance.components.contains_key(reply_name) {
-                            return Err(format!(
-                                "connector {} has unconfigured reply component {}",
-                                selector, reply_name
-                            )
-                            .into());
-                        }
-                        let reply_manifest = package
+                let (reply, reply_capabilities) = if let Some(reply_name) =
+                    &declaration.reply_component
+                {
+                    if !instance.components.contains_key(reply_name) {
+                        return Err(format!(
+                            "connector {selector} has unconfigured reply component {reply_name}"
+                        )
+                        .into());
+                    }
+                    let reply_manifest = package
                             .component(reply_name)
                             .ok_or_else(|| {
                                 format!(
-                                    "connector {} references missing reply component {}",
-                                    selector, reply_name
+                                    "connector {selector} references missing reply component {reply_name}"
                                 )
                             })?
                             .manifest();
-                        (
-                            pluribus_plugin_package::component_id(id, reply_name),
-                            reply_manifest
-                                .provides
-                                .iter()
-                                .map(|capability| {
-                                    pluribus_core::CapabilityName::new(&capability.capability)
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        (String::new(), Vec::new())
-                    };
+                    (
+                        pluribus_plugin_package::component_id(id, reply_name),
+                        reply_manifest
+                            .provides
+                            .iter()
+                            .map(|capability| {
+                                pluribus_core::CapabilityName::new(&capability.capability)
+                            })
+                            .collect(),
+                    )
+                } else {
+                    (String::new(), Vec::new())
+                };
                 connectors.push(pluribus_cognition::Connector {
                     provider: declaration.provider.clone(),
                     inherits_origin: declaration.inherits_origin,
@@ -1212,7 +1219,7 @@ async fn run_agent(data: &Paths) -> Result<(), Box<dyn Error>> {
         }
         agent
             .install_package(
-                &package,
+                package,
                 &instance.config,
                 Delivery {
                     instance_id: id.clone(),

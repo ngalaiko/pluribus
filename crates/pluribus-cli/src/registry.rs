@@ -100,7 +100,7 @@ fn default_memory_bytes() -> usize {
 }
 
 fn default_call_timeout_ms() -> u64 {
-    RuntimeLimits::default().call_timeout.as_millis() as u64
+    u64::try_from(RuntimeLimits::default().call_timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl InstanceLimits {
@@ -581,7 +581,7 @@ mod tests {
             // An address cannot be verified against a certificate name.
             json!({"tls":{"hostname":"17.253.144.10","port":993}}),
             json!({"tls":{"hostname":"imap.mail.me.com","port":993},"max_connections":0}),
-            json!({"tls":{"hostname":"imap.mail.me.com","port":993},"max_timeout_ms":300001}),
+            json!({"tls":{"hostname":"imap.mail.me.com","port":993},"max_timeout_ms":300_001}),
         ] {
             assert!(
                 stream(endpoint.clone()).validate().is_err(),

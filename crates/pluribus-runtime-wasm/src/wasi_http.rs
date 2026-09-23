@@ -1,5 +1,9 @@
 //! WASI HTTP over the policy-controlled host transport.
-use super::*;
+use super::{
+    Arc, BlobStore, Duration, HostState, HttpError, HttpGrant, HttpHeader, HttpRequest,
+    HttpStreamProtocol, HttpStreamService, Instant, Linker, Ordering, Resource, VecDeque, bindings,
+    blobs, credentials, events, execution, runner, socket, state, types,
+};
 use ::http::Response;
 use bindings::wasi::http::client;
 use bytes::Bytes;
@@ -47,12 +51,12 @@ impl WasiHttpView for HostState {
 }
 
 pub(super) fn add_to_linker(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
-    macro_rules! link { ($($m:ident),*) => { $( $m::add_to_linker::<_, HostData>(linker, |h| h)?; )* }; }
-    link!(blobs, credentials, events, execution, socket, state, types);
     use bindings::wasi::{
         clocks::{monotonic_clock, system_clock, types as clock_types},
         random::random,
     };
+    macro_rules! link { ($($m:ident),*) => { $( $m::add_to_linker::<_, HostData>(linker, |h| h)?; )* }; }
+    link!(blobs, credentials, events, execution, socket, state, types);
     link!(monotonic_clock, system_clock, clock_types, random, client);
     wasmtime_wasi_http::p3::bindings::http::types::add_to_linker::<_, wasmtime_wasi_http::WasiHttp>(
         linker,
@@ -61,7 +65,7 @@ pub(super) fn add_to_linker(linker: &mut Linker<HostState>) -> wasmtime::Result<
     Ok(())
 }
 
-fn map_error(error: HttpError) -> ErrorCode {
+fn map_error(error: &HttpError) -> ErrorCode {
     match error {
         HttpError::PermissionDenied(_) | HttpError::AuthenticationRequired => {
             ErrorCode::HttpRequestDenied
@@ -76,7 +80,7 @@ fn map_error(error: HttpError) -> ErrorCode {
         HttpError::Internal(_) => ErrorCode::InternalError(None),
     }
 }
-fn plugin_error(error: types::Error) -> ErrorCode {
+fn plugin_error(error: &types::Error) -> ErrorCode {
     match error.code {
         types::ErrorCode::PermissionDenied => ErrorCode::HttpRequestDenied,
         types::ErrorCode::DeadlineExceeded => ErrorCode::ConnectionTimeout,
@@ -108,14 +112,17 @@ impl client::HostWithStore<HostState> for HostData {
                 {
                     return Err(ErrorCode::HttpRequestDenied);
                 }
-                let grant = host.http_grant().map_err(plugin_error)?.clone();
+                let grant = host
+                    .http_grant()
+                    .map_err(|error| plugin_error(&error))?
+                    .clone();
                 let service = host.http.clone().ok_or(ErrorCode::DestinationUnavailable)?;
                 let source = host.runner.active;
                 let budget = if source {
                     grant.max_timeout_ms
                 } else {
                     host.call_budget()
-                        .map_err(plugin_error)?
+                        .map_err(|error| plugin_error(&error))?
                         .min(grant.max_timeout_ms)
                 };
                 let timeout = options
@@ -173,10 +180,10 @@ impl http_body::Body for ResumeBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
         let result = std::pin::Pin::new(&mut self.body).poll_frame(cx);
-        if result.is_ready() {
-            if let Some(deadline) = &self.deadline {
-                *deadline.lock().unwrap() = Some(Instant::now() + self.budget);
-            }
+        if result.is_ready()
+            && let Some(deadline) = &self.deadline
+        {
+            *deadline.lock().unwrap() = Some(Instant::now() + self.budget);
         }
         result
     }
@@ -246,7 +253,7 @@ async fn exchange(
     let head = service
         .start_response(&grant, &request)
         .await
-        .map_err(map_error)?;
+        .map_err(|error| map_error(&error))?;
     if let Some(head) = head {
         return streaming_response(service, grant, head, cancelled, timeout);
     }
@@ -258,7 +265,7 @@ async fn exchange(
         let stream_id = service
             .open_stream(&grant, HttpStreamProtocol::Bytes, &request)
             .await
-            .map_err(map_error)?;
+            .map_err(|error| map_error(&error))?;
         return streaming_response(
             service,
             grant,
@@ -274,7 +281,17 @@ async fn exchange(
             timeout,
         );
     }
-    let response = service.send(&grant, &request).await.map_err(map_error)?;
+    let response = service
+        .send(&grant, &request)
+        .await
+        .map_err(|error| map_error(&error))?;
+    buffered_response(response, blobs)
+}
+
+fn buffered_response(
+    response: pluribus_core::HttpResponse,
+    blobs: Arc<dyn BlobStore>,
+) -> Result<Response<ResponseBody>, ErrorCode> {
     let mut builder = Response::builder().status(response.status);
     for header in response.headers {
         builder = builder.header(header.name, header.value);
@@ -351,7 +368,7 @@ fn streaming_response(
                 Err(error) => {
                     state.closed = true;
                     return Some((
-                        Err(wasmtime_wasi_http::Error::from(map_error(error))),
+                        Err(wasmtime_wasi_http::Error::from(map_error(&error))),
                         state,
                     ));
                 }
@@ -380,9 +397,12 @@ impl Drop for Sse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CancellationHandle, CorePrincipalKind, PrincipalRef};
     use http_body_util::Full;
     use pluribus_core::{HttpFrame, HttpFramePage, HttpResponse, HttpService};
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use wasmtime::Store;
 
     #[derive(Default)]
     struct Fixture {
@@ -604,7 +624,7 @@ mod tests {
                     assert_eq!(response.headers()["x-fixture"], "present");
                     assert_eq!(response.into_body().collect().await.is_err(), fail_body);
                     accessor.with(|mut access| {
-                        assert!(access.get().effective_deadline().unwrap() > Instant::now())
+                        assert!(access.get().effective_deadline().unwrap() > Instant::now());
                     });
                 })
                 .await

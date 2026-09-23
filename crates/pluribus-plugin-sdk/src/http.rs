@@ -4,7 +4,6 @@ use crate::pluribus::plugin::{
     types::{BlobRef, Chunk, Error, ErrorCode},
 };
 use crate::wasi::http::{client, types as wasi};
-use std::cell::RefCell;
 
 pub struct Header {
     pub name: String,
@@ -152,7 +151,7 @@ struct Body {
 }
 pub struct Reader {
     status: u16,
-    body: RefCell<Body>,
+    body: Body,
 }
 impl Reader {
     fn new(response: wasi::Response) -> Self {
@@ -162,18 +161,18 @@ impl Reader {
         let (bytes, completion) = wasi::Response::consume_body(response, done_read);
         Self {
             status,
-            body: RefCell::new(Body {
+            body: Body {
                 bytes,
                 completion: Some(completion),
                 ended: false,
-            }),
+            },
         }
     }
     pub fn status(&self) -> u16 {
         self.status
     }
-    async fn read(&self, max: u32, timeout_ms: Option<u32>) -> Result<Chunk, Error> {
-        let mut body = self.body.borrow_mut();
+    async fn read(&mut self, max: u32, timeout_ms: Option<u32>) -> Result<Chunk, Error> {
+        let body = &mut self.body;
         if body.ended {
             return Ok(Chunk {
                 bytes: vec![],
@@ -211,7 +210,7 @@ impl Reader {
         }
         Ok(Chunk { bytes, closed })
     }
-    pub fn receive(&self, max: u32, timeout_ms: u32) -> Result<Chunk, Error> {
+    pub fn receive(&mut self, max: u32, timeout_ms: u32) -> Result<Chunk, Error> {
         wit_bindgen::block_on(self.read(max, Some(timeout_ms)))
     }
 }
@@ -229,7 +228,7 @@ async fn response_body(response: wasi::Response) -> Result<Response, Error> {
         .and_then(|h| std::str::from_utf8(&h.value).ok())
         .unwrap_or("application/octet-stream");
     let upload = blobs::open_write(media_type, None)?;
-    let reader = Reader::new(response);
+    let mut reader = Reader::new(response);
     let mut offset = 0;
     loop {
         let chunk = reader.read(64 * 1024, None).await?;
@@ -311,7 +310,7 @@ pub fn exchange(input: &InlineRequest) -> Result<InlineResponse, Error> {
             input.timeout_ms,
         )
         .await?;
-        let reader = Reader::new(response);
+        let mut reader = Reader::new(response);
         let status = reader.status();
         let mut body = Vec::new();
         loop {

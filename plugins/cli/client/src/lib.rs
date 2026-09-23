@@ -312,12 +312,12 @@ fn cursor() -> Result<Cursor, Error> {
 }
 
 fn decode_cursor(bytes: &[u8]) -> Result<Cursor, Error> {
-    if let Ok(cursor) = serde_json::from_slice(&bytes) {
+    if let Ok(cursor) = serde_json::from_slice(bytes) {
         return Ok(cursor);
     }
     // Older releases persisted only the sequence. It cannot identify a
     // restarted bridge, so the next response establishes a fresh session.
-    std::str::from_utf8(&bytes)
+    std::str::from_utf8(bytes)
         .map_err(|_| invalid("stored cursor is not UTF-8"))?
         .parse::<u64>()
         .map(|sequence| Cursor {
@@ -462,11 +462,47 @@ impl Cli {
     }
 }
 
+struct SourceOutput {
+    events: Vec<pluribus::plugin::types::Proposal>,
+    mutations: Vec<pluribus::plugin::types::Mutation>,
+}
+
+impl Cli {
+    /// Services internal deliveries while external work is suspended.
+    async fn waiting<T>(
+        context: &mut Context,
+        work: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<Option<T>, Error> {
+        use futures_util::future::{Either, select};
+        use pluribus::plugin::runtime::{self, Wake};
+        futures_util::pin_mut!(work);
+        loop {
+            match select(Box::pin(runtime::next()), work.as_mut()).await {
+                Either::Left((wake, _)) => match wake? {
+                    Wake::Stop(_) => {
+                        // Finish cancelled imports before dropping their borrowed resources.
+                        let _ = work.await;
+                        return Ok(None);
+                    }
+                    Wake::Events(events) => match Self::handle(context.clone(), events).await {
+                        Ok(out) => {
+                            runtime::commit(&out.events, &out.mutations, out.checkpoint)?;
+                            context.state_checkpoint =
+                                out.checkpoint.unwrap_or(context.state_checkpoint);
+                        }
+                        Err(error) => runtime::reject(&error)?,
+                    },
+                },
+                Either::Right((result, _)) => return result.map(Some),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Cursor, cursor_after, decode_cursor, observation};
     use protocol::Message;
-    use serde_json::Value;
 
     #[test]
     fn old_sequence_cursor_migrates_without_assuming_a_bridge_session() {
@@ -508,42 +544,5 @@ mod tests {
         let old = observation(&config, "old", &message).unwrap();
         let new = observation(&config, "new", &message).unwrap();
         assert_ne!(old.idempotency_key, new.idempotency_key);
-    }
-}
-
-struct SourceOutput {
-    events: Vec<pluribus::plugin::types::Proposal>,
-    mutations: Vec<pluribus::plugin::types::Mutation>,
-}
-
-impl Cli {
-    /// Services internal deliveries while external work is suspended.
-    async fn waiting<T>(
-        context: &mut Context,
-        work: impl std::future::Future<Output = Result<T, Error>>,
-    ) -> Result<Option<T>, Error> {
-        use futures_util::future::{Either, select};
-        use pluribus::plugin::runtime::{self, Wake};
-        futures_util::pin_mut!(work);
-        loop {
-            match select(Box::pin(runtime::next()), work.as_mut()).await {
-                Either::Left((wake, _)) => match wake? {
-                    Wake::Stop(_) => {
-                        // Finish cancelled imports before dropping their borrowed resources.
-                        let _ = work.await;
-                        return Ok(None);
-                    }
-                    Wake::Events(events) => match Self::handle(context.clone(), events).await {
-                        Ok(out) => {
-                            runtime::commit(&out.events, &out.mutations, out.checkpoint)?;
-                            context.state_checkpoint =
-                                out.checkpoint.unwrap_or(context.state_checkpoint);
-                        }
-                        Err(error) => runtime::reject(&error)?,
-                    },
-                },
-                Either::Right((result, _)) => return result.map(Some),
-            }
-        }
     }
 }

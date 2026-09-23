@@ -66,7 +66,7 @@ impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             memory_bytes: 32 * 1024 * 1024,
-            call_timeout: Duration::from_secs(60),
+            call_timeout: Duration::from_mins(1),
         }
     }
 }
@@ -150,6 +150,10 @@ pub struct CredentialExport {
 }
 
 impl CredentialAccess {
+    /// Resolves an authorized, unexpired credential export.
+    ///
+    /// # Errors
+    /// Returns an error if the binding is denied or the export is unavailable.
     pub async fn resolve_export(&self, binding: &str) -> Result<String, types::Error> {
         let grant = self.exports.get(binding).ok_or_else(|| {
             host_error(
@@ -171,10 +175,13 @@ impl CredentialAccess {
             .ok_or_else(unavailable)?;
         let doc: Value = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
         let export = &doc["exports"][&grant.export];
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .map_err(|_| unavailable())?;
         if export["expires_at_ms"].as_i64().ok_or_else(unavailable)? <= now.saturating_add(30_000) {
             return Err(unavailable());
         }

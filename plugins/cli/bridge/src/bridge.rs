@@ -202,7 +202,7 @@ fn response_fits(session_id: &str, messages: &[Message]) -> bool {
         session_id: session_id.to_owned(),
         messages: messages.to_vec(),
     })
-    .is_ok_and(|bytes| bytes.len() + 1 <= MAX_RESPONSE)
+    .is_ok_and(|bytes| bytes.len() < MAX_RESPONSE)
 }
 
 fn new_session_id() -> io::Result<String> {

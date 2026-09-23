@@ -21,7 +21,7 @@ Use `nix-build` in a working tree: `nix build .#` copies the tree, including
 nix-shell
 pluribus-sync-plugins
 cargo fmt --check
-cargo clippy --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace -- --include-ignored
 ```
 
@@ -30,9 +30,10 @@ after guest or WIT changes before running packaged integration tests. Loopback
 fixtures require local socket access. Build dependencies may download on a fresh
 machine; `CARGO_NET_OFFLINE=true` requires cached Cargo dependencies.
 
-[CI](../.github/workflows/ci.yml) runs these checks, both Nix builds, and
-`nix flake check`. Ordinary tests use fixtures. The live memory evaluation requires
-explicit environment variables; leave them unset for the local suite.
+[CI](../.github/workflows/ci.yml) rejects compiler and Clippy warnings and runs
+these checks, both Nix builds, and `nix flake check`. Ordinary tests use fixtures.
+The live memory evaluation requires explicit environment variables; leave them
+unset for the local suite.
 
 ## Focused checks
 

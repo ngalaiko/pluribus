@@ -31,7 +31,7 @@ jobs:
       - run: nix-shell --run pluribus-sync-plugins
 
       - run: nix-shell --run 'cargo fmt --check'
-      - run: nix-shell --run 'cargo clippy --locked --workspace --all-targets'
+      - run: nix-shell --run 'cargo clippy --locked --workspace --all-targets -- -D warnings'
 
       # The ignored tests bind loopback sockets and make no external requests.
       - run: nix-shell --run 'cargo test --locked --workspace -- --include-ignored'

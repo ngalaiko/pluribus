@@ -10,6 +10,10 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 pub const MAX_FRAME: usize = 40 * 1024 * 1024;
+/// Binds a Unix socket with the requested permissions.
+///
+/// # Errors
+/// Returns an error for an invalid or occupied path, or filesystem failure.
 pub fn bind(path: &Path, mode: u32) -> io::Result<tokio::net::UnixListener> {
     if !path.is_absolute() {
         return Err(io::Error::other("absolute socket required"));
@@ -27,6 +31,10 @@ pub fn bind(path: &Path, mode: u32) -> io::Result<tokio::net::UnixListener> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(listener)
 }
+/// Reads one JSON frame.
+///
+/// # Errors
+/// Returns an error for a timeout, invalid frame, or I/O failure.
 pub async fn read(stream: &mut tokio::net::UnixStream) -> io::Result<Value> {
     let mut bytes = Vec::new();
     tokio::time::timeout(
@@ -39,6 +47,10 @@ pub async fn read(stream: &mut tokio::net::UnixStream) -> io::Result<Value> {
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
+/// Writes one JSON frame.
+///
+/// # Errors
+/// Returns an error for an oversized frame, timeout, or I/O failure.
 pub async fn write(stream: &mut tokio::net::UnixStream, value: &Value) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');

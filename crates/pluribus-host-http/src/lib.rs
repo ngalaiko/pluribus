@@ -1164,6 +1164,9 @@ mod tests {
 }
 
 /// Exchanges sensitive payloads without putting them in durable blob storage.
+///
+/// # Errors
+/// Returns an error if authorization, transport, or response body reading fails.
 pub async fn exchange_inline(
     grant: &HttpGrant,
     method: &str,

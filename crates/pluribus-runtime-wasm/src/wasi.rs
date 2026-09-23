@@ -1,6 +1,9 @@
 //! WASI primitives under the instance's scheduling and resource limits.
 
-use super::*;
+use super::{
+    Arc, Duration, HostState, Instant, Ordering, StreamError, StreamGrant, Transport, bindings,
+    cancellable, host_error, runner, socket, stream_denied, stream_plugin_error, types,
+};
 use bindings::wasi::{
     clocks::{monotonic_clock, system_clock, types as clock_types},
     random::random,
@@ -20,7 +23,7 @@ impl system_clock::Host for HostState {
         let ms = (self.clock)();
         system_clock::Instant {
             seconds: ms.div_euclid(1000),
-            nanoseconds: (ms.rem_euclid(1000) as u32) * 1_000_000,
+            nanoseconds: u32::try_from(ms.rem_euclid(1000)).unwrap() * 1_000_000,
         }
     }
     async fn get_resolution(&mut self) -> u64 {
@@ -362,11 +365,11 @@ mod tests {
         ) -> Poll<wasmtime::Result<StreamResult>> {
             let mut bytes = Vec::with_capacity(32 * 1024);
             source.read(store, &mut bytes)?;
-            if !bytes.is_empty() {
+            if bytes.is_empty() {
+                Poll::Ready(Ok(StreamResult::Completed))
+            } else {
                 let _ = self.0.take().unwrap().send(bytes);
                 Poll::Ready(Ok(StreamResult::Dropped))
-            } else {
-                Poll::Ready(Ok(StreamResult::Completed))
             }
         }
     }

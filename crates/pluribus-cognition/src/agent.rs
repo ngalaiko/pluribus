@@ -194,11 +194,7 @@ impl<P: ConstraintPolicy, R: AuthorityResolver> Agent<P, R> {
         .await
         .map_err(AgentError::Runtime)?;
         staged = run_independent(staged, |mut prepared| async move {
-            let result = prepared
-                .instance
-                .rebuild(&prepared.rebuilds)
-                .await
-                .map(|_| ());
+            let result = prepared.instance.rebuild(&prepared.rebuilds).await;
             (prepared, result)
         })
         .await

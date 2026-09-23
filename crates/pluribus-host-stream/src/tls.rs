@@ -140,82 +140,6 @@ pub async fn connect(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn shutdown_write_sends_close_notify_and_keeps_reads_open() {
-        use tokio_rustls::TlsAcceptor;
-        use tokio_rustls::rustls::{
-            ServerConfig,
-            pki_types::{CertificateDer, PrivateKeyDer},
-        };
-
-        let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert = CertificateDer::from(key.cert.der().to_vec());
-        let server_config = ServerConfig::builder_with_provider(Arc::new(
-            tokio_rustls::rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.clone()],
-            PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap(),
-        )
-        .unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(cert).unwrap();
-        let client_config = ClientConfig::builder_with_provider(Arc::new(
-            tokio_rustls::rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut stream = TlsAcceptor::from(Arc::new(server_config))
-                .accept(socket)
-                .await
-                .unwrap();
-            let mut bytes = [0; 8];
-            let result = stream.read(&mut bytes).await;
-            stream.write_all(b"still-readable").await.unwrap();
-            result
-        });
-        let socket = TcpStream::connect(address).await.unwrap();
-        let std_socket = socket.into_std().unwrap();
-        let shutdown_socket = std_socket.try_clone().unwrap();
-        let socket = TcpStream::from_std(std_socket).unwrap();
-        let stream = TlsConnector::from(Arc::new(client_config))
-            .connect(
-                ServerName::try_from("localhost".to_owned()).unwrap(),
-                socket,
-            )
-            .await
-            .unwrap();
-        let (reader, writer) = tokio::io::split(stream);
-        let connection = Connection {
-            reader: tokio::sync::Mutex::new(reader),
-            writer: Arc::new(tokio::sync::Mutex::new(writer)),
-            socket: shutdown_socket,
-        };
-        connection.shutdown_write();
-        assert_eq!(peer.await.unwrap().unwrap(), 0);
-        let mut incoming = [0; 14];
-        let count = tokio::time::timeout(Duration::from_secs(2), connection.read(&mut incoming))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&incoming[..count], b"still-readable");
-    }
-}
-
 /// Speaks RFC 3207 up to the `220` after which the next byte is a handshake.
 ///
 /// The host, not the guest, drives this: the grant's promise is that the
@@ -353,4 +277,80 @@ fn config() -> Result<Arc<ClientConfig>, StreamError> {
     .with_root_certificates(roots)
     .with_no_client_auth();
     Ok(Arc::clone(CONFIG.get_or_init(|| Arc::new(config))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn shutdown_write_sends_close_notify_and_keeps_reads_open() {
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::{
+            ServerConfig,
+            pki_types::{CertificateDer, PrivateKeyDer},
+        };
+
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = CertificateDer::from(key.cert.der().to_vec());
+        let server_config = ServerConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.clone()],
+            PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap(),
+        )
+        .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = TlsAcceptor::from(Arc::new(server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut bytes = [0; 8];
+            let result = stream.read(&mut bytes).await;
+            stream.write_all(b"still-readable").await.unwrap();
+            result
+        });
+        let socket = TcpStream::connect(address).await.unwrap();
+        let std_socket = socket.into_std().unwrap();
+        let shutdown_socket = std_socket.try_clone().unwrap();
+        let socket = TcpStream::from_std(std_socket).unwrap();
+        let stream = TlsConnector::from(Arc::new(client_config))
+            .connect(
+                ServerName::try_from("localhost".to_owned()).unwrap(),
+                socket,
+            )
+            .await
+            .unwrap();
+        let (reader, writer) = tokio::io::split(stream);
+        let connection = Connection {
+            reader: tokio::sync::Mutex::new(reader),
+            writer: Arc::new(tokio::sync::Mutex::new(writer)),
+            socket: shutdown_socket,
+        };
+        connection.shutdown_write();
+        assert_eq!(peer.await.unwrap().unwrap(), 0);
+        let mut incoming = [0; 14];
+        let count = tokio::time::timeout(Duration::from_secs(2), connection.read(&mut incoming))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&incoming[..count], b"still-readable");
+    }
 }

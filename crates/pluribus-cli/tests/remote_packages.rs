@@ -18,6 +18,10 @@ impl Drop for Runner {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep scenario setup and assertions together."
+)]
 fn configured_file_archive_allows_concurrent_runners_without_its_source() {
     let temp = tempfile::tempdir().unwrap();
     let archive = temp.path().join("plugin archive.tar.gz");

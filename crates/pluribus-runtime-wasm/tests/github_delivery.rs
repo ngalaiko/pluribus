@@ -5,6 +5,7 @@ use pluribus_runtime_wasm::{
 };
 use pluribus_store_sqlite::SqliteEventStore;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -167,9 +168,8 @@ struct HttpListener(Child);
 impl HttpListener {
     async fn start(root: &Path, port: u16, uid: u32) -> Self {
         let socket = root.join("http.sock");
-        let binary = std::env::var_os("PLURIBUS_HTTP_LISTENER")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        let binary = std::env::var_os("PLURIBUS_HTTP_LISTENER").map_or_else(
+            || {
                 std::env::current_exe()
                     .unwrap()
                     .parent()
@@ -177,7 +177,9 @@ impl HttpListener {
                     .parent()
                     .unwrap()
                     .join("pluribus-http-listener")
-            });
+            },
+            PathBuf::from,
+        );
         let child = Command::new(&binary)
             .arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
@@ -228,6 +230,10 @@ impl Drop for HttpListener {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep scenario setup and assertions together."
+)]
 async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -241,7 +247,7 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
             .await
             .unwrap(),
     );
-    let value = json!({"app":{"id":7,"slug":"fixture","pem":"unused by verification","webhook_secret":"fixture-secret"},"installation_id":9,"exports":{"installation-token":{"value":"ghs_fixture","expires_at_ms":9999999999999_i64}}});
+    let value = json!({"app":{"id":7,"slug":"fixture","pem":"unused by verification","webhook_secret":"fixture-secret"},"installation_id":9,"exports":{"installation-token":{"value":"ghs_fixture","expires_at_ms":9_999_999_999_999_i64}}});
     store
         .replace_plugin_credential(
             &SecretHandle::new("github:personal"),
@@ -282,7 +288,7 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
             delivery("github/receive"),
             PluginServices {
                 credentials: Some(pluribus_runtime_wasm::CredentialAccess {
-                    exports: Default::default(),
+                    exports: std::collections::BTreeMap::default(),
                     store: store.clone(),
                     provider: "dev.pluribus.github".into(),
                     handles: std::collections::HashSet::from(["github:personal".into()]),
@@ -353,8 +359,10 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
             signature
                 .as_ref()
                 .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
+                .fold(String::new(), |mut hex, byte| {
+                    write!(&mut hex, "{byte:02x}").unwrap();
+                    hex
+                })
         );
         let request = tokio::spawn(
             reqwest::Client::new()
@@ -422,6 +430,10 @@ async fn signed_delivery_crosses_listener_and_wasm_with_core_secrets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep scenario setup and assertions together."
+)]
 async fn refresh_backfills_webhook_secret_export_for_shell_access() {
     let store = Arc::new(
         SqliteEventStore::open_in_memory(Metadata::default())
@@ -449,7 +461,7 @@ async fn refresh_backfills_webhook_secret_export_for_shell_access() {
             delivery("github/receive"),
             PluginServices {
                 credentials: Some(pluribus_runtime_wasm::CredentialAccess {
-                    exports: Default::default(),
+                    exports: std::collections::BTreeMap::default(),
                     store: store.clone(),
                     provider: "dev.pluribus.github".into(),
                     handles: std::collections::HashSet::from(["test".into()]),
@@ -482,7 +494,7 @@ async fn refresh_backfills_webhook_secret_export_for_shell_access() {
             serde_json::to_vec(&json!({
                 "app":{"id":7,"pem":include_str!("../../../plugins/github/tests/fixtures/test-app.pem"),"webhook_secret":"secret-fixture"},
                 "installation_id":9,
-                "exports":{"installation-token":{"value":"ghs_fixture","expires_at_ms":9999999999999_i64}}
+                "exports":{"installation-token":{"value":"ghs_fixture","expires_at_ms":9_999_999_999_999_i64}}
             }))
             .unwrap(),
         )
@@ -539,7 +551,7 @@ async fn refresh_backfills_webhook_secret_export_for_shell_access() {
         )]),
         store,
         provider: "dev.pluribus.shell".into(),
-        handles: Default::default(),
+        handles: std::collections::HashSet::default(),
     };
     assert_eq!(
         shell.resolve_export("GITHUB_WEBHOOK_SECRET").await.unwrap(),
@@ -548,6 +560,10 @@ async fn refresh_backfills_webhook_secret_export_for_shell_access() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep scenario setup and assertions together."
+)]
 async fn wasm_manual_enrollment_replays_without_exposing_secrets() {
     let store = Arc::new(
         SqliteEventStore::open_in_memory(Metadata::default())
@@ -574,7 +590,7 @@ async fn wasm_manual_enrollment_replays_without_exposing_secrets() {
             delivery("github/receive"),
             PluginServices {
                 credentials: Some(pluribus_runtime_wasm::CredentialAccess {
-                    exports: Default::default(),
+                    exports: std::collections::BTreeMap::default(),
                     store: store.clone(),
                     provider: "dev.pluribus.github".into(),
                     handles: std::collections::HashSet::from(["test".into()]),
@@ -608,7 +624,7 @@ async fn wasm_manual_enrollment_replays_without_exposing_secrets() {
         })
         .await
         .unwrap();
-    let outcome = plugin.handle(&[request.clone()]).await.unwrap();
+    let outcome = plugin.handle(std::slice::from_ref(&request)).await.unwrap();
     let response = outcome
         .events
         .iter()
@@ -652,10 +668,10 @@ async fn wasm_manual_enrollment_replays_without_exposing_secrets() {
             delivery("denied"),
             PluginServices {
                 credentials: Some(pluribus_runtime_wasm::CredentialAccess {
-                    exports: Default::default(),
+                    exports: std::collections::BTreeMap::default(),
                     store: store.clone(),
                     provider: "dev.pluribus.github".into(),
-                    handles: Default::default(),
+                    handles: std::collections::HashSet::default(),
                 }),
                 ..Default::default()
             },

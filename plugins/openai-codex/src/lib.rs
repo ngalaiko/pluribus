@@ -239,7 +239,7 @@ fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error
     let read = responses(&body, &tokens, config.timeout_ms)?;
     // An expired access token is rejected before any frame arrives, so one
     // refresh replays the request.
-    let read = if read.status() == 401 {
+    let mut read = if read.status() == 401 {
         drop(read);
         let tokens = refresh(handle, record, &tokens)?;
         responses(&body, &tokens, config.timeout_ms)?
@@ -247,7 +247,7 @@ fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error
         read
     };
     // The reader closes when it drops, ending the transfer.
-    parse_stream(&request.call_id, &read, tool_names)
+    parse_stream(&request.call_id, &mut read, tool_names)
 }
 
 /// Opens one Responses stream under the supplied tokens.
@@ -1040,7 +1040,11 @@ struct StreamState {
 /// framing lives here: the transport moves bytes, the plugin owns the
 /// protocol. The core enforces cancellation through epoch interruption, so
 /// there is no cancellation flag to poll.
-fn parse_stream(call_id: &str, read: &Reader, tool_names: ToolNames) -> Result<Completion, Error> {
+fn parse_stream(
+    call_id: &str,
+    read: &mut Reader,
+    tool_names: ToolNames,
+) -> Result<Completion, Error> {
     let mut state = StreamState {
         tool_names,
         ..StreamState::default()

@@ -4,8 +4,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 fn shared(texts: &[&str]) -> Shared {
-    let mut inbox = Inbox::default();
-    inbox.session_id = "test-session".into();
+    let mut inbox = Inbox {
+        session_id: "test-session".into(),
+        ..Inbox::default()
+    };
     for text in texts {
         inbox.next += 1;
         inbox.messages.push(Message {
@@ -69,7 +71,7 @@ fn a_poll_batch_fits_the_protocol_response_limit() {
         messages,
     })
     .unwrap();
-    assert!(encoded.len() + 1 <= MAX_RESPONSE);
+    assert!(encoded.len() < MAX_RESPONSE);
 }
 
 #[test]

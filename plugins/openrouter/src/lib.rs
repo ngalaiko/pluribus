@@ -157,7 +157,7 @@ fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error
     }
     let (body, tool_names) = build_request(request)?;
     let body = put_blob("application/json", &body)?;
-    let read = http::sse(&Request {
+    let mut read = http::sse(&Request {
         method: "POST".to_owned(),
         url: URL.to_owned(),
         headers: vec![
@@ -169,7 +169,7 @@ fn complete(request: &ModelRequest, config: &Config) -> Result<Completion, Error
         timeout_ms: config.timeout_ms,
     })?;
     // The reader closes when it drops, ending the transfer.
-    parse_stream(&request.call_id, &read, tool_names)
+    parse_stream(&request.call_id, &mut read, tool_names)
 }
 
 fn decode_request(event: &Event) -> Result<ModelRequest, Error> {
@@ -356,7 +356,11 @@ struct StreamState {
 /// framing lives here: the transport moves bytes, the plugin owns the
 /// protocol. The core enforces cancellation through epoch interruption, so
 /// there is no cancellation flag to poll.
-fn parse_stream(call_id: &str, read: &Reader, tool_names: ToolNames) -> Result<Completion, Error> {
+fn parse_stream(
+    call_id: &str,
+    read: &mut Reader,
+    tool_names: ToolNames,
+) -> Result<Completion, Error> {
     let mut state = StreamState {
         tool_names,
         ..StreamState::default()

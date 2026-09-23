@@ -335,8 +335,7 @@ async fn packaged_guest_oom_replans_and_completes_smaller_read() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|e| e.request.event_type == "code.completed")
-        .last()
+        .rfind(|e| e.request.event_type == "code.completed")
         .expect("smaller read completed");
     assert!(
         payload(&completed)["value"]
@@ -2707,6 +2706,7 @@ async fn packaged_reasoning_preserves_large_state_across_budget_pause() {
         "paused-budget"
     );
     clock.fetch_add(60_000, Ordering::Relaxed);
+    deliver_scheduled_wake(&store).await;
     drive(&mut agent, clock.load(Ordering::Relaxed)).await;
     scripted(
         &store,

@@ -942,6 +942,10 @@ fn origin_constraints_support_declared_selectors_without_plugin_names() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep scenario setup and assertions together."
+)]
 async fn routing_projects_constraints_from_the_selected_provider_contract() {
     use pluribus_plugin_package::{ConstraintBinding, ConstraintPart};
     let store = store().await;
@@ -1132,18 +1136,18 @@ async fn derived_observations_preserve_origin_authority_and_reject_identity_chan
             wake.actor = PrincipalRef::new(PrincipalKind::Component, "scheduler");
             wake.causation_id = Some(request.event_id.clone());
             let wake = store.append(wake).await.unwrap();
-            let resolved = resolver.resolve(&wake).await;
+            let result = resolver.resolve(&wake).await;
             // Non-true trust values are untrusted, so changing false to a string cannot expand authority.
-            if changed.is_some() && !(changed == Some("trusted") && !trusted) {
-                assert!(resolved.is_err(), "accepted changed {changed:?}");
+            if changed.is_some() && (changed != Some("trusted") || trusted) {
+                assert!(result.is_err(), "accepted changed {changed:?}");
             } else {
-                let resolved = resolved.unwrap();
-                assert_eq!(resolved.origin.source_event_id, original.event_id);
+                let authority = result.unwrap();
+                assert_eq!(authority.origin.source_event_id, original.event_id);
                 assert_eq!(
-                    resolved.permits(&CapabilityName::new("shell.execute")),
+                    authority.permits(&CapabilityName::new("shell.execute")),
                     trusted
                 );
-                assert_eq!(resolved.origin.conversation_id.as_deref(), Some("c"));
+                assert_eq!(authority.origin.conversation_id.as_deref(), Some("c"));
             }
         }
     }

@@ -1,5 +1,6 @@
 //! The shell plugin without an endpoint grant must fail, not trap.
 
+use pluribus_core::PluginCredentialStore;
 use pluribus_core::{
     AppendRequest, BlobStore, DeliveryStore, EventId, EventMetadataSource, EventPayload,
     EventStore, InMemoryBlobStore, PrincipalKind, PrincipalRef, StateStore, StreamId, StreamKind,
@@ -176,17 +177,23 @@ async fn shell_keeps_secrets_out_of_requests_until_a_helper_asks_for_one() {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep scenario setup and assertions together."
+)]
 async fn export_delivery(mode: &str) {
     let store = Arc::new(
         SqliteEventStore::open_in_memory(Metadata(AtomicU64::new(1)))
             .await
             .unwrap(),
     );
-    use pluribus_core::PluginCredentialStore;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
     store.replace_plugin_credential(&pluribus_core::SecretHandle::new("github:personal"), "dev.pluribus.github", None,
         serde_json::to_vec(&json!({"private-key":"private-fixture", "exports":{"installation-token":{
             "value":"fixture-token", "expires_at_ms": if mode == "expired" { now - 1 } else { now + 120_000 }
@@ -326,8 +333,8 @@ async fn export_delivery(mode: &str) {
             },
             PluginServices {
                 credentials: Some(pluribus_runtime_wasm::CredentialAccess {
-                    store: store.clone(), provider: "dev.pluribus.shell".into(), handles: Default::default(),
-                    exports: if mode == "ungranted" { Default::default() } else {
+                    store: store.clone(), provider: "dev.pluribus.shell".into(), handles: std::collections::HashSet::default(),
+                    exports: if mode == "ungranted" { std::collections::BTreeMap::default() } else {
                         [("GH_TOKEN".into(), pluribus_runtime_wasm::CredentialExport {
                             provider: "dev.pluribus.github".into(), credential: "github:personal".into(), export: "installation-token".into(),
                         })].into_iter().collect()

@@ -494,7 +494,6 @@ impl Outgoing {
 ///
 /// Header values are encoded, never interpolated: a value carrying a newline
 /// would otherwise become a header the caller did not ask for.
-#[must_use]
 pub fn write(message: &Outgoing) -> Result<Vec<u8>, WriteError> {
     let mut out = String::new();
     out.push_str(&fold("Date", &message.date)?);
