@@ -5,22 +5,6 @@
   "additionalProperties": false,
   "properties": {
     "command": { "type": "string", "minLength": 1, "maxLength": 65536 },
-    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 300000, "default": 30000 },
-    "attachments": {
-      "type": "array",
-      "maxItems": 32,
-      "description": "Populated automatically by the RLM runtime from ready references in the current input. Do not provide or alter references.",
-      "items": {
-        "type": "object",
-        "required": ["algorithm", "digest", "size", "media-type"],
-        "additionalProperties": false,
-        "properties": {
-          "algorithm": { "const": "sha256" },
-          "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-          "size": { "type": "integer", "minimum": 0 },
-          "media-type": { "type": "string", "minLength": 1 }
-        }
-      }
-    }
+    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 300000, "default": 30000 }
   }
 }

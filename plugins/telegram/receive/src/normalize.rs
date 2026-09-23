@@ -67,12 +67,8 @@ fn normalize_update(update: &Value) -> Result<Observation, Error> {
 /// A blob reference as JSON, so an event payload can name content without
 /// inlining it.
 pub(crate) fn blob_json(blob: &BlobRef) -> Value {
-    json!({
-        "algorithm": blob.algorithm,
-        "digest": blob.digest,
-        "size": blob.size,
-        "mediaType": blob.media_type,
-    })
+    pluribus_plugin_sdk::blob::BlobRef::from(blob.clone())
+        .to_json(pluribus_plugin_sdk::blob::MediaTypeSpelling::Camel)
 }
 
 /// The media type of a downloaded attachment. Telegram's file server labels

@@ -37,8 +37,6 @@ struct Arguments {
     command: String,
     #[serde(default = "default_timeout")]
     timeout_ms: u32,
-    #[serde(default)]
-    attachments: Vec<serde_json::Value>,
 }
 
 fn default_timeout() -> u32 {
@@ -167,7 +165,12 @@ async fn run(
             .clone()
             .unwrap_or_else(|| event.event_id.clone()),
     };
-    if arguments.attachments.len() > 32 {
+    if payload
+        .get("attachments")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
+        > 32
+    {
         return Err(failure(
             ErrorCode::ResourceExhausted,
             "too many attachment references",
@@ -405,7 +408,9 @@ mod tests {
         assert!(manifest.contains("pluribus-shell-cli attachment SHA256_DIGEST"));
         assert!(manifest.contains("pluribus-shell-cli secret BINDING"));
         assert!(manifest.contains("pluribus-shell-cli --help"));
-        assert!(manifest.contains("The RLM runtime forwards ready refs"));
+        assert!(
+            manifest.contains("Ready attachments are listed in the capability event's top-level")
+        );
     }
 }
 

@@ -1391,6 +1391,10 @@ impl HostState {
         }
     }
 
+    fn authorize_proposal_blobs(&self, payload: &EventPayload) -> Result<(), RuntimeError> {
+        authorize_blob_references(payload, &self.visible_blobs)
+    }
+
     fn ensure_visible_blob(&self, blob: &BlobRef) -> Result<(), types::Error> {
         validate_blob_ref(blob).map_err(|error| blob_error(&error))?;
         if self.visible_blobs.contains(blob) {
@@ -1427,6 +1431,7 @@ impl HostState {
         let mut payload = core_payload(&proposal.payload).map_err(|error| {
             RuntimeError::new(format!("invalid proposal payload: {}", error.message))
         })?;
+        self.authorize_proposal_blobs(&payload)?;
         if proposal.event_type == "model.requested"
             && let EventPayload::CanonicalJson(bytes) = &mut payload
         {
@@ -1589,19 +1594,19 @@ impl events::Host for HostState {
 
     async fn get(&mut self, event_id: String) -> Result<types::Event, types::Error> {
         let store = self.event_store.clone();
-        store
+        let event = store
             .get(&EventId::new(event_id))
             .await
             .map_err(|error| {
                 host_error(types::ErrorCode::Internal, &format!("cannot read: {error}"))
             })?
-            .as_ref()
             .filter(|event| {
                 event.request.stream_id == StreamId::new(self.delivery.agent.id.clone())
                     && http_request_visible(event, &self.delivery.instance_id)
             })
-            .map(wit_event)
-            .ok_or_else(|| host_error(types::ErrorCode::NotFound, "no such event"))
+            .ok_or_else(|| host_error(types::ErrorCode::NotFound, "no such event"))?;
+        self.reveal_event_blobs(std::slice::from_ref(&event));
+        Ok(wit_event(&event))
     }
 
     async fn query(
@@ -1696,6 +1701,9 @@ impl events::Host for HostState {
                 self.progress.notify_one();
                 event.sequence
             });
+        for event in &selected {
+            self.reveal_event_blobs(std::slice::from_ref(*event));
+        }
         Ok(events::Page {
             events: selected.into_iter().map(wit_event).collect(),
             next_sequence,
@@ -2120,6 +2128,28 @@ fn wit_payload(payload: &EventPayload) -> types::Payload {
         EventPayload::CanonicalJson(bytes) => types::Payload::Json(bytes.clone()),
         EventPayload::Blob(blob) => types::Payload::Blob(wit_blob_ref(blob)),
     }
+}
+
+fn authorize_blob_references(
+    payload: &EventPayload,
+    visible_blobs: &HashSet<BlobRef>,
+) -> Result<(), RuntimeError> {
+    let mut found = Vec::new();
+    match payload {
+        EventPayload::Blob(blob) => found.push(blob.clone()),
+        EventPayload::CanonicalJson(bytes) => {
+            let value: Value = serde_json::from_slice(bytes)
+                .map_err(|error| RuntimeError::new(format!("invalid proposal JSON: {error}")))?;
+            collect_blob_refs(&value, &mut found);
+        }
+    }
+    found.retain(|blob| validate_blob_ref(blob).is_ok());
+    if found.iter().any(|blob| !visible_blobs.contains(blob)) {
+        return Err(RuntimeError::new(
+            "proposal references a blob not visible to this delivery",
+        ));
+    }
+    Ok(())
 }
 
 fn core_payload(payload: &types::Payload) -> Result<EventPayload, types::Error> {

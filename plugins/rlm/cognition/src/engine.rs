@@ -1429,18 +1429,12 @@ impl Engine {
                     "capability.invoke" if task.depth == 0 => {
                         let origin = task.origin.clone();
                         let attachments = attachment_refs(&task.context[trigger_input(task)]);
-                        let mut arguments = args["arguments"].clone();
-                        if args["name"] == "shell.execute"
-                            && let Some(fields) = arguments.as_object_mut()
-                        {
-                            fields.insert("attachments".into(), json!(attachments));
-                        }
                         self.tasks.get_mut(session).unwrap().pending = Some(
                             json!({"yield":value["id"],"cause":id,"revision":self.tasks[session].revision}),
                         );
                         vec![draft(
                             "capability.requested",
-                            json!({"capability":args["name"],"arguments":arguments,"rlmSession":session,"rlmYield":value["id"],"jobId":self.tasks[session].root,"revision":self.tasks[session].revision}),
+                            json!({"capability":args["name"],"arguments":args["arguments"],"attachments":attachments,"rlmSession":session,"rlmYield":value["id"],"jobId":self.tasks[session].root,"revision":self.tasks[session].revision}),
                             &origin,
                         )]
                     }
@@ -3763,7 +3757,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_capability_forwards_original_attachment_refs_without_model_metadata() {
+    fn capability_forwards_ready_attachment_refs_outside_arguments() {
         let c = config();
         let mut e = Engine::default();
         let blob = json!({
@@ -3789,18 +3783,22 @@ mod tests {
             &c,
             "yield",
             "code.yielded",
-            &json!({"sessionId":"origin","id":1,"method":"capability.invoke","args":{"name":"shell.execute","arguments":{"command":"pluribus-shell-cli attachment aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","attachments":[{"algorithm":"sha256","digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":0,"media_type":"forged/type"}]}}}),
+            &json!({"sessionId":"origin","id":1,"method":"capability.invoke","args":{"name":"vendor.process","arguments":{"operation":"inspect","attachments":[{"algorithm":"sha256","digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":0,"media_type":"forged/type"}]}}}),
             None,
         );
 
         assert_eq!(
-            request[0].payload["arguments"]["attachments"],
+            request[0].payload["attachments"],
             json!([{
                 "algorithm":"sha256",
                 "digest":"a".repeat(64),
                 "size":17,
                 "media-type":"application/pdf",
             }])
+        );
+        assert_eq!(
+            request[0].payload["arguments"]["attachments"][0]["digest"],
+            "b".repeat(64)
         );
     }
 

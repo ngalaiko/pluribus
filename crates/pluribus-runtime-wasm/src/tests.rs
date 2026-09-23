@@ -28,6 +28,47 @@ fn runtime_error_exposes_typed_resource_exhaustion() {
     assert!(error.trapped());
 }
 
+#[test]
+fn proposals_can_only_forward_visible_blob_references() {
+    let visible = pluribus_core::BlobRef {
+        algorithm: "sha256".into(),
+        digest: "a".repeat(64),
+        size: 3,
+        media_type: "application/pdf".into(),
+    };
+    let forged = pluribus_core::BlobRef {
+        digest: "b".repeat(64),
+        ..visible.clone()
+    };
+    let mut visible_blobs = HashSet::new();
+    visible_blobs.insert(visible.clone());
+
+    let nested = EventPayload::CanonicalJson(
+        serde_json::to_vec(&serde_json::json!({"attachments":[{
+            "algorithm": forged.algorithm,
+            "digest": forged.digest,
+            "size": forged.size,
+            "media-type": forged.media_type,
+        }]}))
+        .unwrap(),
+    );
+    assert!(authorize_blob_references(&nested, &visible_blobs).is_err());
+    let visible_nested = EventPayload::CanonicalJson(
+        serde_json::to_vec(&serde_json::json!({"attachments":[{
+            "algorithm": visible.algorithm,
+            "digest": visible.digest,
+            "size": visible.size,
+            "media-type": visible.media_type,
+        }]}))
+        .unwrap(),
+    );
+    assert!(authorize_blob_references(&visible_nested, &visible_blobs).is_ok());
+    assert!(
+        authorize_blob_references(&EventPayload::Blob(visible.clone()), &visible_blobs).is_ok()
+    );
+    assert!(authorize_blob_references(&EventPayload::Blob(forged), &visible_blobs).is_err());
+}
+
 pub(super) struct Metadata(AtomicU64);
 
 impl EventMetadataSource for Metadata {
@@ -73,8 +114,12 @@ fn delivery() -> Delivery {
 }
 
 pub(super) async fn host(emits: Vec<String>) -> HostState {
+    host_with_store(emits).await.0
+}
+
+async fn host_with_store(emits: Vec<String>) -> (HostState, Arc<SqliteEventStore<Metadata>>) {
     let store = store().await;
-    HostState::new(
+    let host = HostState::new(
         1024 * 1024,
         delivery(),
         Arc::new(AtomicBool::new(false)),
@@ -88,7 +133,35 @@ pub(super) async fn host(emits: Vec<String>) -> HostState {
         },
         PluginServices::default(),
         emits,
-    )
+    );
+    (host, store)
+}
+
+#[tokio::test]
+async fn async_append_rejects_forged_blob_without_writing_an_event() {
+    let (mut host, store) = host_with_store(vec!["capability.requested".into()]).await;
+    let forged = types::Proposal {
+        event_type: "capability.requested".into(),
+        payload_schema: "test/1".into(),
+        payload: types::Payload::Json(
+            serde_json::to_vec(&serde_json::json!({"attachments":[{
+                "algorithm":"sha256",
+                "digest":"a".repeat(64),
+                "size":4,
+                "media-type":"application/pdf",
+            }]}))
+            .unwrap(),
+        ),
+        idempotency_key: Some("forged-blob".into()),
+        causation_id: None,
+    };
+
+    assert!(events::Host::append(&mut host, forged).await.is_err());
+    let committed = store
+        .query(&StreamId::new("personal"), &EventQuery::default(), 10)
+        .await
+        .unwrap();
+    assert!(committed.is_empty());
 }
 
 pub(super) fn proposal(event_type: &str) -> types::Proposal {
@@ -813,6 +886,120 @@ async fn http_request_reads_are_confined_to_consumer_and_listener() {
 }
 
 #[tokio::test]
+async fn historical_reads_reveal_only_returned_event_blobs() {
+    async fn put(host: &HostState, bytes: &[u8]) -> BlobRef {
+        let upload = host
+            .blob_store
+            .begin_put("application/pdf", Some(bytes.len() as u64))
+            .await
+            .unwrap();
+        host.blob_store.write(&upload, 0, bytes).await.unwrap();
+        host.blob_store.finish_put(&upload).await.unwrap()
+    }
+    fn json_payload(blob: &BlobRef) -> EventPayload {
+        EventPayload::CanonicalJson(
+            serde_json::to_vec(&serde_json::json!({"blob": {
+                "algorithm": blob.algorithm,
+                "digest": blob.digest,
+                "size": blob.size,
+                "media-type": blob.media_type,
+            }}))
+            .unwrap(),
+        )
+    }
+
+    let mut host = host(vec![]).await;
+    let visible = put(&host, b"visible historical file").await;
+    let hidden = put(&host, b"hidden request body").await;
+    let stream_id = StreamId::new(host.delivery.agent.id.clone());
+    for (event_type, actor, payload) in [
+        (
+            "observation.received",
+            "telegram/receive",
+            json_payload(&visible),
+        ),
+        (
+            "http.request.received",
+            "github/listener",
+            EventPayload::CanonicalJson(
+                serde_json::to_vec(&serde_json::json!({
+                    "consumer":"other/instance",
+                    "body":{"blob": {
+                        "algorithm": hidden.algorithm,
+                        "digest": hidden.digest,
+                        "size": hidden.size,
+                        "media-type": hidden.media_type,
+                    }},
+                }))
+                .unwrap(),
+            ),
+        ),
+    ] {
+        host.event_store
+            .append(AppendRequest {
+                stream_id: stream_id.clone(),
+                stream_kind: StreamKind::Agent,
+                observed_at_ms: None,
+                event_type: event_type.into(),
+                payload_schema: "test/1".into(),
+                payload,
+                actor: PrincipalRef::new(CorePrincipalKind::Component, actor),
+                authority_id: Some(AuthorityId::new("authority-1")),
+                activity_id: Some("activity-1".into()),
+                correlation_id: Some("correlation-1".into()),
+                causation_id: None,
+                deduplication_key: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let page = events::Host::query(
+        &mut host,
+        events::Filter {
+            after_sequence: None,
+            before_sequence: None,
+            event_types: Vec::new(),
+            text_query: None,
+            conversation_id: None,
+            correlation_id: None,
+            activity_id: None,
+            recorded_from_ms: None,
+            recorded_to_ms: None,
+            descending: false,
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert!(authorize_blob_references(&json_payload(&visible), &host.visible_blobs).is_ok());
+    assert!(authorize_blob_references(&json_payload(&hidden), &host.visible_blobs).is_err());
+    assert!(
+        blobs::Host::read(&mut host, wit_blob_ref(&hidden), 0, 1024)
+            .await
+            .is_err()
+    );
+    host.visible_blobs.clear();
+    let stored = host
+        .event_store
+        .query(&stream_id, &EventQuery::default(), 10)
+        .await
+        .unwrap();
+    for event in stored {
+        let readable = event.request.event_type == "observation.received";
+        assert_eq!(
+            events::Host::get(&mut host, event.event_id.as_str().into())
+                .await
+                .is_ok(),
+            readable
+        );
+    }
+    assert!(authorize_blob_references(&json_payload(&visible), &host.visible_blobs).is_ok());
+    assert!(authorize_blob_references(&json_payload(&hidden), &host.visible_blobs).is_err());
+}
+
+#[tokio::test]
 async fn history_search_filters_conversation_before_limit() {
     let mut host = host(vec![
         "observation.received".into(),
@@ -988,7 +1175,9 @@ async fn a_delivered_event_reveals_the_blobs_its_payload_names() {
         .unwrap(),
     );
     request.idempotency_key = Some("observation".into());
+    host.visible_blobs.insert(attached.clone());
     events::Host::append(&mut host, request).await.unwrap();
+    host.visible_blobs.remove(&attached);
     let stream = StreamId::new(host.delivery.agent.id.clone());
     let event = host
         .event_store

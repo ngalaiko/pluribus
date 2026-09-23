@@ -210,12 +210,8 @@ fn store(config: &Config, attachment: &mime::Attachment) -> Result<Value, Error>
 }
 
 fn blob_json(blob: &BlobRef) -> Value {
-    json!({
-        "algorithm": blob.algorithm,
-        "digest": blob.digest,
-        "size": blob.size,
-        "mediaType": blob.media_type,
-    })
+    pluribus_plugin_sdk::blob::BlobRef::from(blob.clone())
+        .to_json(pluribus_plugin_sdk::blob::MediaTypeSpelling::Camel)
 }
 
 fn proposal(payload: &Value, idempotency_key: String) -> Result<Proposal, Error> {

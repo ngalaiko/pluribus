@@ -138,10 +138,11 @@ core for each request; values never enter the command environment or event
 log. Only names in `credential_exports` are accepted, and missing or expiring
 exports fail the helper call. Keep secrets out of command output and logs.
 
-The RLM runtime automatically forwards ready attachment references from the
-current input to `shell.execute`; the model does not need to supply metadata.
-The helper resolves a digest only among those references visible in the
-current delivery and streams the bytes to stdout in chunks:
+The host adds ready attachment references from the triggering observation to
+the `capability.requested` event's top-level `attachments` context. They are
+separate from `shell.execute` arguments. The helper resolves a digest only
+among those references visible in the current delivery and streams the bytes
+to stdout in chunks:
 
 ```sh
 pluribus-shell-cli attachment SHA256_DIGEST | pdftotext - -
